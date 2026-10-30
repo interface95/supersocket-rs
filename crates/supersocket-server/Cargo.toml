@@ -1,0 +1,36 @@
+[package]
+name = "supersocket-server"
+description = "Server side of supersocket-rs: sessions, commands, middleware, TLS and configuration on tokio."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+## TLS listeners through rustls.
+tls = ["dep:tokio-rustls"]
+## Loading `ServerOptions` from TOML or JSON files with environment overrides.
+config = ["dep:serde_json", "dep:toml"]
+
+[dependencies]
+supersocket-proto.workspace = true
+bytes.workspace = true
+humantime-serde.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+
+serde_json = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true
