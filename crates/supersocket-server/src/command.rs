@@ -6,7 +6,7 @@ use supersocket_proto::CommandPackage;
 
 use crate::{
     BoxFuture, HandlerResult,
-    server::{PackageError, PackageHandler, ServerBuilder, handle_with_limit},
+    server::{DynPackageHandler, PackageError, ServerBuilder, handle_with_limit},
     session::{Session, SessionState},
 };
 
@@ -252,7 +252,7 @@ impl<P: KeyedPackage, S: SessionState> ServerBuilder<P, S> {
     }
 }
 
-impl<P: KeyedPackage, S: SessionState> PackageHandler<P, S> for Commands<P, S> {
+impl<P: KeyedPackage, S: SessionState> DynPackageHandler<P, S> for Commands<P, S> {
     fn handle<'a>(
         &'a self,
         session: Session<S>,

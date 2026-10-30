@@ -46,6 +46,9 @@ async fn main() -> Result<(), supersocket::Error> {
 - **A client**, modeled on SuperSocket's `EasyClient`: it connects through a chain of
   connectors (TCP or an HTTP CONNECT, SOCKS4 or SOCKS5 proxy, then TLS) and reuses the server's
   pipeline filters and send queue.
+- **WebSocket** (RFC 6455) server and client built on the same core: the handshake filter
+  switches to the frame filter, and sessions count as connected once the handshake is complete.
+  Fragments, pings and the closing handshake are handled for you; tested against tungstenite.
 - **TLS** through rustls, **configuration** from TOML or JSON files with environment overrides,
   **tracing** for logs, graceful shutdown on Ctrl+C or SIGTERM.
 
@@ -55,7 +58,7 @@ Until the first release, depend on the repository:
 
 ```toml
 [dependencies]
-supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # optional features: "tls", "config", "client", "proxy"
+supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # optional features: "tls", "config", "client", "proxy", "websocket"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -70,6 +73,9 @@ cargo run --example tls_echo_server --features tls
 cargo run --example config_server --features config
 cargo run --example echo_client --features client     # with echo_server running
 cargo run --example proxy_client --features proxy -- 127.0.0.1:1080 example.com:80
+cargo run --example websocket_echo_server --features websocket
+cargo run --example websocket_chat --features websocket
+cargo run --example websocket_client --features websocket,client   # with websocket_echo_server running
 ```
 
 ## Guide
@@ -233,6 +239,53 @@ EasyClient::builder(LineFilter::default())
 `HttpProxy` (CONNECT) and `Socks4Proxy` (with SOCKS4a for host names) work the same way, and
 anything implementing `Connector` can be added with `.connector(...)`.
 
+### WebSocket
+
+Enable the `websocket` feature. The WebSocket server runs on the same core: its first pipeline
+filter reads the HTTP upgrade request and switches to the frame filter, and a session counts as
+connected once its handshake is complete, so broadcasts never reach a connection that is still
+upgrading. Listeners with TLS give `wss://`.
+
+```rust
+use supersocket::websocket::{Rejection, WebSocketServer};
+
+WebSocketServer::builder()
+    .subprotocols(["chat.v1"])
+    .on_handshake(async |session| match session.request().query() {
+        Some("token=secret") => Ok(()),
+        _ => Err(Rejection::new(401, "log in first")),
+    })
+    .on_message(async |session, message| {
+        for other in session.sessions() {
+            let _ = other.send(&message).await; // broadcast
+        }
+        Ok(())
+    })
+    .listen("0.0.0.0:4040")
+    .build()?
+    .run()
+    .await
+```
+
+`session.close(CloseCode::NORMAL, "bye")` starts the closing handshake, and shutting the server
+down sends 1001 (going away) to every client. `max_package_length` limits both frames and
+messages joined from fragments.
+
+With the `client` feature as well, `WebSocketClient` connects through the same connectors as
+`EasyClient`, so proxies and `wss://` work the same way:
+
+```rust
+let mut client = WebSocketClient::connect("wss://example.com/chat").await?;
+client.send_text("hello").await?;
+let reply = client.receive().await?; // Some(Message), or None once closed
+client.close(CloseCode::NORMAL, "done").await;
+```
+
+The server uses two core features that serve other protocols too: a `PackageHandler` type,
+whose `closing` hook can queue a goodbye message, and `ServerBuilder::require_handshake`, which
+keeps a session out of the session container and holds back its connected handlers until the
+handler calls `session.complete_handshake()`.
+
 ### Middleware
 
 ```rust
@@ -326,7 +379,7 @@ their time elsewhere.
 
 ## Roadmap
 
-- WebSocket server and client, built on pipeline filters
+- WebSocket compression (permessage-deflate) and a run of the Autobahn test suite
 - Derive-style command registration
 - UDP sessions, if there is demand
 

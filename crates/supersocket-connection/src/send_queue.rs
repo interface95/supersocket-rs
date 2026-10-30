@@ -57,6 +57,12 @@ impl SendQueue {
     /// Queues `data`. Waits while the limit is reached, and fails with
     /// [`ErrorKind::BrokenPipe`](io::ErrorKind::BrokenPipe) once the queue is closed.
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
+        self.send_vectored(&[data]).await
+    }
+
+    /// Queues `parts` back to back as one piece, so data from concurrent sends never lands
+    /// between them, without copying them together first. Otherwise like [`send`](Self::send).
+    pub async fn send_vectored(&self, parts: &[&[u8]]) -> io::Result<()> {
         loop {
             let drained = self.drained.notified();
             {
@@ -65,7 +71,12 @@ impl SendQueue {
                     return Err(io::ErrorKind::BrokenPipe.into());
                 }
                 if state.pending.is_empty() || state.pending.len() < self.limit {
-                    state.pending.extend_from_slice(data);
+                    state
+                        .pending
+                        .reserve(parts.iter().map(|part| part.len()).sum());
+                    for part in parts {
+                        state.pending.extend_from_slice(part);
+                    }
                     break;
                 }
             }
@@ -161,9 +172,10 @@ mod tests {
             let queue = queue.clone();
             async move { queue.run_writer(writer, None).await }
         });
-        for piece in [&b"one "[..], b"two ", b"three"] {
+        for piece in [&b"one "[..], b"two "] {
             queue.send(piece).await.unwrap();
         }
+        queue.send_vectored(&[b"th", b"r", b"ee"]).await.unwrap();
         queue.close();
         assert_eq!(
             queue.send(b"late").await.unwrap_err().kind(),

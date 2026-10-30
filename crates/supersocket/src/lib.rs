@@ -26,6 +26,8 @@
 //! - `config`: loading [`ServerOptions`] from TOML or JSON files with environment overrides.
 //! - `client`: the client, `EasyClient`, in the `client` module.
 //! - `proxy`: HTTP CONNECT, SOCKS4 and SOCKS5 proxy connectors for the client.
+//! - `websocket`: the WebSocket server in the `websocket` module, and with `client` the WebSocket
+//!   client.
 
 #[cfg(feature = "client")]
 pub use supersocket_client as client;
@@ -34,6 +36,8 @@ pub use supersocket_proto as proto;
 pub use supersocket_proto::*;
 pub use supersocket_server as server;
 pub use supersocket_server::*;
+#[cfg(feature = "websocket")]
+pub use supersocket_websocket as websocket;
 
 /// The items most applications need.
 pub mod prelude {

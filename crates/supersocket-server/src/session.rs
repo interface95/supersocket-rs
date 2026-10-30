@@ -7,7 +7,7 @@ use std::{
     ops::Deref,
     sync::{
         Arc, OnceLock, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -36,11 +36,12 @@ pub enum CloseReason {
     ApplicationError,
     /// Reading from or writing to the connection failed.
     SocketError,
-    /// The session was idle for too long, or the peer stopped accepting data.
+    /// The session was idle for too long, did not complete its handshake in time, or the peer
+    /// stopped accepting data.
     Timeout,
     /// The data broke the protocol, or a package exceeded the size limit.
     ProtocolError,
-    /// A middleware rejected the session.
+    /// A middleware or the handshake rejected the session.
     Rejected,
     /// Application code panicked where the session cannot continue, such as in the pipeline
     /// filter.
@@ -86,7 +87,8 @@ impl fmt::Display for CloseReason {
 /// }
 /// ```
 pub trait SessionState: Default + Send + Sync + 'static {
-    /// Called after the session is registered, before its first package is handled.
+    /// Called after the session is registered, before its first package is handled. On a server
+    /// that requires a handshake, called once the handshake is complete instead.
     fn on_connected(_session: &Session<Self>) -> impl Future<Output = ()> + Send {
         async {}
     }
@@ -116,6 +118,7 @@ struct SessionInner<S> {
     start_time: SystemTime,
     started_at: Instant,
     last_active_ms: AtomicU64,
+    handshake_complete: AtomicBool,
     send_queue: SendQueue,
     close_token: CancellationToken,
     close_reason: OnceLock<CloseReason>,
@@ -156,6 +159,7 @@ impl<S: SessionState> Session<S> {
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
         secure: bool,
+        handshake_complete: bool,
         close_token: CancellationToken,
         server: Arc<ServerInfo<S>>,
     ) -> Self {
@@ -169,6 +173,7 @@ impl<S: SessionState> Session<S> {
                 start_time: SystemTime::now(),
                 started_at: Instant::now(),
                 last_active_ms: AtomicU64::new(0),
+                handshake_complete: AtomicBool::new(handshake_complete),
                 send_queue,
                 close_token,
                 close_reason: OnceLock::new(),
@@ -234,6 +239,13 @@ impl<S> Session<S> {
         self.inner.send_queue.send(data.as_ref()).await
     }
 
+    /// Queues `parts` back to back as one piece, like [`send`](Self::send) with the parts joined,
+    /// but without copying them together first. Protocol layers use it to send a header and a
+    /// payload.
+    pub async fn send_vectored(&self, parts: &[&[u8]]) -> io::Result<()> {
+        self.inner.send_queue.send_vectored(parts).await
+    }
+
     /// Encodes `package` with `encoder` and queues it like [`send`](Self::send).
     pub async fn send_package<T: ?Sized>(
         &self,
@@ -249,6 +261,20 @@ impl<S> Session<S> {
     /// Completes once the session is closed or closing, for tasks that should stop with it.
     pub async fn closed(&self) {
         self.inner.close_token.cancelled().await;
+    }
+
+    /// Marks the handshake of the session as complete, on a server that requires one; see
+    /// [`ServerBuilder::require_handshake`](crate::ServerBuilder::require_handshake). The session
+    /// then joins the session container and its connected handlers run, before its next package
+    /// is handled.
+    pub fn complete_handshake(&self) {
+        self.inner.handshake_complete.store(true, Ordering::Release);
+    }
+
+    /// Whether the session has completed its handshake. Always `true` on a server that does not
+    /// require one.
+    pub fn is_handshake_complete(&self) -> bool {
+        self.inner.handshake_complete.load(Ordering::Acquire)
     }
 
     /// Closes the session. Queued data is still sent. The first reason given wins.

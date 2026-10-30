@@ -1,5 +1,6 @@
 use std::{
     net::SocketAddr,
+    pin::pin,
     sync::{Arc, atomic::Ordering},
 };
 
@@ -10,6 +11,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
     task::JoinSet,
+    time::Instant,
 };
 use tracing::Instrument;
 
@@ -84,6 +86,7 @@ async fn run_session<P, S, R>(
         remote_addr,
         local_addr,
         secure,
+        !server.handshake_required,
         server.shutdown.child_token(),
         server.info.clone(),
     );
@@ -101,25 +104,33 @@ async fn run_session<P, S, R>(
         return;
     }
 
-    server.info.sessions().add(session.clone());
-    tracing::debug!("session connected");
-    if let Err(panic) = catch_panic(async { S::on_connected(&session).await }).await {
-        tracing::error!(%panic, "SessionState::on_connected panicked");
-    }
-    if let Some(handler) = &server.on_connected {
-        if let Err(panic) = catch_panic(async { handler(session.clone()).await }).await {
-            tracing::error!(%panic, "connected handler panicked");
-        }
+    // A session that must complete a handshake connects once it has; see `read_loop`.
+    let mut connected = false;
+    if session.is_handshake_complete() {
+        connect(&server, &session).await;
+        connected = true;
     }
 
-    let reason = read_loop(&server, &session, &mut reader).await;
+    let reason = read_loop(&server, &session, &mut reader, &mut connected).await;
     session.close(reason);
     let reason = session.close_reason();
 
-    // Send what is still queued (unless the peer stops reading), and close the connection before
-    // the closed events run.
+    // Let the protocol queue a goodbye, send what is still queued (unless the peer stops
+    // reading), and close the connection before the closed events run.
+    let deadline = Instant::now() + server.info.options().close_timeout;
+    if connected {
+        if let Some(closing) = server
+            .package_handler
+            .as_ref()
+            .and_then(|handler| handler.closing(&session, reason))
+        {
+            if let Err(panic) = catch_panic(tokio::time::timeout_at(deadline, closing)).await {
+                tracing::error!(%panic, "PackageHandler::closing panicked");
+            }
+        }
+    }
     session.close_send_queue();
-    if tokio::time::timeout(server.info.options().close_timeout, &mut writer_task)
+    if tokio::time::timeout_at(deadline, &mut writer_task)
         .await
         .is_err()
     {
@@ -135,12 +146,29 @@ async fn run_session<P, S, R>(
         }
     }
     tracing::debug!(%reason, "session closed");
+    if !connected {
+        return;
+    }
     if let Err(panic) = catch_panic(async { S::on_closed(&session, reason).await }).await {
         tracing::error!(%panic, "SessionState::on_closed panicked");
     }
     if let Some(handler) = &server.on_closed {
         if let Err(panic) = catch_panic(async { handler(session.clone(), reason).await }).await {
             tracing::error!(%panic, "closed handler panicked");
+        }
+    }
+}
+
+/// Adds the session to the session container and runs the connected handlers.
+async fn connect<P, S: SessionState>(server: &ServerInner<P, S>, session: &Session<S>) {
+    server.info.sessions().add(session.clone());
+    tracing::debug!("session connected");
+    if let Err(panic) = catch_panic(async { S::on_connected(session).await }).await {
+        tracing::error!(%panic, "SessionState::on_connected panicked");
+    }
+    if let Some(handler) = &server.on_connected {
+        if let Err(panic) = catch_panic(async { handler(session.clone()).await }).await {
+            tracing::error!(%panic, "connected handler panicked");
         }
     }
 }
@@ -170,11 +198,13 @@ async fn register<P, S: SessionState>(server: &ServerInner<P, S>, session: &Sess
 }
 
 /// Reads packages and hands them to the package handler until the session ends. Returns why it
-/// ended.
+/// ended. A session that must complete a handshake does that first; once it has, it connects and
+/// `connected` is set.
 async fn read_loop<P, S, R>(
     server: &Arc<ServerInner<P, S>>,
     session: &Session<S>,
     reader: R,
+    connected: &mut bool,
 ) -> CloseReason
 where
     P: Send + 'static,
@@ -195,6 +225,14 @@ where
         receive_buffer_size: options.receive_buffer_size,
     };
     let mut packages = PackageReader::new(reader, filter, read_options);
+    if !*connected {
+        // Boxed, so that the read loop of every session does not carry the handshake's state.
+        if let Err(reason) = Box::pin(handshake(server, session, &mut packages)).await {
+            return reason;
+        }
+        connect(server, session).await;
+        *connected = true;
+    }
     let mut in_flight = JoinSet::new();
 
     let reason = loop {
@@ -209,30 +247,12 @@ where
                     _ = close_token.cancelled() => break cancelled_reason(server),
                     read = packages.fill() => read,
                 };
-                match read {
-                    Ok(0) => break CloseReason::RemoteClosed,
-                    Ok(_) => {
-                        session.touch();
-                        continue;
-                    }
-                    Err(error) => {
-                        tracing::debug!(%error, "read failed");
-                        break CloseReason::SocketError;
-                    }
+                match received(session, read) {
+                    Ok(()) => continue,
+                    Err(reason) => break reason,
                 }
             }
-            Err(ReadError::Io(error)) => {
-                tracing::debug!(%error, "read failed");
-                break CloseReason::SocketError;
-            }
-            Err(ReadError::FilterPanicked(panic)) => {
-                tracing::error!(%panic, "pipeline filter panicked");
-                break CloseReason::InternalError;
-            }
-            Err(error) => {
-                tracing::debug!(%error, "closing session");
-                break CloseReason::ProtocolError;
-            }
+            Err(error) => break undecodable(error),
         };
         match options.package_handling {
             PackageHandling::Serial => handle_package(server, session, package).await,
@@ -251,6 +271,81 @@ where
     // Let packages still being handled finish; each one is bounded by the handling timeout.
     while in_flight.join_next().await.is_some() {}
     reason
+}
+
+/// Handles packages one at a time until the session completes its handshake. Fails with the
+/// reason to close the session when it ends first or the handshake timeout passes.
+async fn handshake<P, S, R>(
+    server: &ServerInner<P, S>,
+    session: &Session<S>,
+    packages: &mut PackageReader<R, P>,
+) -> Result<(), CloseReason>
+where
+    P: Send + 'static,
+    S: SessionState,
+    R: AsyncRead + Unpin,
+{
+    let close_token = session.close_token();
+    let mut timeout = pin!(tokio::time::sleep(server.info.options().handshake_timeout));
+    loop {
+        let package = match packages.try_next() {
+            Ok(Some(package)) => package,
+            Ok(None) => {
+                let read = tokio::select! {
+                    biased;
+                    _ = close_token.cancelled() => return Err(cancelled_reason(server)),
+                    () = &mut timeout => {
+                        tracing::debug!("handshake timed out");
+                        return Err(CloseReason::Timeout);
+                    }
+                    read = packages.fill() => read,
+                };
+                received(session, read)?;
+                continue;
+            }
+            Err(error) => return Err(undecodable(error)),
+        };
+        handle_package(server, session, package).await;
+        if close_token.is_cancelled() {
+            return Err(cancelled_reason(server));
+        }
+        if session.is_handshake_complete() {
+            return Ok(());
+        }
+    }
+}
+
+/// What a read means for the session: data arrived, or the reason to close it.
+fn received<S>(session: &Session<S>, read: Result<usize, ReadError>) -> Result<(), CloseReason> {
+    match read {
+        Ok(0) => Err(CloseReason::RemoteClosed),
+        Ok(_) => {
+            session.touch();
+            Ok(())
+        }
+        Err(error) => {
+            tracing::debug!(%error, "read failed");
+            Err(CloseReason::SocketError)
+        }
+    }
+}
+
+/// The reason to close a session whose data could not be decoded.
+fn undecodable(error: ReadError) -> CloseReason {
+    match error {
+        ReadError::Io(error) => {
+            tracing::debug!(%error, "read failed");
+            CloseReason::SocketError
+        }
+        ReadError::FilterPanicked(panic) => {
+            tracing::error!(%panic, "pipeline filter panicked");
+            CloseReason::InternalError
+        }
+        error => {
+            tracing::debug!(%error, "closing session");
+            CloseReason::ProtocolError
+        }
+    }
 }
 
 // When the session closed itself its reason is already recorded, so this only matters when the

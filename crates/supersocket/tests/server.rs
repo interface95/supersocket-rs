@@ -12,12 +12,15 @@ use std::{
 
 use common::{Client, next_reason, start, track_close_reasons};
 use supersocket::{
-    BeginEndMarkFilter, BoxFilter, FixedHeaderFilter, FixedHeaderProtocol, PackageHandling,
-    PipelineFilterExt, ServerBuilder,
+    BeginEndMarkFilter, BoxFilter, FixedHeaderFilter, FixedHeaderProtocol, PackageHandler,
+    PackageHandling, PipelineFilterExt, ServerBuilder,
     bytes::{Buf, BufMut, Bytes, BytesMut},
     prelude::*,
 };
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
 fn echo_lines() -> ServerBuilder<TextPackage> {
     Server::builder(LineFilter::default).on_package(async |session, package| {
@@ -840,4 +843,155 @@ async fn a_panicking_filter_closes_only_its_session() {
     tokio::time::timeout(common::WAIT, server.shutdown())
         .await
         .expect("shutdown hung after a filter panic");
+}
+
+/// Counts the connected and closed events of a server.
+#[derive(Default)]
+struct Events {
+    connected: AtomicUsize,
+    closed: AtomicUsize,
+}
+
+/// A line protocol whose first line must be `hello`: the server answers `welcome`, then echoes.
+fn greeting_server(events: Arc<Events>) -> ServerBuilder<TextPackage> {
+    let closed = events.clone();
+    Server::builder(LineFilter::default)
+        .require_handshake()
+        .on_connected(move |session| {
+            let events = events.clone();
+            async move {
+                assert!(session.is_handshake_complete());
+                events.connected.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .on_closed(move |_, _| {
+            let events = closed.clone();
+            async move {
+                events.closed.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .on_package(async |session, package| {
+            if session.is_handshake_complete() {
+                session.send(format!("{}\r\n", package.text)).await?;
+            } else if package.text == "hello" {
+                // Until the handshake is complete, broadcasts cannot reach the session.
+                assert!(session.server().sessions().get(session.id()).is_none());
+                session.send("welcome\r\n").await?;
+                session.complete_handshake();
+            } else {
+                session.close(CloseReason::Rejected);
+            }
+            Ok(())
+        })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_connect_once_their_handshake_is_complete() {
+    let events = Arc::new(Events::default());
+    let (server, address) = start(greeting_server(events.clone()));
+
+    let mut client = Client::connect(address).await;
+    client.send(b"hello\r\nfirst\r\n").await;
+    assert_eq!(client.line().await, "welcome");
+    assert_eq!(client.line().await, "first");
+    assert_eq!(server.info().session_count(), 1);
+    assert_eq!(events.connected.load(Ordering::SeqCst), 1);
+
+    // A failed handshake never connects, so it has no closed event either.
+    let mut rejected = Client::connect(address).await;
+    rejected.send(b"wrong\r\n").await;
+    rejected.expect_closed().await;
+
+    server.shutdown().await;
+    assert_eq!(events.connected.load(Ordering::SeqCst), 1);
+    assert_eq!(events.closed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_that_do_not_complete_the_handshake_in_time_are_closed() {
+    let events = Arc::new(Events::default());
+    let limit = Duration::from_millis(200);
+    let (server, address) = start(
+        greeting_server(events.clone()).configure(|options| options.handshake_timeout = limit),
+    );
+
+    // Data keeps arriving, but never a complete handshake: the deadline still holds.
+    let (mut reader, mut writer) = TcpStream::connect(address).await.unwrap().into_split();
+    let trickle = tokio::spawn(async move {
+        while writer.write_all(b"x").await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let started = Instant::now();
+    let mut rest = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut rest))
+        .await
+        .expect("the server did not close the session");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= limit && elapsed < Duration::from_secs(2),
+        "{elapsed:?}"
+    );
+    trickle.abort();
+
+    server.shutdown().await;
+    assert_eq!(events.connected.load(Ordering::SeqCst), 0);
+    assert_eq!(events.closed.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn packages_before_the_handshake_are_handled_in_order() {
+    let (server, address) = start(
+        Server::builder(LineFilter::default)
+            .require_handshake()
+            .configure(|options| {
+                options.package_handling = PackageHandling::Concurrent { max_in_flight: 8 };
+            })
+            .on_package(async |session, package| {
+                if package.text == "hello" {
+                    // A slow handshake: the packages behind it must wait for it.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    session.complete_handshake();
+                } else {
+                    let when = if session.is_handshake_complete() {
+                        "after"
+                    } else {
+                        "before"
+                    };
+                    session.send(format!("{} {when}\r\n", package.text)).await?;
+                }
+                Ok(())
+            }),
+    );
+    let mut client = Client::connect(address).await;
+    client.send(b"hello\r\none\r\ntwo\r\n").await;
+    let mut lines = [client.line().await, client.line().await];
+    lines.sort();
+    assert_eq!(lines, ["one after", "two after"]);
+    server.shutdown().await;
+}
+
+struct Farewell;
+
+impl PackageHandler<TextPackage> for Farewell {
+    async fn handle(&self, session: &Session, package: TextPackage) -> HandlerResult {
+        session.send(format!("{}\r\n", package.text)).await?;
+        Ok(())
+    }
+
+    async fn closing(&self, session: &Session, reason: CloseReason) {
+        let _ = session.send(format!("bye: {reason}\r\n")).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn package_handler_types_can_say_goodbye_when_sessions_close() {
+    let (server, address) = start(Server::builder(LineFilter::default).package_handler(Farewell));
+    let mut client = Client::connect(address).await;
+    client.send(b"hi\r\n").await;
+    assert_eq!(client.line().await, "hi");
+
+    server.shutdown().await;
+    assert_eq!(client.line().await, "bye: server shutdown");
+    client.expect_closed().await;
 }

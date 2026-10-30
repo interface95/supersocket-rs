@@ -93,17 +93,70 @@ pub enum ErrorAction {
     Close,
 }
 
+/// Handles the packages of every session, like SuperSocket's `IPackageHandler`. Closures passed to
+/// [`ServerBuilder::on_package`] cover most needs; implement this for a handler that is a type,
+/// such as a protocol layer, and register it with [`ServerBuilder::package_handler`].
+///
+/// ```
+/// use supersocket_proto::{LineFilter, TextPackage};
+/// use supersocket_server::{CloseReason, HandlerResult, PackageHandler, Server, Session};
+///
+/// struct Echo;
+///
+/// impl PackageHandler<TextPackage> for Echo {
+///     async fn handle(&self, session: &Session, package: TextPackage) -> HandlerResult {
+///         session.send(format!("{}\r\n", package.text)).await?;
+///         Ok(())
+///     }
+///
+///     async fn closing(&self, session: &Session, _reason: CloseReason) {
+///         let _ = session.send("bye\r\n").await;
+///     }
+/// }
+///
+/// let builder = Server::builder(LineFilter::default).package_handler(Echo);
+/// ```
+pub trait PackageHandler<P, S = ()>: Send + Sync + 'static {
+    /// Handles one package of `session`. Errors and panics go to the handler set with
+    /// [`ServerBuilder::on_error`], and the call is cut off after the package handling timeout.
+    fn handle(
+        &self,
+        session: &Session<S>,
+        package: P,
+    ) -> impl Future<Output = HandlerResult> + Send;
+
+    /// Runs when a connected session is closing, after its last package was handled and before
+    /// the data still queued is sent, so a protocol can queue a goodbye message such as a
+    /// WebSocket close frame. Limited by the close timeout.
+    fn closing(
+        &self,
+        _session: &Session<S>,
+        _reason: CloseReason,
+    ) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+}
+
 type FilterFactory<P> = Arc<dyn Fn() -> BoxFilter<P> + Send + Sync>;
 /// Handles one package within a time limit. The returned future runs the application's code
 /// together with the timeout and panic catching, so they share the one allocation each package
 /// needs, and it borrows the handler instead of cloning shared state for every package.
-pub(crate) trait PackageHandler<P, S>: Send + Sync {
+pub(crate) trait DynPackageHandler<P, S>: Send + Sync {
     fn handle<'a>(
         &'a self,
         session: Session<S>,
         package: P,
         limit: Duration,
     ) -> BoxFuture<'a, Result<(), PackageError>>;
+
+    /// The [`PackageHandler::closing`] hook, if the handler has one.
+    fn closing<'a>(
+        &'a self,
+        _session: &'a Session<S>,
+        _reason: CloseReason,
+    ) -> Option<BoxFuture<'a, ()>> {
+        None
+    }
 }
 
 /// Runs the future `start` creates, with a time limit, turning panics into errors.
@@ -123,9 +176,38 @@ where
     }
 }
 
+/// Runs a [`PackageHandler`] registered with [`ServerBuilder::package_handler`].
+struct TypedHandler<H>(H);
+
+impl<P, S, H> DynPackageHandler<P, S> for TypedHandler<H>
+where
+    P: Send + 'static,
+    S: SessionState,
+    H: PackageHandler<P, S>,
+{
+    fn handle<'a>(
+        &'a self,
+        session: Session<S>,
+        package: P,
+        limit: Duration,
+    ) -> BoxFuture<'a, Result<(), PackageError>> {
+        Box::pin(handle_with_limit(limit, move || async move {
+            self.0.handle(&session, package).await
+        }))
+    }
+
+    fn closing<'a>(
+        &'a self,
+        session: &'a Session<S>,
+        reason: CloseReason,
+    ) -> Option<BoxFuture<'a, ()>> {
+        Some(Box::pin(self.0.closing(session, reason)))
+    }
+}
+
 struct FnHandler<F>(F);
 
-impl<P, S, F, Fut> PackageHandler<P, S> for FnHandler<F>
+impl<P, S, F, Fut> DynPackageHandler<P, S> for FnHandler<F>
 where
     P: Send + 'static,
     S: SessionState,
@@ -152,11 +234,12 @@ pub struct ServerBuilder<P, S = ()> {
     filter_factory: FilterFactory<P>,
     options: ServerOptions,
     services: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
-    package_handler: Option<Box<dyn PackageHandler<P, S>>>,
+    package_handler: Option<Box<dyn DynPackageHandler<P, S>>>,
     on_connected: Option<ConnectedHandler<S>>,
     on_closed: Option<ClosedHandler<S>>,
     on_error: Option<ErrorHandler<S>>,
     middlewares: Vec<Box<dyn DynMiddleware<S>>>,
+    handshake_required: bool,
 }
 
 impl<P: Send + 'static> ServerBuilder<P> {
@@ -184,6 +267,7 @@ impl<P: Send + 'static> ServerBuilder<P> {
             on_closed: None,
             on_error: None,
             middlewares: Vec::new(),
+            handshake_required: self.handshake_required,
         }
     }
 }
@@ -199,8 +283,27 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
         self.set_package_handler(Box::new(FnHandler(handler)))
     }
 
-    pub(crate) fn set_package_handler(mut self, handler: Box<dyn PackageHandler<P, S>>) -> Self {
+    /// Handles every package with `handler`, for handlers that are types rather than closures.
+    pub fn package_handler(self, handler: impl PackageHandler<P, S>) -> Self {
+        self.set_package_handler(Box::new(TypedHandler(handler)))
+    }
+
+    pub(crate) fn set_package_handler(mut self, handler: Box<dyn DynPackageHandler<P, S>>) -> Self {
         self.package_handler = Some(handler);
+        self
+    }
+
+    /// Requires every session to complete a handshake before it counts as connected, like
+    /// SuperSocket's `IHandshakeRequiredSession`. Protocols such as WebSocket use it.
+    ///
+    /// Until the package handler calls [`Session::complete_handshake`], the session is not in the
+    /// session container, so broadcasts skip it, its connected handlers have not run and its
+    /// packages are handled one at a time. A session that does not complete the handshake within
+    /// [`handshake_timeout`](ServerOptions::handshake_timeout) is closed with
+    /// [`CloseReason::Timeout`]. The closed handlers run only for sessions that completed it;
+    /// middleware sees every session.
+    pub fn require_handshake(mut self) -> Self {
+        self.handshake_required = true;
         self
     }
 
@@ -297,6 +400,7 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
                 on_closed: self.on_closed,
                 on_error: self.on_error,
                 middlewares,
+                handshake_required: self.handshake_required,
                 listeners,
                 next_session_id: AtomicU64::new(1),
                 started: AtomicBool::new(false),
@@ -316,11 +420,12 @@ pub struct Server<P, S = ()> {
 pub(crate) struct ServerInner<P, S> {
     pub(crate) info: Arc<ServerInfo<S>>,
     pub(crate) filter_factory: FilterFactory<P>,
-    pub(crate) package_handler: Option<Box<dyn PackageHandler<P, S>>>,
+    pub(crate) package_handler: Option<Box<dyn DynPackageHandler<P, S>>>,
     pub(crate) on_connected: Option<ConnectedHandler<S>>,
     pub(crate) on_closed: Option<ClosedHandler<S>>,
     pub(crate) on_error: Option<ErrorHandler<S>>,
     pub(crate) middlewares: Vec<Box<dyn DynMiddleware<S>>>,
+    pub(crate) handshake_required: bool,
     listeners: Vec<Arc<Listener>>,
     pub(crate) next_session_id: AtomicU64,
     started: AtomicBool,
@@ -410,6 +515,7 @@ impl<P: Send + 'static> Server<P> {
             on_closed: None,
             on_error: None,
             middlewares: Vec::new(),
+            handshake_required: false,
         }
     }
 }

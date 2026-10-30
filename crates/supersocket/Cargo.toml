@@ -11,25 +11,30 @@ categories.workspace = true
 readme = "../../README.md"
 
 [features]
-## TLS through rustls, for listeners and, with `client`, for the client.
-tls = ["supersocket-server/tls", "supersocket-client?/tls"]
+## TLS through rustls, for listeners and, with `client`, for the clients.
+tls = ["supersocket-server/tls", "supersocket-client?/tls", "supersocket-websocket?/tls"]
 ## Loading `ServerOptions` from TOML or JSON files with environment overrides.
 config = ["supersocket-server/config"]
-## The client, `EasyClient`.
-client = ["dep:supersocket-client"]
+## The client, `EasyClient`, and with `websocket` the WebSocket client.
+client = ["dep:supersocket-client", "supersocket-websocket?/client"]
 ## HTTP CONNECT, SOCKS4 and SOCKS5 proxy connectors for the client.
 proxy = ["client", "supersocket-client/proxy"]
+## The WebSocket server, and with `client` the WebSocket client.
+websocket = ["dep:supersocket-websocket"]
 
 [dependencies]
 supersocket-connection.workspace = true
 supersocket-proto.workspace = true
 supersocket-server.workspace = true
 supersocket-client = { workspace = true, optional = true }
+supersocket-websocket = { workspace = true, optional = true }
 
 [dev-dependencies]
+futures-util.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -49,6 +54,18 @@ required-features = ["client"]
 name = "proxy_client"
 required-features = ["proxy"]
 
+[[example]]
+name = "websocket_echo_server"
+required-features = ["websocket"]
+
+[[example]]
+name = "websocket_chat"
+required-features = ["websocket"]
+
+[[example]]
+name = "websocket_client"
+required-features = ["websocket", "client"]
+
 [[test]]
 name = "tls"
 required-features = ["tls"]
@@ -64,6 +81,14 @@ required-features = ["tls", "client"]
 [[test]]
 name = "proxy"
 required-features = ["proxy"]
+
+[[test]]
+name = "websocket"
+required-features = ["websocket"]
+
+[[test]]
+name = "websocket_client"
+required-features = ["websocket", "client", "tls"]
 
 [lints]
 workspace = true

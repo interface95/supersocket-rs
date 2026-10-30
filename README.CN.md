@@ -39,6 +39,8 @@ async fn main() -> Result<(), supersocket::Error> {
 - **空闲会话不占缓冲区**，大量长期空闲的连接也很省内存。
 - **客户端**照 SuperSocket 的 `EasyClient` 设计：通过一串连接器建立连接（先 TCP 或 HTTP CONNECT、SOCKS4、SOCKS5 代理，再套 TLS），
   复用服务端的协议过滤器和发送队列。
+- **WebSocket**（RFC 6455）服务端和客户端建在同一个核心上：握手过滤器读完升级请求后切换到帧过滤器，握手完成后会话才算连上。
+  分片、ping 和关闭握手都替你处理好了，并和 tungstenite 做过互通测试。
 - 通过 rustls 支持 **TLS**；**配置**可以从 TOML 或 JSON 文件读取，并用环境变量覆盖；日志用 **tracing**；
   收到 Ctrl+C 或 SIGTERM 时优雅关闭。
 
@@ -48,7 +50,7 @@ async fn main() -> Result<(), supersocket::Error> {
 
 ```toml
 [dependencies]
-supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # 可选 feature："tls"、"config"、"client"、"proxy"
+supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # 可选 feature："tls"、"config"、"client"、"proxy"、"websocket"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -63,6 +65,9 @@ cargo run --example tls_echo_server --features tls
 cargo run --example config_server --features config
 cargo run --example echo_client --features client     # 先运行 echo_server
 cargo run --example proxy_client --features proxy -- 127.0.0.1:1080 example.com:80
+cargo run --example websocket_echo_server --features websocket
+cargo run --example websocket_chat --features websocket
+cargo run --example websocket_client --features websocket,client   # 先运行 websocket_echo_server
 ```
 
 ## 使用说明
@@ -217,6 +222,47 @@ EasyClient::builder(LineFilter::default())
 `HttpProxy`（CONNECT 方法）和 `Socks4Proxy`（主机名用 SOCKS4a）用法一样；任何实现了 `Connector` 的类型都可以通过
 `.connector(...)` 加进来。
 
+### WebSocket
+
+启用 `websocket` feature。WebSocket 服务端跑在同一个核心上：第一个协议过滤器读 HTTP 升级请求，读完切换到帧过滤器；
+握手完成后会话才算连上，所以广播不会发到还在升级的连接上。监听器配了 TLS 就是 `wss://`。
+
+```rust
+use supersocket::websocket::{Rejection, WebSocketServer};
+
+WebSocketServer::builder()
+    .subprotocols(["chat.v1"])
+    .on_handshake(async |session| match session.request().query() {
+        Some("token=secret") => Ok(()),
+        _ => Err(Rejection::new(401, "log in first")),
+    })
+    .on_message(async |session, message| {
+        for other in session.sessions() {
+            let _ = other.send(&message).await; // 广播
+        }
+        Ok(())
+    })
+    .listen("0.0.0.0:4040")
+    .build()?
+    .run()
+    .await
+```
+
+`session.close(CloseCode::NORMAL, "bye")` 发起关闭握手；服务端关闭时会给每个客户端发 1001（going away）。
+`max_package_length` 同时限制单帧大小和分片拼接后的消息大小。
+
+再启用 `client` feature，就可以用 `WebSocketClient`。它和 `EasyClient` 用同一套连接器，所以代理和 `wss://` 的用法也一样：
+
+```rust
+let mut client = WebSocketClient::connect("wss://example.com/chat").await?;
+client.send_text("hello").await?;
+let reply = client.receive().await?; // Some(Message)，连接关闭后返回 None
+client.close(CloseCode::NORMAL, "done").await;
+```
+
+WebSocket 服务端用到的两个核心功能，别的协议也能用：一是 `PackageHandler` 类型，它的 `closing` 钩子可以在关闭前排一条告别消息；
+二是 `ServerBuilder::require_handshake`，在处理器调用 `session.complete_handshake()` 之前，会话不进会话容器，连接回调也先不触发。
+
 ### 中间件
 
 ```rust
@@ -303,7 +349,7 @@ Server::builder(LineFilter::default).options(options)
 
 ## 路线图
 
-- 基于协议过滤器的 WebSocket 服务端和客户端
+- WebSocket 压缩（permessage-deflate），并跑一遍 Autobahn 测试套件
 - 用派生宏注册命令
 - UDP 会话（有需求再做）
 

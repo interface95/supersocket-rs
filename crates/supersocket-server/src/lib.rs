@@ -43,7 +43,7 @@ pub use error::{BoxError, Error, HandlerResult};
 pub use extensions::Extensions;
 pub use middleware::Middleware;
 pub use options::{ListenOptions, PackageHandling, ServerOptions, TlsOptions};
-pub use server::{ErrorAction, PackageError, Server, ServerBuilder, ServerInfo};
+pub use server::{ErrorAction, PackageError, PackageHandler, Server, ServerBuilder, ServerInfo};
 pub use session::{CloseReason, Session, SessionContainer, SessionState};
 
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;

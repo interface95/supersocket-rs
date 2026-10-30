@@ -53,6 +53,13 @@ pub struct ServerOptions {
     /// How long a closing session may take to send data that is still queued. Default: 5 seconds.
     #[serde(with = "lenient::duration")]
     pub close_timeout: Duration,
+
+    /// How long a session may take to complete its handshake on a server that requires one, such
+    /// as a WebSocket server; see
+    /// [`ServerBuilder::require_handshake`](crate::ServerBuilder::require_handshake). Default:
+    /// 10 seconds.
+    #[serde(with = "lenient::duration")]
+    pub handshake_timeout: Duration,
 }
 
 impl Default for ServerOptions {
@@ -69,6 +76,7 @@ impl Default for ServerOptions {
             send_timeout: None,
             send_buffer_limit: 64 * 1024,
             close_timeout: Duration::from_secs(5),
+            handshake_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -100,6 +108,9 @@ impl ServerOptions {
         }
         if self.send_timeout.is_some_and(|timeout| timeout.is_zero()) {
             return invalid("send_timeout must be greater than zero".into());
+        }
+        if self.handshake_timeout.is_zero() {
+            return invalid("handshake_timeout must be greater than zero".into());
         }
         for listener in &self.listeners {
             if listener.backlog == 0 {

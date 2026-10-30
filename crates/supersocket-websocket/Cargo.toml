@@ -1,0 +1,27 @@
+[package]
+name = "supersocket-websocket"
+description = "WebSocket (RFC 6455) server and client for supersocket-rs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+## The WebSocket client, built on `EasyClient`.
+client = ["dep:supersocket-client"]
+## `wss://` for the client, with `client`.
+tls = ["supersocket-client?/tls"]
+
+[dependencies]
+supersocket-proto.workspace = true
+supersocket-server.workspace = true
+supersocket-client = { workspace = true, optional = true }
+bytes.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+tracing.workspace = true
+
+[lints]
+workspace = true

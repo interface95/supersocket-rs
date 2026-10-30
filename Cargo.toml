@@ -16,6 +16,7 @@ supersocket-proto = { path = "crates/supersocket-proto", version = "0.1.0" }
 supersocket-connection = { path = "crates/supersocket-connection", version = "0.1.0" }
 supersocket-client = { path = "crates/supersocket-client", version = "0.1.0" }
 supersocket-server = { path = "crates/supersocket-server", version = "0.1.0" }
+supersocket-websocket = { path = "crates/supersocket-websocket", version = "0.1.0" }
 
 bytes = "1.10"
 humantime = "2.1"
@@ -29,7 +30,9 @@ toml = "1.0"
 tracing = "0.1"
 webpki-roots = "1.0"
 
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 rcgen = "0.14"
+tokio-tungstenite = "0.30"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.rust]
