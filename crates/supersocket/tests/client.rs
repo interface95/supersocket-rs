@@ -5,8 +5,6 @@ mod common;
 use std::{
     io,
     net::SocketAddr,
-    pin::Pin,
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -17,12 +15,7 @@ use supersocket::{
     client::{Connection, Connector, Endpoint, ReadError},
     prelude::*,
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::TcpListener,
-    sync::mpsc,
-    time::timeout,
-};
+use tokio::{net::TcpListener, sync::mpsc, time::timeout};
 
 fn echo_lines() -> ServerBuilder<TextPackage> {
     Server::builder(LineFilter::default).on_package(async |session, package| {
@@ -118,38 +111,13 @@ async fn dropping_every_sender_closes_a_receiving_client() {
     server.shutdown().await;
 }
 
-/// A stream whose writes never finish and whose reads never end, so a client writing to it is
-/// stuck until something cancels it. It drives nothing itself; the close timeout wakes the task.
-struct Stall;
-
-impl AsyncRead for Stall {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-        _: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Poll::Pending
-    }
-}
-
-impl AsyncWrite for Stall {
-    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
-        Poll::Pending
-    }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Pending
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-/// Opens every connection on a [`Stall`] stream.
+/// Opens every connection on a stream whose writes never finish, so the client's writer is stuck
+/// until the close timeout cancels it.
 struct StallConnector;
 
 impl Connector for StallConnector {
     async fn connect(&self, _: &Endpoint, _: Option<Connection>) -> io::Result<Connection> {
-        Ok(Connection::new(Stall))
+        Ok(Connection::new(common::Stall))
     }
 }
 

@@ -14,8 +14,9 @@ use std::{
 
 use common::{Client, next_reason, start, track_close_reasons};
 use supersocket::{
-    BeginEndMarkFilter, BoxError, BoxFilter, FixedHeaderFilter, FixedHeaderProtocol,
-    PackageHandler, PackageHandling, PipelineFilterExt, ServerBuilder, ServerInfo,
+    BeginEndMarkFilter, BoxError, BoxFilter, ConnectionInfo, FixedHeaderFilter,
+    FixedHeaderProtocol, PackageHandler, PackageHandling, PipelineFilterExt, ServerBuilder,
+    ServerInfo,
     bytes::{Buf, BufMut, Bytes, BytesMut},
     prelude::*,
 };
@@ -1211,44 +1212,50 @@ async fn listeners_take_host_names_and_socket_addresses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn broadcasts_with_try_send_skip_sessions_that_do_not_read() {
-    let (server, address) = start(
-        Server::builder(LineFilter::default)
-            .configure(|options| {
-                options.send_buffer_limit = 16;
-                options.close_timeout = Duration::from_millis(100);
-            })
-            .on_package(async |session, package| {
-                match package.text.as_str() {
-                    // Far more than the socket buffers hold: the queue stays full.
-                    "flood" => session.send(vec![b'x'; 4 * 1024 * 1024]).await?,
-                    "broadcast" => {
-                        let (mut sent, mut skipped) = (0, 0);
-                        session.server().sessions().for_each(|other| {
-                            match other.try_send("news\r\n") {
-                                Ok(()) => sent += 1,
-                                Err(_) => skipped += 1,
-                            }
-                        });
-                        session
-                            .send(format!("sent {sent} skipped {skipped}\r\n"))
-                            .await?;
-                    }
-                    _ => {}
-                }
-                Ok(())
-            }),
-    );
+async fn broadcasts_with_try_send_skip_full_sessions() {
+    let (server, address) = start(echo_lines().configure(|options| options.send_buffer_limit = 16));
+
+    // One real client that reads, so a broadcast reaches it.
     let mut reader = Client::connect(address).await;
-    let mut stalled = Client::connect(address).await;
-    stalled.send(b"flood\r\n").await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    reader.send(b"warm up\r\n").await;
+    assert_eq!(reader.line().await, "warm up");
 
-    reader.send(b"broadcast\r\n").await;
+    // A session whose stream never drains, so its send queue stays full however the platform
+    // buffers sockets. It is marked with a distinctive address so the test can find it.
+    let stuck_addr: SocketAddr = "203.0.113.9:9".parse().unwrap();
+    server
+        .serve_connection(common::Stall, ConnectionInfo::new(stuck_addr, stuck_addr))
+        .unwrap();
+    tokio::time::timeout(common::WAIT, async {
+        while server.info().session_count() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both sessions did not register");
+
+    // Fill the stuck session past the send buffer limit; its writer never drains it.
+    let stuck = server
+        .info()
+        .sessions()
+        .find(|session| session.remote_addr() == stuck_addr)
+        .pop()
+        .unwrap();
+    stuck.try_send([0u8; 64]).unwrap();
+
+    // A broadcast with try_send reaches the reader and skips the full session, without waiting.
+    let (mut sent, mut skipped) = (0, 0);
+    server
+        .info()
+        .sessions()
+        .for_each(|session| match session.try_send("news\r\n") {
+            Ok(()) => sent += 1,
+            Err(_) => skipped += 1,
+        });
+    assert_eq!((sent, skipped), (1, 1));
     assert_eq!(reader.line().await, "news");
-    assert_eq!(reader.line().await, "sent 1 skipped 1");
 
-    // Sessions compare by identity, and are kept in maps by id, for rooms and the like.
+    // Sessions compare by identity and are kept in maps by id, for rooms and the like.
     let sessions = server.info().sessions().all();
     let members: HashMap<u64, Session> = sessions.iter().map(|s| (s.id(), s.clone())).collect();
     assert_eq!(members.len(), 2);

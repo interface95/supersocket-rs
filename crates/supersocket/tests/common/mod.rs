@@ -2,11 +2,16 @@
 
 #![allow(dead_code)]
 
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use supersocket::{CloseReason, Server, ServerBuilder, SessionState};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
     net::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -16,6 +21,37 @@ use tokio::{
 };
 
 pub const WAIT: Duration = Duration::from_secs(5);
+
+/// A stream whose writes never finish and whose reads never end: a session served over it has a
+/// writer that never drains, which fills its send queue deterministically, without depending on
+/// any operating system's socket buffering.
+pub struct Stall;
+
+impl AsyncRead for Stall {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for Stall {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Pending
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
 
 /// Builds the server listening on a free local port and starts it.
 pub fn start<P: Send + 'static, S: SessionState>(
