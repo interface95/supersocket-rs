@@ -38,7 +38,8 @@ async fn main() -> Result<(), supersocket::Error> {
 - **Commands** dispatch packages by key, with filters that run before and after commands.
 - **Middleware** sees sessions come and go and can reject them.
 - **Serial or concurrent** package handling per session, with a handling timeout and an error
-  handler that decides whether a failing session stays open.
+  handler that decides whether a failing session stays open. A panicking handler is caught and
+  reported to the error handler; it never takes the server down.
 - **Batched writes**: data queued while packages are handled goes out in one system call, with
   back-pressure when a peer reads slowly and an optional send timeout.
 - **Idle sessions hold no buffers**, so many mostly idle connections stay cheap.
@@ -189,14 +190,29 @@ to `max_in_flight` packages of a session run at the same time on the runtime's w
 ### Middleware
 
 ```rust
-struct ConnectionLimit(usize);
+struct ConnectionLimit {
+    limit: usize,
+    current: AtomicUsize,
+}
 
 impl<S: SessionState> Middleware<S> for ConnectionLimit {
-    async fn register_session(&self, session: &Session<S>) -> bool {
-        session.server().session_count() < self.0
+    async fn register_session(&self, _session: &Session<S>) -> bool {
+        if self.current.fetch_add(1, Ordering::SeqCst) < self.limit {
+            true
+        } else {
+            self.current.fetch_sub(1, Ordering::SeqCst);
+            false
+        }
+    }
+
+    async fn unregister_session(&self, _session: &Session<S>) {
+        self.current.fetch_sub(1, Ordering::SeqCst);
     }
 }
 ```
+
+Sessions connect concurrently, so a limit keeps its own count rather than reading
+`session_count()`.
 
 ### TLS
 
@@ -216,7 +232,9 @@ The handshake runs in the connection's own task, so slow clients never hold up a
 ### Configuration
 
 With the `config` feature, `ServerOptions::load` reads a TOML or JSON file. Every field has a
-default, and environment variables override the file:
+default, and environment variables override the file. Values are converted to the type of
+their field, so numbers may be written as strings and durations as `"30s"` or a number of
+seconds:
 
 ```toml
 name = "echo"

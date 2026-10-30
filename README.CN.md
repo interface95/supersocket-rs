@@ -34,7 +34,7 @@ async fn main() -> Result<(), supersocket::Error> {
 - **会话**是很轻的句柄，可以克隆到别的任务里随时发送。可以挂带类型的会话状态，也可以通过扩展表挂任意数据。
 - **命令**按 key 分发包，命令过滤器在命令执行前后运行。
 - **中间件**能看到会话的建立和关闭，也可以拒绝会话。
-- 每个会话的包可以**串行或并发**处理，有处理超时，出错时由错误回调决定会话是否继续。
+- 每个会话的包可以**串行或并发**处理，有处理超时，出错时由错误回调决定会话是否继续。处理函数 panic 会被捕获并交给错误回调，不会拖垮服务。
 - **合并发送**：处理一批包期间排队的数据用一次系统调用发出；对方读得慢时 `send` 会等待，也可以设发送超时。
 - **空闲会话不占缓冲区**，大量长期空闲的连接也很省内存。
 - 通过 rustls 支持 **TLS**；**配置**可以从 TOML 或 JSON 文件读取，并用环境变量覆盖；日志用 **tracing**；
@@ -179,14 +179,28 @@ Server::builder(LineFilter::default)
 ### 中间件
 
 ```rust
-struct ConnectionLimit(usize);
+struct ConnectionLimit {
+    limit: usize,
+    current: AtomicUsize,
+}
 
 impl<S: SessionState> Middleware<S> for ConnectionLimit {
-    async fn register_session(&self, session: &Session<S>) -> bool {
-        session.server().session_count() < self.0
+    async fn register_session(&self, _session: &Session<S>) -> bool {
+        if self.current.fetch_add(1, Ordering::SeqCst) < self.limit {
+            true
+        } else {
+            self.current.fetch_sub(1, Ordering::SeqCst);
+            false
+        }
+    }
+
+    async fn unregister_session(&self, _session: &Session<S>) {
+        self.current.fetch_sub(1, Ordering::SeqCst);
     }
 }
 ```
+
+会话是并发建立的，所以限流时要自己计数，不能依赖 `session_count()`。
 
 ### TLS
 
@@ -205,7 +219,7 @@ TLS 握手在每个连接自己的任务里进行，慢客户端不会拖住接�
 
 ### 配置
 
-开启 `config` feature 后，`ServerOptions::load` 可以读取 TOML 或 JSON 文件。每个字段都有默认值，环境变量可以覆盖文件里的值：
+开启 `config` feature 后，`ServerOptions::load` 可以读取 TOML 或 JSON 文件。每个字段都有默认值，环境变量可以覆盖文件里的值。值会按字段类型转换，数字可以写成字符串，时长可以写 `"30s"` 或秒数：
 
 ```toml
 name = "echo"
