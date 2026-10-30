@@ -1,0 +1,43 @@
+[package]
+name = "supersocket"
+description = "A socket server framework for Rust with pipeline filters, sessions, commands and middleware, inspired by SuperSocket."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[features]
+## TLS listeners through rustls.
+tls = ["supersocket-server/tls"]
+## Loading `ServerOptions` from TOML or JSON files with environment overrides.
+config = ["supersocket-server/config"]
+
+[dependencies]
+supersocket-proto.workspace = true
+supersocket-server.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[example]]
+name = "tls_echo_server"
+required-features = ["tls"]
+
+[[example]]
+name = "config_server"
+required-features = ["config"]
+
+[[test]]
+name = "tls"
+required-features = ["tls"]
+
+[lints]
+workspace = true

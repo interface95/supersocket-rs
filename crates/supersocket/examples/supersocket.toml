@@ -1,0 +1,14 @@
+# Options for the config_server example. Every field is optional; see ServerOptions for defaults.
+name = "config-example"
+max_package_length = 65536
+package_handling_timeout = "10s"
+idle_session_timeout = "5m"
+package_handling = "serial"
+# package_handling = { concurrent = { max_in_flight = 16 } }
+
+[[listeners]]
+address = "0.0.0.0:4040"
+
+# [[listeners]]
+# address = "0.0.0.0:4443"
+# tls = { cert = "cert.pem", key = "key.pem" }
