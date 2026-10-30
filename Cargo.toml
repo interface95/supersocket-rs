@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/interface95/supersocket-rs"
+keywords = ["socket", "server", "tcp", "tokio", "protocol"]
+categories = ["network-programming", "asynchronous"]
+
+[workspace.dependencies]
+supersocket-proto = { path = "crates/supersocket-proto", version = "0.1.0" }
+supersocket-server = { path = "crates/supersocket-server", version = "0.1.0" }
+
+bytes = "1.10"
+humantime-serde = "1.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.47", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
+tokio-util = { version = "0.7", default-features = false }
+toml = "1.0"
+tracing = "0.1"
+
+rcgen = "0.14"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

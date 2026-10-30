@@ -1,0 +1,17 @@
+[package]
+name = "supersocket-proto"
+description = "Protocol layer of supersocket-rs: pipeline filters that cut byte streams into packages."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

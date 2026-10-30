@@ -1,0 +1,8 @@
+supersocket-rs
+
+This project is an independent Rust implementation inspired by SuperSocket
+(https://github.com/kerryjiang/SuperSocket), a socket server framework for
+.NET created by Kerry Jiang and contributors and licensed under the Apache
+License, Version 2.0. supersocket-rs follows SuperSocket's architecture
+(pipeline filters, sessions, commands and middleware) but contains no code
+from it.
