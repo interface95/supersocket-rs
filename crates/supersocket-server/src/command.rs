@@ -1,10 +1,12 @@
-use std::{collections::HashMap, fmt::Debug, future::Future, hash::Hash, sync::Arc};
+use std::{
+    collections::HashMap, fmt::Debug, future::Future, hash::Hash, sync::Arc, time::Duration,
+};
 
 use supersocket_proto::CommandPackage;
 
 use crate::{
     BoxFuture, HandlerResult,
-    server::ServerBuilder,
+    server::{PackageError, PackageHandler, ServerBuilder, handle_with_limit},
     session::{Session, SessionState},
 };
 
@@ -246,10 +248,19 @@ impl<P: KeyedPackage, S: SessionState> ServerBuilder<P, S> {
             unknown: None,
         };
         configure(&mut commands);
-        let commands = Arc::new(commands);
-        self.on_package(move |session, package| {
-            let commands = commands.clone();
-            async move { commands.dispatch(session, package).await }
-        })
+        self.set_package_handler(Box::new(commands))
+    }
+}
+
+impl<P: KeyedPackage, S: SessionState> PackageHandler<P, S> for Commands<P, S> {
+    fn handle<'a>(
+        &'a self,
+        session: Session<S>,
+        package: P,
+        limit: Duration,
+    ) -> BoxFuture<'a, Result<(), PackageError>> {
+        Box::pin(handle_with_limit(limit, move || {
+            self.dispatch(session, package)
+        }))
     }
 }

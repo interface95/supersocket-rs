@@ -16,6 +16,7 @@ tls = ["dep:tokio-rustls"]
 config = ["dep:serde_json", "dep:toml"]
 
 [dependencies]
+supersocket-connection.workspace = true
 supersocket-proto.workspace = true
 bytes.workspace = true
 humantime.workspace = true

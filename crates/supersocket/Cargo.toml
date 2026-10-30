@@ -11,14 +11,20 @@ categories.workspace = true
 readme = "../../README.md"
 
 [features]
-## TLS listeners through rustls.
-tls = ["supersocket-server/tls"]
+## TLS through rustls, for listeners and, with `client`, for the client.
+tls = ["supersocket-server/tls", "supersocket-client?/tls"]
 ## Loading `ServerOptions` from TOML or JSON files with environment overrides.
 config = ["supersocket-server/config"]
+## The client, `EasyClient`.
+client = ["dep:supersocket-client"]
+## HTTP CONNECT, SOCKS4 and SOCKS5 proxy connectors for the client.
+proxy = ["client", "supersocket-client/proxy"]
 
 [dependencies]
+supersocket-connection.workspace = true
 supersocket-proto.workspace = true
 supersocket-server.workspace = true
+supersocket-client = { workspace = true, optional = true }
 
 [dev-dependencies]
 rcgen.workspace = true
@@ -35,9 +41,29 @@ required-features = ["tls"]
 name = "config_server"
 required-features = ["config"]
 
+[[example]]
+name = "echo_client"
+required-features = ["client"]
+
+[[example]]
+name = "proxy_client"
+required-features = ["proxy"]
+
 [[test]]
 name = "tls"
 required-features = ["tls"]
+
+[[test]]
+name = "client"
+required-features = ["client"]
+
+[[test]]
+name = "client_tls"
+required-features = ["tls", "client"]
+
+[[test]]
+name = "proxy"
+required-features = ["proxy"]
 
 [lints]
 workspace = true

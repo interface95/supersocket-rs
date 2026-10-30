@@ -111,3 +111,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Client<R, W> {
         }
     }
 }
+
+#[cfg(feature = "tls")]
+pub mod tls;

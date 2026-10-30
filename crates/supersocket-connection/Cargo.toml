@@ -1,0 +1,22 @@
+[package]
+name = "supersocket-connection"
+description = "Connection layer of supersocket-rs, shared by the server and the client: package reading and batched sending."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+supersocket-proto.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

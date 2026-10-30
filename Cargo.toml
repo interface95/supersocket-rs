@@ -13,6 +13,8 @@ categories = ["network-programming", "asynchronous"]
 
 [workspace.dependencies]
 supersocket-proto = { path = "crates/supersocket-proto", version = "0.1.0" }
+supersocket-connection = { path = "crates/supersocket-connection", version = "0.1.0" }
+supersocket-client = { path = "crates/supersocket-client", version = "0.1.0" }
 supersocket-server = { path = "crates/supersocket-server", version = "0.1.0" }
 
 bytes = "1.10"
@@ -25,6 +27,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
 tracing = "0.1"
+webpki-roots = "1.0"
 
 rcgen = "0.14"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

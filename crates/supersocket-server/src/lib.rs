@@ -31,7 +31,6 @@ mod extensions;
 mod lenient;
 mod middleware;
 mod options;
-mod panic;
 mod server;
 mod session;
 #[cfg(feature = "tls")]

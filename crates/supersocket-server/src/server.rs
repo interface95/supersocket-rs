@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use supersocket_connection::catch_panic;
 use supersocket_proto::{BoxFilter, PipelineFilter};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -93,8 +94,53 @@ pub enum ErrorAction {
 }
 
 type FilterFactory<P> = Arc<dyn Fn() -> BoxFilter<P> + Send + Sync>;
-pub(crate) type PackageHandler<P, S> =
-    Arc<dyn Fn(Session<S>, P) -> BoxFuture<'static, HandlerResult> + Send + Sync>;
+/// Handles one package within a time limit. The returned future runs the application's code
+/// together with the timeout and panic catching, so they share the one allocation each package
+/// needs, and it borrows the handler instead of cloning shared state for every package.
+pub(crate) trait PackageHandler<P, S>: Send + Sync {
+    fn handle<'a>(
+        &'a self,
+        session: Session<S>,
+        package: P,
+        limit: Duration,
+    ) -> BoxFuture<'a, Result<(), PackageError>>;
+}
+
+/// Runs the future `start` creates, with a time limit, turning panics into errors.
+pub(crate) async fn handle_with_limit<Fut>(
+    limit: Duration,
+    start: impl FnOnce() -> Fut,
+) -> Result<(), PackageError>
+where
+    Fut: Future<Output = HandlerResult>,
+{
+    match catch_panic(async { tokio::time::timeout(limit, start()).await }).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(PackageError::Handler(error)),
+        // Dropping the handler's future cancels it at its current await point.
+        Ok(Err(_)) => Err(PackageError::Timeout(limit)),
+        Err(panic) => Err(PackageError::Panicked(panic)),
+    }
+}
+
+struct FnHandler<F>(F);
+
+impl<P, S, F, Fut> PackageHandler<P, S> for FnHandler<F>
+where
+    P: Send + 'static,
+    S: SessionState,
+    F: Fn(Session<S>, P) -> Fut + Send + Sync,
+    Fut: Future<Output = HandlerResult> + Send + 'static,
+{
+    fn handle<'a>(
+        &'a self,
+        session: Session<S>,
+        package: P,
+        limit: Duration,
+    ) -> BoxFuture<'a, Result<(), PackageError>> {
+        Box::pin(handle_with_limit(limit, move || (self.0)(session, package)))
+    }
+}
 type ConnectedHandler<S> = Arc<dyn Fn(Session<S>) -> BoxFuture<'static, ()> + Send + Sync>;
 type ClosedHandler<S> =
     Arc<dyn Fn(Session<S>, CloseReason) -> BoxFuture<'static, ()> + Send + Sync>;
@@ -106,7 +152,7 @@ pub struct ServerBuilder<P, S = ()> {
     filter_factory: FilterFactory<P>,
     options: ServerOptions,
     services: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
-    package_handler: Option<PackageHandler<P, S>>,
+    package_handler: Option<Box<dyn PackageHandler<P, S>>>,
     on_connected: Option<ConnectedHandler<S>>,
     on_closed: Option<ClosedHandler<S>>,
     on_error: Option<ErrorHandler<S>>,
@@ -145,14 +191,16 @@ impl<P: Send + 'static> ServerBuilder<P> {
 impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
     /// Handles every package. Packages of a session are handled one at a time unless
     /// [`PackageHandling::Concurrent`](crate::PackageHandling::Concurrent) is configured.
-    pub fn on_package<F, Fut>(mut self, handler: F) -> Self
+    pub fn on_package<F, Fut>(self, handler: F) -> Self
     where
         F: Fn(Session<S>, P) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = HandlerResult> + Send + 'static,
     {
-        self.package_handler = Some(Arc::new(move |session, package| {
-            Box::pin(handler(session, package))
-        }));
+        self.set_package_handler(Box::new(FnHandler(handler)))
+    }
+
+    pub(crate) fn set_package_handler(mut self, handler: Box<dyn PackageHandler<P, S>>) -> Self {
+        self.package_handler = Some(handler);
         self
     }
 
@@ -268,7 +316,7 @@ pub struct Server<P, S = ()> {
 pub(crate) struct ServerInner<P, S> {
     pub(crate) info: Arc<ServerInfo<S>>,
     pub(crate) filter_factory: FilterFactory<P>,
-    pub(crate) package_handler: Option<PackageHandler<P, S>>,
+    pub(crate) package_handler: Option<Box<dyn PackageHandler<P, S>>>,
     pub(crate) on_connected: Option<ConnectedHandler<S>>,
     pub(crate) on_closed: Option<ClosedHandler<S>>,
     pub(crate) on_error: Option<ErrorHandler<S>>,

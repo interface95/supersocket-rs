@@ -1,17 +1,13 @@
 use std::{
-    future::poll_fn,
-    io,
-    mem::MaybeUninit,
     net::SocketAddr,
-    pin::Pin,
     sync::{Arc, atomic::Ordering},
-    task::{Poll, ready},
 };
 
-use bytes::BytesMut;
-use supersocket_proto::{BoxFilter, ProtocolError};
+use supersocket_connection::{
+    PackageReader, ReadError, ReadOptions, catch_panic, catch_panic_sync,
+};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncWrite},
     net::TcpStream,
     task::JoinSet,
 };
@@ -19,14 +15,9 @@ use tracing::Instrument;
 
 use crate::{
     options::PackageHandling,
-    panic::{catch_panic, catch_panic_sync},
-    server::{ErrorAction, Listener, PackageError, ServerInfo, ServerInner},
+    server::{ErrorAction, Listener, ServerInfo, ServerInner},
     session::{CloseReason, Session, SessionState},
 };
-
-/// Bytes read per poll while a session has no buffered data. They are read into the stack and
-/// only what arrived is copied to the heap.
-const STACK_READ_SIZE: usize = 8 * 1024;
 
 /// Serves one accepted connection.
 pub(crate) async fn serve<P: Send + 'static, S: SessionState>(
@@ -71,7 +62,7 @@ struct Cleanup<S> {
 impl<S> Drop for Cleanup<S> {
     fn drop(&mut self) {
         self.session.close(CloseReason::InternalError);
-        self.session.close_outbox();
+        self.session.close_send_queue();
         self.server.sessions().remove(self.session.id());
     }
 }
@@ -105,7 +96,7 @@ async fn run_session<P, S, R>(
     if !register(&server, &session).await {
         tracing::debug!("session rejected by middleware");
         session.close(CloseReason::Rejected);
-        session.close_outbox();
+        session.close_send_queue();
         let _ = writer_task.await;
         return;
     }
@@ -127,7 +118,7 @@ async fn run_session<P, S, R>(
 
     // Send what is still queued (unless the peer stops reading), and close the connection before
     // the closed events run.
-    session.close_outbox();
+    session.close_send_queue();
     if tokio::time::timeout(server.info.options().close_timeout, &mut writer_task)
         .await
         .is_err()
@@ -178,44 +169,12 @@ async fn register<P, S: SessionState>(server: &ServerInner<P, S>, session: &Sess
     true
 }
 
-enum Step<P> {
-    Package(P),
-    Switched,
-    NeedMore,
-}
-
-/// Runs the filter once: decodes a package if one is complete and applies a filter switch.
-fn decode_step<P: Send + 'static>(
-    filter: &mut BoxFilter<P>,
-    buf: &mut BytesMut,
-) -> Result<Step<P>, ProtocolError> {
-    let package = filter.filter(buf)?;
-    let switched = match filter.next_filter() {
-        Some(next) => {
-            filter.reset();
-            *filter = next;
-            true
-        }
-        None => false,
-    };
-    Ok(match package {
-        Some(package) => {
-            if !switched {
-                filter.reset();
-            }
-            Step::Package(package)
-        }
-        None if switched => Step::Switched,
-        None => Step::NeedMore,
-    })
-}
-
-/// Reads, cuts packages with the pipeline filter and hands them to the package handler until the
-/// session ends. Returns why it ended.
+/// Reads packages and hands them to the package handler until the session ends. Returns why it
+/// ended.
 async fn read_loop<P, S, R>(
     server: &Arc<ServerInner<P, S>>,
     session: &Session<S>,
-    reader: &mut R,
+    reader: R,
 ) -> CloseReason
 where
     P: Send + 'static,
@@ -224,67 +183,69 @@ where
 {
     let options = server.info.options();
     let close_token = session.close_token().clone();
-    let mut filter = match catch_panic_sync(|| (server.filter_factory)()) {
+    let filter = match catch_panic_sync(|| (server.filter_factory)()) {
         Ok(filter) => filter,
         Err(panic) => {
             tracing::error!(%panic, "creating the pipeline filter panicked");
             return CloseReason::InternalError;
         }
     };
-    let mut buf = BytesMut::new();
+    let read_options = ReadOptions {
+        max_package_length: options.max_package_length,
+        receive_buffer_size: options.receive_buffer_size,
+    };
+    let mut packages = PackageReader::new(reader, filter, read_options);
     let mut in_flight = JoinSet::new();
 
-    let reason = 'session: loop {
-        while !buf.is_empty() {
-            let package = match catch_panic_sync(|| decode_step(&mut filter, &mut buf)) {
-                Ok(Ok(Step::Package(package))) => package,
-                Ok(Ok(Step::Switched)) => continue,
-                Ok(Ok(Step::NeedMore)) => {
-                    if buf.len() > options.max_package_length {
-                        tracing::debug!(buffered = buf.len(), "package exceeds the maximum length");
-                        break 'session CloseReason::ProtocolError;
-                    }
-                    break;
-                }
-                Ok(Err(error)) => {
-                    tracing::debug!(%error, "closing session");
-                    break 'session CloseReason::ProtocolError;
-                }
-                Err(panic) => {
-                    tracing::error!(%panic, "pipeline filter panicked");
-                    break 'session CloseReason::InternalError;
-                }
-            };
-            match options.package_handling {
-                PackageHandling::Serial => handle_package(server, session, package).await,
-                PackageHandling::Concurrent { max_in_flight } => {
-                    while in_flight.len() >= max_in_flight {
-                        in_flight.join_next().await;
-                    }
-                    let (server, session) = (server.clone(), session.clone());
-                    in_flight
-                        .spawn(async move { handle_package(&server, &session, package).await });
-                }
-            }
-            if close_token.is_cancelled() {
-                break 'session cancelled_reason(server);
-            }
-        }
+    let reason = loop {
         while in_flight.try_join_next().is_some() {}
-        // Everything received has been handled: drop the buffer so an idle session holds none.
-        if buf.is_empty() {
-            buf = BytesMut::new();
-        }
-        tokio::select! {
-            _ = close_token.cancelled() => break 'session cancelled_reason(server),
-            read = read_some(reader, &mut buf, options.receive_buffer_size) => match read {
-                Ok(0) => break 'session CloseReason::RemoteClosed,
-                Ok(_) => session.touch(),
-                Err(error) => {
-                    tracing::debug!(%error, "read failed");
-                    break 'session CloseReason::SocketError;
+        // Packages already received are handled without waiting; only wait for more data (and
+        // watch for the session closing) when none is complete.
+        let package = match packages.try_next() {
+            Ok(Some(package)) => package,
+            Ok(None) => {
+                let read = tokio::select! {
+                    biased;
+                    _ = close_token.cancelled() => break cancelled_reason(server),
+                    read = packages.fill() => read,
+                };
+                match read {
+                    Ok(0) => break CloseReason::RemoteClosed,
+                    Ok(_) => {
+                        session.touch();
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "read failed");
+                        break CloseReason::SocketError;
+                    }
                 }
-            },
+            }
+            Err(ReadError::Io(error)) => {
+                tracing::debug!(%error, "read failed");
+                break CloseReason::SocketError;
+            }
+            Err(ReadError::FilterPanicked(panic)) => {
+                tracing::error!(%panic, "pipeline filter panicked");
+                break CloseReason::InternalError;
+            }
+            Err(error) => {
+                tracing::debug!(%error, "closing session");
+                break CloseReason::ProtocolError;
+            }
+        };
+        match options.package_handling {
+            PackageHandling::Serial => handle_package(server, session, package).await,
+            PackageHandling::Concurrent { max_in_flight } => {
+                while in_flight.len() >= max_in_flight {
+                    in_flight.join_next().await;
+                }
+                let (server, session) = (server.clone(), session.clone());
+                in_flight.spawn(async move { handle_package(&server, &session, package).await });
+            }
+        }
+        if close_token.is_cancelled() {
+            break cancelled_reason(server);
         }
     };
     // Let packages still being handled finish; each one is bounded by the handling timeout.
@@ -311,13 +272,8 @@ async fn handle_package<P: Send + 'static, S: SessionState>(
         return;
     };
     let limit = server.info.options().package_handling_timeout;
-    let handling = async { tokio::time::timeout(limit, handler(session.clone(), package)).await };
-    let error = match catch_panic(handling).await {
-        Ok(Ok(Ok(()))) => return,
-        Ok(Ok(Err(error))) => PackageError::Handler(error),
-        // Dropping the handler's future cancels it at its current await point.
-        Ok(Err(_)) => PackageError::Timeout(limit),
-        Err(panic) => PackageError::Panicked(panic),
+    let Err(error) = handler.handle(session.clone(), package, limit).await else {
+        return;
     };
     let action = match &server.on_error {
         Some(on_error) => catch_panic(async { on_error(session.clone(), error).await })
@@ -334,25 +290,4 @@ async fn handle_package<P: Send + 'static, S: SessionState>(
     if action == ErrorAction::Close {
         session.close(CloseReason::ApplicationError);
     }
-}
-
-/// Reads more data into `buf`. While `buf` is empty, that is between packages, nothing is
-/// allocated until data actually arrives.
-async fn read_some<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    buf: &mut BytesMut,
-    chunk_size: usize,
-) -> io::Result<usize> {
-    if !buf.is_empty() {
-        buf.reserve(chunk_size);
-        return reader.read_buf(buf).await;
-    }
-    poll_fn(|cx| {
-        let mut stack = [MaybeUninit::<u8>::uninit(); STACK_READ_SIZE];
-        let mut read_buf = ReadBuf::uninit(&mut stack);
-        ready!(Pin::new(&mut *reader).poll_read(cx, &mut read_buf))?;
-        buf.extend_from_slice(read_buf.filled());
-        Poll::Ready(Ok(read_buf.filled().len()))
-    })
-    .await
 }

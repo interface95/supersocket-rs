@@ -43,6 +43,9 @@ async fn main() -> Result<(), supersocket::Error> {
 - **Batched writes**: data queued while packages are handled goes out in one system call, with
   back-pressure when a peer reads slowly and an optional send timeout.
 - **Idle sessions hold no buffers**, so many mostly idle connections stay cheap.
+- **A client**, modeled on SuperSocket's `EasyClient`: it connects through a chain of
+  connectors (TCP or an HTTP CONNECT, SOCKS4 or SOCKS5 proxy, then TLS) and reuses the server's
+  pipeline filters and send queue.
 - **TLS** through rustls, **configuration** from TOML or JSON files with environment overrides,
   **tracing** for logs, graceful shutdown on Ctrl+C or SIGTERM.
 
@@ -52,7 +55,7 @@ Until the first release, depend on the repository:
 
 ```toml
 [dependencies]
-supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # optional features: "tls", "config"
+supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # optional features: "tls", "config", "client", "proxy"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -65,6 +68,8 @@ cargo run --example custom_protocol
 cargo run --example live_chat
 cargo run --example tls_echo_server --features tls
 cargo run --example config_server --features config
+cargo run --example echo_client --features client     # with echo_server running
+cargo run --example proxy_client --features proxy -- 127.0.0.1:1080 example.com:80
 ```
 
 ## Guide
@@ -165,7 +170,8 @@ Server::builder(CommandLineFilter::default)
 
 `session.server().sessions()` lists the connected sessions, for example to broadcast.
 `session.extensions()` stores data by type, handy for middleware. Shared services registered
-with `.service(value)` are reachable through `session.server().service::<T>()`.
+with `.service(value)` are reachable through `session.server().service::<T>()`. A task spawned
+for a session can wait for `session.closed()` to stop with it.
 
 ### Package handling, errors and timeouts
 
@@ -186,6 +192,46 @@ Server::builder(LineFilter::default)
 
 By default the packages of a session are handled one at a time, in order. In concurrent mode up
 to `max_in_flight` packages of a session run at the same time on the runtime's worker threads.
+
+### Client
+
+Enable the `client` feature. An `EasyClient` cuts what the server sends into packages with a
+pipeline filter, the same ones the server uses:
+
+```rust
+let mut client = EasyClient::builder(LineFilter::default())
+    .connect("127.0.0.1:4040")
+    .await?;
+client.send("hello\r\n").await?;
+let reply = client.receive().await?; // Some(TextPackage), or None once closed
+```
+
+Or hand every package to a handler running in the background, and keep the returned sender for
+sending and closing:
+
+```rust
+let sender = client.start_receive(async |sender, package| {
+    let _ = sender.send(format!("got {}\r\n", package.text)).await;
+});
+sender.close().await; // sends what is queued first, for up to `close_timeout`
+```
+
+The background task does not keep the connection open: dropping the last sender closes it the
+same way.
+
+The connection is built by a chain of connectors, like SuperSocket's `IConnector`: the first
+one opens it, later ones wrap it.
+
+```rust
+EasyClient::builder(LineFilter::default())
+    .proxy(Socks5Proxy::new("127.0.0.1:1080").credentials("user", "secret")) // feature "proxy"
+    .tls(TlsConnector::new()) // feature "tls"; Mozilla roots by default
+    .connect("example.com:443")
+    .await?;
+```
+
+`HttpProxy` (CONNECT) and `Socks4Proxy` (with SOCKS4a for host names) work the same way, and
+anything implementing `Connector` can be added with `.connector(...)`.
 
 ### Middleware
 
@@ -274,14 +320,13 @@ separate cores (4 cores, 8 threads each), the core of supersocket-rs compared wi
 | Memory with 10,000 idle connections | 63 MB | 186 MB |
 
 These numbers come from a prototype of the same core. Since then idle sessions stopped holding
-read and write buffers, which halved the memory per idle connection again (6.4 KB to 2.9 KB in
-a local measurement). Echo measures framework overhead only; real applications spend most of
+read and write buffers, which halved the memory per idle connection again (6.4 KB to about
+3 KB in a local measurement). Echo measures framework overhead only; real applications spend most of
 their time elsewhere.
 
 ## Roadmap
 
-- WebSocket server, built on pipeline filters
-- Client with TCP, TLS and proxy (HTTP CONNECT, SOCKS) connectors
+- WebSocket server and client, built on pipeline filters
 - Derive-style command registration
 - UDP sessions, if there is demand
 

@@ -6,18 +6,16 @@ use std::{
     net::SocketAddr,
     ops::Deref,
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
+        Arc, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
 
 use bytes::BytesMut;
+use supersocket_connection::SendQueue;
 use supersocket_proto::PackageEncoder;
-use tokio::{
-    io::{AsyncWrite, AsyncWriteExt},
-    sync::Notify,
-};
+use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
 
 use crate::{BoxError, extensions::Extensions, server::ServerInfo};
@@ -118,27 +116,12 @@ struct SessionInner<S> {
     start_time: SystemTime,
     started_at: Instant,
     last_active_ms: AtomicU64,
-    outbox: Outbox,
+    send_queue: SendQueue,
     close_token: CancellationToken,
     close_reason: OnceLock<CloseReason>,
     extensions: Extensions,
     server: Arc<ServerInfo<S>>,
     state: S,
-}
-
-// Data waiting to be sent. `send` appends to it and the session's writer task writes everything
-// that piled up in one go, so packages handled back to back go out in one system call.
-#[derive(Default)]
-struct Outbox {
-    state: Mutex<OutboxState>,
-    data_available: Notify,
-    drained: Notify,
-}
-
-#[derive(Default)]
-struct OutboxState {
-    pending: BytesMut,
-    closed: bool,
 }
 
 impl<S> Clone for Session<S> {
@@ -176,6 +159,7 @@ impl<S: SessionState> Session<S> {
         close_token: CancellationToken,
         server: Arc<ServerInfo<S>>,
     ) -> Self {
+        let send_queue = SendQueue::new(server.options().send_buffer_limit);
         Self {
             inner: Arc::new(SessionInner {
                 id,
@@ -185,7 +169,7 @@ impl<S: SessionState> Session<S> {
                 start_time: SystemTime::now(),
                 started_at: Instant::now(),
                 last_active_ms: AtomicU64::new(0),
-                outbox: Outbox::default(),
+                send_queue,
                 close_token,
                 close_reason: OnceLock::new(),
                 extensions: Extensions::default(),
@@ -247,27 +231,7 @@ impl<S> Session<S> {
     /// [`send_buffer_limit`](crate::ServerOptions::send_buffer_limit) bytes are already waiting,
     /// this waits until the writer has taken them. Fails once the session is closing.
     pub async fn send(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
-        let data = data.as_ref();
-        let outbox = &self.inner.outbox;
-        let limit = self.inner.server.options().send_buffer_limit;
-        loop {
-            let drained = outbox.drained.notified();
-            {
-                let mut state = outbox.state.lock().unwrap();
-                if state.closed {
-                    return Err(io::ErrorKind::BrokenPipe.into());
-                }
-                // Always accept data when nothing is waiting, so a limit of zero or a send larger
-                // than the limit cannot block forever.
-                if state.pending.is_empty() || state.pending.len() < limit {
-                    state.pending.extend_from_slice(data);
-                    break;
-                }
-            }
-            drained.await;
-        }
-        outbox.data_available.notify_one();
-        Ok(())
+        self.inner.send_queue.send(data.as_ref()).await
     }
 
     /// Encodes `package` with `encoder` and queues it like [`send`](Self::send).
@@ -280,6 +244,11 @@ impl<S> Session<S> {
         encoder.encode(package, &mut buf)?;
         self.send(&buf).await?;
         Ok(())
+    }
+
+    /// Completes once the session is closed or closing, for tasks that should stop with it.
+    pub async fn closed(&self) {
+        self.inner.close_token.cancelled().await;
     }
 
     /// Closes the session. Queued data is still sent. The first reason given wins.
@@ -306,60 +275,22 @@ impl<S> Session<S> {
     }
 
     /// Stops accepting data to send; the writer task sends what is queued and shuts down.
-    pub(crate) fn close_outbox(&self) {
-        let outbox = &self.inner.outbox;
-        outbox.state.lock().unwrap().closed = true;
-        outbox.data_available.notify_one();
-        outbox.drained.notify_waiters();
+    pub(crate) fn close_send_queue(&self) {
+        self.inner.send_queue.close();
     }
 
-    /// The session's writer task: writes whatever piled up in the outbox in one go.
-    pub(crate) async fn run_writer(self, mut writer: Box<dyn AsyncWrite + Send + Unpin>) {
-        let outbox = &self.inner.outbox;
+    /// The session's writer task. A failed or timed-out write closes the session.
+    pub(crate) async fn run_writer(self, writer: Box<dyn AsyncWrite + Send + Unpin>) {
         let send_timeout = self.inner.server.options().send_timeout;
-        loop {
-            let chunk = {
-                let mut state = outbox.state.lock().unwrap();
-                if state.pending.is_empty() {
-                    if state.closed {
-                        break;
-                    }
-                    None
-                } else {
-                    // Take the whole buffer: it is freed once written, so idle sessions hold no
-                    // send buffer.
-                    Some(std::mem::take(&mut state.pending))
-                }
+        if let Err(error) = self.inner.send_queue.run_writer(writer, send_timeout).await {
+            let reason = if error.kind() == io::ErrorKind::TimedOut {
+                CloseReason::Timeout
+            } else {
+                CloseReason::SocketError
             };
-            let Some(chunk) = chunk else {
-                outbox.data_available.notified().await;
-                continue;
-            };
-            outbox.drained.notify_waiters();
-            let write = async {
-                writer.write_all(&chunk).await?;
-                writer.flush().await
-            };
-            let written = match send_timeout {
-                Some(limit) => tokio::time::timeout(limit, write)
-                    .await
-                    .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into())),
-                None => write.await,
-            };
-            if let Err(error) = written {
-                let reason = if error.kind() == io::ErrorKind::TimedOut {
-                    CloseReason::Timeout
-                } else {
-                    CloseReason::SocketError
-                };
-                tracing::debug!(session = self.id(), %error, "send failed");
-                outbox.state.lock().unwrap().closed = true;
-                outbox.drained.notify_waiters();
-                self.close(reason);
-                break;
-            }
+            tracing::debug!(session = self.id(), %error, "send failed");
+            self.close(reason);
         }
-        let _ = writer.shutdown().await;
     }
 }
 

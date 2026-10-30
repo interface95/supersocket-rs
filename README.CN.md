@@ -37,6 +37,8 @@ async fn main() -> Result<(), supersocket::Error> {
 - 每个会话的包可以**串行或并发**处理，有处理超时，出错时由错误回调决定会话是否继续。处理函数 panic 会被捕获并交给错误回调，不会拖垮服务。
 - **合并发送**：处理一批包期间排队的数据用一次系统调用发出；对方读得慢时 `send` 会等待，也可以设发送超时。
 - **空闲会话不占缓冲区**，大量长期空闲的连接也很省内存。
+- **客户端**照 SuperSocket 的 `EasyClient` 设计：通过一串连接器建立连接（先 TCP 或 HTTP CONNECT、SOCKS4、SOCKS5 代理，再套 TLS），
+  复用服务端的协议过滤器和发送队列。
 - 通过 rustls 支持 **TLS**；**配置**可以从 TOML 或 JSON 文件读取，并用环境变量覆盖；日志用 **tracing**；
   收到 Ctrl+C 或 SIGTERM 时优雅关闭。
 
@@ -46,7 +48,7 @@ async fn main() -> Result<(), supersocket::Error> {
 
 ```toml
 [dependencies]
-supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # 可选 feature："tls"、"config"
+supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # 可选 feature："tls"、"config"、"client"、"proxy"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -59,6 +61,8 @@ cargo run --example custom_protocol
 cargo run --example live_chat
 cargo run --example tls_echo_server --features tls
 cargo run --example config_server --features config
+cargo run --example echo_client --features client     # 先运行 echo_server
+cargo run --example proxy_client --features proxy -- 127.0.0.1:1080 example.com:80
 ```
 
 ## 使用说明
@@ -155,7 +159,8 @@ Server::builder(CommandLineFilter::default)
 ```
 
 `session.server().sessions()` 列出当前所有会话，可以用来广播。`session.extensions()` 按类型存数据，适合中间件使用。
-用 `.service(value)` 注册的共享服务，可以通过 `session.server().service::<T>()` 取到。
+用 `.service(value)` 注册的共享服务，可以通过 `session.server().service::<T>()` 取到。为会话 spawn 的任务可以等待
+`session.closed()`，在会话关闭时一起结束。
 
 ### 包处理、错误和超时
 
@@ -175,6 +180,42 @@ Server::builder(LineFilter::default)
 ```
 
 默认每个会话的包按顺序一个一个处理。并发模式下，一个会话最多同时有 `max_in_flight` 个包在运行时的工作线程上处理。
+
+### 客户端
+
+开启 `client` feature。`EasyClient` 用协议过滤器把服务端发来的数据切成包，和服务端用的是同一套过滤器：
+
+```rust
+let mut client = EasyClient::builder(LineFilter::default())
+    .connect("127.0.0.1:4040")
+    .await?;
+client.send("hello\r\n").await?;
+let reply = client.receive().await?; // Some(TextPackage)，连接关闭后返回 None
+```
+
+也可以把每个包交给后台运行的处理函数，用返回的发送句柄继续发送和关闭：
+
+```rust
+let sender = client.start_receive(async |sender, package| {
+    let _ = sender.send(format!("got {}\r\n", package.text)).await;
+});
+sender.close().await; // 先把队列里的数据发完，最多等 close_timeout
+```
+
+后台任务不会让连接一直开着：最后一个发送句柄被丢弃时，连接也会这样关闭。
+
+连接由一串连接器建立，对应 SuperSocket 的 `IConnector`：第一个负责打开连接，后面的依次往外包一层。
+
+```rust
+EasyClient::builder(LineFilter::default())
+    .proxy(Socks5Proxy::new("127.0.0.1:1080").credentials("user", "secret")) // 需要 "proxy" feature
+    .tls(TlsConnector::new()) // 需要 "tls" feature，默认用 Mozilla 根证书校验
+    .connect("example.com:443")
+    .await?;
+```
+
+`HttpProxy`（CONNECT 方法）和 `Socks4Proxy`（主机名用 SOCKS4a）用法一样；任何实现了 `Connector` 的类型都可以通过
+`.connector(...)` 加进来。
 
 ### 中间件
 
@@ -258,12 +299,11 @@ Server::builder(LineFilter::default).options(options)
 | 1 万个空闲连接的内存 | 63 MB | 186 MB |
 
 这组数据来自同一核心的原型。之后空闲会话不再保留读写缓冲区，每个空闲连接的内存又降了一半多（本机实测从 6.4 KB 降到
-2.9 KB）。回显只衡量框架本身的开销，实际应用的大部分时间花在别处。
+约 3 KB）。回显只衡量框架本身的开销，实际应用的大部分时间花在别处。
 
 ## 路线图
 
-- 基于协议过滤器的 WebSocket 服务端
-- 客户端，支持 TCP、TLS 和代理（HTTP CONNECT、SOCKS）
+- 基于协议过滤器的 WebSocket 服务端和客户端
 - 用派生宏注册命令
 - UDP 会话（有需求再做）
 

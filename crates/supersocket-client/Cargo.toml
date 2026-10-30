@@ -1,0 +1,33 @@
+[package]
+name = "supersocket-client"
+description = "Client side of supersocket-rs: EasyClient with connector chains for TCP, TLS and proxies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+## TLS through rustls, verifying servers against the Mozilla root certificates by default.
+tls = ["dep:tokio-rustls", "dep:webpki-roots"]
+## HTTP CONNECT, SOCKS4 and SOCKS5 proxy connectors.
+proxy = []
+
+[dependencies]
+supersocket-connection.workspace = true
+supersocket-proto.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+tokio-rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

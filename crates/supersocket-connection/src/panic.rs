@@ -7,8 +7,8 @@ use std::{
 };
 
 /// Runs `future`, turning a panic inside it into an error with the panic message, so application
-/// code cannot unwind through the server and skip a session's cleanup.
-pub(crate) async fn catch_panic<F: Future>(future: F) -> Result<F::Output, String> {
+/// code cannot unwind through the code that runs it.
+pub async fn catch_panic<F: Future>(future: F) -> Result<F::Output, String> {
     let mut future = pin!(future);
     poll_fn(
         |cx| match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
@@ -21,7 +21,7 @@ pub(crate) async fn catch_panic<F: Future>(future: F) -> Result<F::Output, Strin
 }
 
 /// Runs `f`, turning a panic into an error with the panic message.
-pub(crate) fn catch_panic_sync<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+pub fn catch_panic_sync<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     catch_unwind(AssertUnwindSafe(f)).map_err(|panic| panic_message(&*panic))
 }
 

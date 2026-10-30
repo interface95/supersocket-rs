@@ -22,9 +22,14 @@
 //!
 //! # Features
 //!
-//! - `tls`: TLS listeners through rustls.
+//! - `tls`: TLS through rustls, for listeners and, with `client`, for the client.
 //! - `config`: loading [`ServerOptions`] from TOML or JSON files with environment overrides.
+//! - `client`: the client, `EasyClient`, in the `client` module.
+//! - `proxy`: HTTP CONNECT, SOCKS4 and SOCKS5 proxy connectors for the client.
 
+#[cfg(feature = "client")]
+pub use supersocket_client as client;
+pub use supersocket_connection as connection;
 pub use supersocket_proto as proto;
 pub use supersocket_proto::*;
 pub use supersocket_server as server;
@@ -40,4 +45,7 @@ pub mod prelude {
         AsyncCommand, AsyncCommandExt, CloseReason, CommandFilter, ErrorAction, HandlerResult,
         Middleware, PackageError, Server, ServerOptions, Session, SessionState,
     };
+
+    #[cfg(feature = "client")]
+    pub use supersocket_client::{ClientSender, EasyClient};
 }
