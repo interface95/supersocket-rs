@@ -54,7 +54,7 @@ pub(crate) enum HeadError {
 impl fmt::Display for HeadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooLarge => write!(f, "the HTTP head is larger than {MAX_HEAD_SIZE} bytes"),
+            Self::TooLarge => f.write_str("the HTTP head is too large"),
             Self::Malformed(why) => f.write_str(why),
         }
     }

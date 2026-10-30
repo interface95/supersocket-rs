@@ -138,7 +138,7 @@ impl<S: Send + Sync + 'static> WebSocketSession<S> {
         } else {
             CloseCode::NORMAL
         };
-        let _ = send_close(&self.session, Some(code), reason).await;
+        let _ = send_close(&self.session, Some(code), reason);
         let session = self.session.clone();
         let limit = session.server().options().close_timeout;
         tokio::spawn(async move {

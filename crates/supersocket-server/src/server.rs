@@ -398,7 +398,7 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
     }
 
     /// Checks the options and loads TLS certificates. A server without listeners only serves the
-    /// connections handed to [`Server::serve_connection`].
+    /// connections handed to [`Server::serve_connection`] once it is started.
     pub fn build(self) -> Result<Server<P, S>, Error> {
         self.options.validate()?;
         let listeners = self
@@ -634,14 +634,24 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
     /// a Unix socket, stdin and stdout joined with `tokio::io::join`, a connection an HTTP server
     /// upgraded, or an in-memory pipe in a test. The session is like any other: middleware sees
     /// it, stream layers wrap it, it joins the session container, and shutting down closes it.
-    /// `connection` tells its addresses. Must be called from within a Tokio runtime.
-    pub fn serve_connection(&self, stream: impl Stream, connection: ConnectionInfo) {
+    /// `connection` tells its addresses. Fails with [`Error::NotRunning`] before
+    /// [`start`](Self::start) and after [`shutdown`](Self::shutdown). Must be called from within a
+    /// Tokio runtime.
+    pub fn serve_connection(
+        &self,
+        stream: impl Stream,
+        connection: ConnectionInfo,
+    ) -> Result<(), Error> {
         let server = &self.inner;
+        if !server.started.load(Ordering::SeqCst) || server.shutdown.is_cancelled() {
+            return Err(Error::NotRunning);
+        }
         server.tracker.spawn(connection::serve_stream(
             server.clone(),
             Box::new(stream),
             connection,
         ));
+        Ok(())
     }
 
     /// Stops accepting connections, closes every session with [`CloseReason::ServerShutdown`] and

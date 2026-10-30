@@ -7,7 +7,9 @@ use crate::{BoxFuture, session::ConnectionInfo};
 /// Wraps the stream of every connection before its session starts, after any TLS handshake, like
 /// SuperSocket's `IConnectionStreamInitializer`. Use it for compression, encryption or
 /// accounting that works on the byte stream rather than on packages; add one with
-/// [`ServerBuilder::stream_layer`](crate::ServerBuilder::stream_layer).
+/// [`ServerBuilder::stream_layer`](crate::ServerBuilder::stream_layer). All the layers of a
+/// connection together must finish within
+/// [`handshake_timeout`](crate::ServerOptions::handshake_timeout).
 ///
 /// ```
 /// use std::io;

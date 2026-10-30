@@ -472,3 +472,18 @@ async fn connections_that_never_upgrade_time_out() {
     assert!(rest.is_empty());
     server.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handshakes_beyond_the_maximum_size_get_an_http_error() {
+    let (server, address) = start(echo().configure(|options| options.max_package_length = 1024));
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    // A head that is still incomplete when it passes the maximum size.
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nCookie: {}",
+        "x".repeat(2000)
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let response = read_head(&mut stream).await;
+    assert!(response.starts_with("HTTP/1.1 431 "), "{response}");
+    server.shutdown().await;
+}

@@ -84,7 +84,7 @@ impl FromStr for Endpoint {
             None if host.contains(':') => return Err(invalid()),
             None => host,
         };
-        if host.is_empty() {
+        if host.is_empty() || host.bytes().any(|byte| byte <= b' ' || byte == 0x7F) {
             return Err(invalid());
         }
         let port = port.parse().map_err(|_| invalid())?;
@@ -180,7 +180,15 @@ mod tests {
         assert_eq!(endpoint.to_string(), "[::1]:4040");
         assert!(endpoint.ip().is_some());
 
-        for invalid in ["no-port", "::1:80", ":80", "host:99999", "[::1:80"] {
+        for invalid in [
+            "no-port",
+            "::1:80",
+            ":80",
+            "host:99999",
+            "[::1:80",
+            "two words:80",
+            "a\r\nb:80",
+        ] {
             assert!(invalid.parse::<Endpoint>().is_err(), "{invalid}");
         }
     }

@@ -40,6 +40,8 @@ pub struct SendQueue {
 struct State {
     pending: BytesMut,
     closed: bool,
+    /// The last data has been queued: nothing more is accepted, but the queue is still written.
+    sealed: bool,
 }
 
 impl SendQueue {
@@ -67,7 +69,7 @@ impl SendQueue {
             let drained = self.drained.notified();
             {
                 let mut state = self.state.lock().unwrap();
-                if state.closed {
+                if state.closed || state.sealed {
                     return Err(io::ErrorKind::BrokenPipe.into());
                 }
                 if state.pending.is_empty() || state.pending.len() < self.limit {
@@ -83,6 +85,26 @@ impl SendQueue {
             drained.await;
         }
         self.data_available.notify_one();
+        Ok(())
+    }
+
+    /// Queues `data` as the last data to send, without waiting for room: every later send fails,
+    /// while the writer still writes what is queued and runs until the queue is closed. For a
+    /// goodbye message that nothing may follow, such as a WebSocket close frame. Fails with
+    /// [`ErrorKind::BrokenPipe`](io::ErrorKind::BrokenPipe) once the queue is closed or the last
+    /// data was already queued.
+    pub fn send_last(&self, data: &[u8]) -> io::Result<()> {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.closed || state.sealed {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            state.pending.extend_from_slice(data);
+            state.sealed = true;
+        }
+        self.data_available.notify_one();
+        // Senders waiting for room fail now instead of waiting.
+        self.drained.notify_waiters();
         Ok(())
     }
 
@@ -138,6 +160,13 @@ impl SendQueue {
             };
             if let Err(error) = written {
                 self.close();
+                // Still try to tell the peer that the connection ends, but give up as a write
+                // would.
+                let shutdown = writer.shutdown();
+                let _ = match send_timeout {
+                    Some(limit) => tokio::time::timeout(limit, shutdown).await.ok(),
+                    None => Some(shutdown.await),
+                };
                 return Err(error);
             }
         }
@@ -185,6 +214,70 @@ mod tests {
         let mut received = String::new();
         reader.read_to_string(&mut received).await.unwrap();
         assert_eq!(received, "one two three");
+    }
+
+    #[tokio::test]
+    async fn nothing_follows_the_last_data() {
+        let (writer, mut reader) = tokio::io::duplex(1024);
+        let queue = Arc::new(SendQueue::new(1024));
+        let task = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.run_writer(writer, None).await }
+        });
+        queue.send(b"data ").await.unwrap();
+        queue.send_last(b"bye").unwrap();
+        for late in [queue.send(b"late").await, queue.send_last(b"again")] {
+            assert_eq!(late.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        }
+        // The writer keeps running until the queue is closed.
+        let mut received = [0; 8];
+        reader.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"data bye");
+        assert!(!task.is_finished());
+        queue.close();
+        task.await.unwrap().unwrap();
+    }
+
+    /// Fails every write and records whether it was shut down.
+    struct Broken(Arc<std::sync::atomic::AtomicBool>);
+
+    impl AsyncWrite for Broken {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_still_shuts_the_writer_down() {
+        let shut_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queue = SendQueue::new(1024);
+        queue.send(b"data").await.unwrap();
+        let error = queue
+            .run_writer(Broken(shut_down.clone()), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert!(shut_down.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(queue.is_closed());
     }
 
     #[tokio::test]

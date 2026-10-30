@@ -335,6 +335,13 @@ impl<S> Session<S> {
         self.inner.send_queue.send_vectored(parts).await
     }
 
+    /// Queues `data` as the last data of the session, without waiting for room: later sends
+    /// fail, while what is queued is still sent and the session keeps reading. For a goodbye
+    /// message that nothing may follow, such as a WebSocket close frame.
+    pub fn send_last(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
+        self.inner.send_queue.send_last(data.as_ref())
+    }
+
     /// Encodes `package` with `encoder` and queues it like [`send`](Self::send).
     pub async fn send_package<T: ?Sized>(
         &self,
@@ -353,9 +360,9 @@ impl<S> Session<S> {
     }
 
     /// Marks the handshake of the session as complete, on a server that requires one; see
-    /// [`ServerBuilder::require_handshake`](crate::ServerBuilder::require_handshake). The session
-    /// then joins the session container and its connected handlers run, before its next package
-    /// is handled.
+    /// [`ServerBuilder::require_handshake`](crate::ServerBuilder::require_handshake). Call it while
+    /// handling one of the session's packages: the session then joins the session container and
+    /// its connected handlers run, before its next package is handled.
     pub fn complete_handshake(&self) {
         self.inner.handshake_complete.store(true, Ordering::Release);
     }

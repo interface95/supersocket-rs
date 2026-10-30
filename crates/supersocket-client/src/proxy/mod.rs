@@ -8,7 +8,7 @@ mod socks5;
 use std::{fmt, io};
 
 use bytes::BytesMut;
-use supersocket_connection::{PackageReader, ReadError, ReadOptions, Rewind};
+use supersocket_connection::{PackageReader, ReadOptions, Rewind};
 use supersocket_proto::BoxFilter;
 use tokio::net::TcpStream;
 
@@ -34,7 +34,7 @@ async fn read_reply<P: Send + 'static>(
     filter: BoxFilter<P>,
 ) -> io::Result<(P, BytesMut)> {
     let mut reader = PackageReader::new(&mut *stream, filter, HANDSHAKE_LIMITS);
-    let reply = reader.next().await.map_err(into_io_error)?.ok_or_else(|| {
+    let reply = reader.next().await?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "the proxy closed the connection",
@@ -57,13 +57,6 @@ async fn read_step<P: Send + 'static>(
         ));
     }
     Ok(reply)
-}
-
-fn into_io_error(error: ReadError) -> io::Error {
-    match error {
-        ReadError::Io(error) => error,
-        other => io::Error::new(io::ErrorKind::InvalidData, other),
-    }
 }
 
 fn refused(message: String) -> io::Error {

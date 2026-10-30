@@ -157,18 +157,28 @@ pub(crate) async fn serve_stream<P: Send + 'static, S: SessionState>(
 async fn serve_layered<P: Send + 'static, S: SessionState>(
     server: &Arc<ServerInner<P, S>>,
     id: u64,
-    mut stream: BoxStream,
+    stream: BoxStream,
     connection: ConnectionInfo,
 ) {
-    for layer in &server.layers {
-        stream = match layer.wrap(stream, &connection).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                tracing::debug!(%error, "a stream layer refused the connection");
-                return;
-            }
-        };
-    }
+    let wrapping = async {
+        let mut stream = stream;
+        for layer in &server.layers {
+            stream = layer.wrap(stream, &connection).await?;
+        }
+        Ok::<_, std::io::Error>(stream)
+    };
+    let limit = server.info.options().handshake_timeout;
+    let stream = match tokio::time::timeout(limit, wrapping).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "a stream layer refused the connection");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!("the stream layers timed out");
+            return;
+        }
+    };
     let (reader, writer) = tokio::io::split(stream);
     let writer = Box::new(writer);
     let Some(session) = start(server, id, connection, reader, writer, BytesMut::new()) else {
@@ -478,16 +488,16 @@ where
     let close_token = session.close_token();
     let mut timeout = pin!(tokio::time::sleep(server.info.options().handshake_timeout));
     loop {
+        if session.is_handshake_complete() {
+            return Ok(());
+        }
         let package = match packages.try_next() {
             Ok(Some(package)) => package,
             Ok(None) => {
                 let read = tokio::select! {
                     biased;
                     _ = close_token.cancelled() => return Err(cancelled_reason(server)),
-                    () = &mut timeout => {
-                        tracing::debug!("handshake timed out");
-                        return Err(CloseReason::Timeout);
-                    }
+                    () = &mut timeout => return timed_out(session),
                     read = packages.fill() => read,
                 };
                 received(session, read)?;
@@ -495,14 +505,26 @@ where
             }
             Err(error) => return Err(undecodable(error)),
         };
-        handle_package(server, session, package).await;
+        // The deadline also limits handling the handshake, such as a slow validation.
+        tokio::select! {
+            biased;
+            () = handle_package(server, session, package) => {}
+            () = &mut timeout => return timed_out(session),
+        }
         if close_token.is_cancelled() {
             return Err(cancelled_reason(server));
         }
-        if session.is_handshake_complete() {
-            return Ok(());
-        }
     }
+}
+
+/// The handshake deadline passed: unless something completed the handshake meanwhile, the
+/// session must close.
+fn timed_out<S>(session: &Session<S>) -> Result<(), CloseReason> {
+    if session.is_handshake_complete() {
+        return Ok(());
+    }
+    tracing::debug!("handshake timed out");
+    Err(CloseReason::Timeout)
 }
 
 /// What a read means for the session: data arrived, or the reason to close it.

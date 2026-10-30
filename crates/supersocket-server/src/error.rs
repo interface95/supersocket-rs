@@ -10,6 +10,11 @@ pub type HandlerResult = Result<(), BoxError>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// [`Server::serve_connection`](crate::Server::serve_connection) was called before
+    /// [`Server::start`](crate::Server::start) or after the server shut down.
+    #[error("the server is not running")]
+    NotRunning,
+
     /// The options contain a value that cannot work, such as a zero timeout.
     #[error("invalid server options: {0}")]
     InvalidOptions(String),

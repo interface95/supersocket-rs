@@ -133,6 +133,19 @@ impl ServerOptions {
                 return zero("socket_send_buffer_size");
             }
             if let Some(tls) = &listener.tls {
+                #[cfg(feature = "tls")]
+                if tls.config.is_some()
+                    && (tls.client_ca.is_some()
+                        || tls.client_auth_optional
+                        || !tls.cert.as_os_str().is_empty()
+                        || !tls.key.as_os_str().is_empty())
+                {
+                    return invalid(format!(
+                        "listener {}: a TLS config replaces cert, key and the client certificate \
+                         settings; set them in the rustls configuration instead",
+                        listener.address
+                    ));
+                }
                 if tls.handshake_timeout.is_zero() {
                     return invalid(format!(
                         "listener {}: handshake_timeout must be greater than zero",

@@ -3,13 +3,19 @@
 
 mod common;
 
-use std::io;
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 use common::{Client, start};
 use supersocket::{
     BoxStream, ConnectionInfo, ListenOptions, ServerBuilder, StreamLayer, prelude::*,
 };
-use tokio::{io::AsyncWriteExt, sync::mpsc};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::mpsc,
+};
 
 /// Echoes every line together with the address of the session.
 fn echo_with_address() -> ServerBuilder<TextPackage> {
@@ -29,7 +35,9 @@ async fn connections_from_other_transports_become_sessions() {
     let (client, connection) = tokio::io::duplex(1024);
     let remote = "198.51.100.4:1234".parse().unwrap();
     let local = "192.0.2.1:4040".parse().unwrap();
-    server.serve_connection(connection, ConnectionInfo::new(remote, local));
+    server
+        .serve_connection(connection, ConnectionInfo::new(remote, local))
+        .unwrap();
     let (reader, writer) = tokio::io::split(client);
     let mut client = Client::new(reader, writer);
     client.send(b"hello\r\n").await;
@@ -55,7 +63,9 @@ async fn unix_sockets_can_be_served() {
         let server = server.clone();
         async move {
             while let Ok((stream, _)) = listener.accept().await {
-                server.serve_connection(stream, ConnectionInfo::default());
+                server
+                    .serve_connection(stream, ConnectionInfo::default())
+                    .unwrap();
             }
         }
     });
@@ -111,7 +121,9 @@ async fn stream_layers_wrap_connections_in_order() {
 
     // Connections handed over go through the layers too.
     let (other, connection) = tokio::io::duplex(1024);
-    server.serve_connection(connection, ConnectionInfo::default());
+    server
+        .serve_connection(connection, ConnectionInfo::default())
+        .unwrap();
     let (reader, writer) = tokio::io::split(other);
     let mut other = Client::new(reader, writer);
     assert_eq!(other.line().await, "first");
@@ -153,5 +165,51 @@ async fn layers_see_the_data_that_arrived_with_a_proxy_header() {
         .await;
     assert_eq!(client.line().await, "welcome");
     assert_eq!(client.line().await, "hello 203.0.113.7:51000");
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connections_are_refused_unless_the_server_runs() {
+    let server = echo_with_address().build().unwrap();
+    let refused = |server: &Server<TextPackage>| {
+        let (_client, connection) = tokio::io::duplex(64);
+        matches!(
+            server.serve_connection(connection, ConnectionInfo::default()),
+            Err(supersocket::Error::NotRunning)
+        )
+    };
+    assert!(refused(&server));
+    server.start().unwrap();
+    server.shutdown().await;
+    assert!(refused(&server));
+}
+
+/// Waits for a preamble that never comes.
+struct WaitForever;
+
+impl StreamLayer for WaitForever {
+    async fn wrap(
+        &self,
+        mut stream: BoxStream,
+        _connection: &ConnectionInfo,
+    ) -> io::Result<BoxStream> {
+        let mut preamble = Vec::new();
+        stream.read_to_end(&mut preamble).await?;
+        Ok(stream)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_layers_must_finish_within_the_handshake_timeout() {
+    let limit = Duration::from_millis(200);
+    let (server, address) = start(
+        echo_with_address()
+            .stream_layer(WaitForever)
+            .configure(|options| options.handshake_timeout = limit),
+    );
+    let mut client = Client::connect(address).await;
+    let started = Instant::now();
+    client.expect_closed().await;
+    assert!(started.elapsed() >= limit);
     server.shutdown().await;
 }

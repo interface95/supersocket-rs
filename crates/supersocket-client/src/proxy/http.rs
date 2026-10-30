@@ -5,9 +5,7 @@ use supersocket_connection::PackageReader;
 use supersocket_proto::{ProtocolError, TerminatorFilter};
 use tokio::io::AsyncWriteExt;
 
-use super::{
-    Credentials, HANDSHAKE_LIMITS, base64, connect_to_proxy, finish, into_io_error, refused,
-};
+use super::{Credentials, HANDSHAKE_LIMITS, base64, connect_to_proxy, finish, refused};
 use crate::{Connection, Connector, Endpoint, connector::must_be_first};
 
 /// Connects through an HTTP proxy with the `CONNECT` method, like SuperSocket's `HttpConnector`.
@@ -40,9 +38,16 @@ impl Connector for HttpProxy {
         previous: Option<Connection>,
     ) -> io::Result<Connection> {
         must_be_first("HttpProxy", &previous)?;
+        // The target goes into the request line, where spaces or line breaks would change it.
+        let authority = target.to_string();
+        if authority.bytes().any(|byte| byte <= b' ' || byte == 0x7F) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid target {authority:?}"),
+            ));
+        }
         let mut stream = connect_to_proxy(&self.proxy).await?;
 
-        let authority = target.to_string();
         let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
         if let Some(Credentials { username, password }) = &self.credentials {
             let token = base64(format!("{username}:{password}").as_bytes());
@@ -57,7 +62,7 @@ impl Connector for HttpProxy {
             Box::new(TerminatorFilter::new(&b"\n"[..], decode_line)),
             HANDSHAKE_LIMITS,
         );
-        let mut next_line = async || match reader.next().await.map_err(into_io_error)? {
+        let mut next_line = async || match reader.next().await? {
             Some(line) => Ok(line),
             None => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -91,4 +96,20 @@ impl Connector for HttpProxy {
 fn decode_line(line: Bytes) -> Result<String, ProtocolError> {
     let line = line.strip_suffix(b"\r").unwrap_or(&line);
     Ok(String::from_utf8_lossy(line).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn targets_cannot_change_the_request() {
+        // Refused before connecting, so no proxy is needed.
+        let target = Endpoint::new("example.com:443 HTTP/1.1\r\nX-Injected: 1\r\nX", 80);
+        let error = HttpProxy::new("127.0.0.1:1")
+            .connect(&target, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
 }

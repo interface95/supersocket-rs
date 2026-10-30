@@ -80,7 +80,8 @@ impl PipelineFilter for HeadFilter {
                 self.searched = 0;
                 parse_head(&buf.split_to(length))
             }
-            None if buf.len() > MAX_HEAD_SIZE => Err(HeadError::TooLarge),
+            // A larger head would fail the read buffer's limit without an HTTP answer.
+            None if buf.len() > MAX_HEAD_SIZE.min(self.max_size) => Err(HeadError::TooLarge),
             None => {
                 self.searched = buf.len();
                 return Ok(None);
@@ -279,7 +280,8 @@ fn message(opcode: u8, payload: BytesMut) -> Result<Message, Violation> {
     if opcode == OP_BINARY {
         return Ok(Message::Binary(payload.freeze()));
     }
-    String::from_utf8(payload.to_vec())
+    // A message joined from fragments owns its buffer, which then becomes the string's.
+    String::from_utf8(Vec::from(payload))
         .map(Message::Text)
         .map_err(|_| INVALID_TEXT)
 }
@@ -536,5 +538,14 @@ mod tests {
             Package::Handshake(Err(HeadError::TooLarge))
         ));
         assert!(filter.next_filter().is_none());
+
+        // A smaller maximum size limits the head too.
+        let mut filter = HeadFilter::new(Role::Server, 1024);
+        let mut buf = BytesMut::from(&[b'x'; 1025][..]);
+        let package = filter.filter(&mut buf).unwrap().unwrap();
+        assert!(matches!(
+            package.0,
+            Package::Handshake(Err(HeadError::TooLarge))
+        ));
     }
 }

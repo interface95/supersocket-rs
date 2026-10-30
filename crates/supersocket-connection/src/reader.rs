@@ -56,6 +56,16 @@ pub enum ReadError {
     FilterPanicked(String),
 }
 
+impl From<ReadError> for io::Error {
+    /// I/O errors as they were; any other error as [`ErrorKind::InvalidData`](io::ErrorKind).
+    fn from(error: ReadError) -> Self {
+        match error {
+            ReadError::Io(error) => error,
+            other => io::Error::new(io::ErrorKind::InvalidData, other),
+        }
+    }
+}
+
 /// Reads packages from `R`, cutting the byte stream with a pipeline filter.
 ///
 /// ```

@@ -993,3 +993,59 @@ async fn package_handler_types_can_say_goodbye_when_sessions_close() {
     assert_eq!(client.line().await, "bye: server shutdown");
     client.expect_closed().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handshakes_completed_by_another_task_do_not_time_out() {
+    let events = Arc::new(Events::default());
+    let connected = events.clone();
+    let (server, address) = start(
+        Server::builder(LineFilter::default)
+            .require_handshake()
+            .configure(|options| options.handshake_timeout = Duration::from_millis(300))
+            .on_connected(move |_session| {
+                let events = connected.clone();
+                async move {
+                    events.connected.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .on_package(async |session, package| {
+                if session.is_handshake_complete() {
+                    session.send(format!("{}\r\n", package.text)).await?;
+                } else {
+                    // An authorization that another task finishes.
+                    let session = session.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        session.complete_handshake();
+                    });
+                }
+                Ok(())
+            }),
+    );
+    let mut client = Client::connect(address).await;
+    client.send(b"hello\r\n").await;
+    // Nothing more arrives before the handshake timeout passes.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    client.send(b"after\r\n").await;
+    assert_eq!(client.line().await, "after");
+    assert_eq!(events.connected.load(Ordering::SeqCst), 1);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_handshake_timeout_also_limits_handling() {
+    let (server, address) = start(
+        Server::builder(LineFilter::default)
+            .require_handshake()
+            .configure(|options| options.handshake_timeout = Duration::from_millis(200))
+            .on_package(async |_session, _package| {
+                // A validation far slower than the handshake may take.
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok(())
+            }),
+    );
+    let mut client = Client::connect(address).await;
+    client.send(b"hello\r\n").await;
+    client.expect_closed().await;
+    server.shutdown().await;
+}

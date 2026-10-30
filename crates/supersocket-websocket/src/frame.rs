@@ -13,6 +13,8 @@ pub(crate) const OP_PONG: u8 = 0xA;
 pub(crate) const MAX_HEADER_SIZE: usize = 14;
 /// The largest payload of a control frame.
 pub(crate) const MAX_CONTROL_PAYLOAD: usize = 125;
+/// The largest close frame: two bytes of header, a masking key and the payload.
+pub(crate) const MAX_CLOSE_FRAME: usize = 2 + 4 + MAX_CONTROL_PAYLOAD;
 
 /// Writes the header of an unfragmented frame into `header` and returns its length. The payload is
 /// masked with `mask` when one is given, as a client's must be.
@@ -63,9 +65,29 @@ pub(crate) fn apply_mask(data: &mut [u8], mask: [u8; 4]) {
     }
 }
 
+/// Writes a whole close frame into `frame`, masked with `mask` when one is given, and returns its
+/// length. It is sent in one piece, so that nothing can be queued between its parts.
+pub(crate) fn close_frame(
+    code: Option<CloseCode>,
+    reason: &str,
+    mask: Option<[u8; 4]>,
+    frame: &mut [u8; MAX_CLOSE_FRAME],
+) -> usize {
+    let mut payload = [0; MAX_CONTROL_PAYLOAD];
+    let length = close_payload(code, reason, &mut payload);
+    let mut header = [0; MAX_HEADER_SIZE];
+    let size = encode_header(OP_CLOSE, length, mask, &mut header);
+    frame[..size].copy_from_slice(&header[..size]);
+    frame[size..size + length].copy_from_slice(&payload[..length]);
+    if let Some(mask) = mask {
+        apply_mask(&mut frame[size..size + length], mask);
+    }
+    size + length
+}
+
 /// Writes the payload of a close frame into `payload` and returns its length: nothing without a
 /// code, otherwise the code and as much of `reason` as fits.
-pub(crate) fn close_payload(
+fn close_payload(
     code: Option<CloseCode>,
     reason: &str,
     payload: &mut [u8; MAX_CONTROL_PAYLOAD],
@@ -121,6 +143,15 @@ mod tests {
             apply_mask(&mut data, [0x12, 0x34, 0x56, 0x78]);
             assert_eq!(data, original[..length]);
         }
+    }
+
+    #[test]
+    fn close_frames_are_whole() {
+        let mut frame = [0; MAX_CLOSE_FRAME];
+        let length = close_frame(Some(CloseCode::NORMAL), "bye", None, &mut frame);
+        assert_eq!(frame[..length], [0x88, 5, 0x03, 0xE8, b'b', b'y', b'e']);
+        let length = close_frame(None, "", Some([1, 2, 3, 4]), &mut frame);
+        assert_eq!(frame[..length], [0x88, 0x80, 1, 2, 3, 4]);
     }
 
     #[test]

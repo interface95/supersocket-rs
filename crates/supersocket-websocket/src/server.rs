@@ -19,9 +19,7 @@ use supersocket_server::{
 use crate::{
     CloseCode, CloseFrame, HandshakeRequest, Message, Rejection, WebSocketSession,
     filter::{HeadFilter, Package, Role, WebSocketPackage},
-    frame::{
-        MAX_CONTROL_PAYLOAD, MAX_HEADER_SIZE, OP_CLOSE, OP_PONG, close_payload, encode_header,
-    },
+    frame::{MAX_CLOSE_FRAME, MAX_HEADER_SIZE, OP_PONG, close_frame, encode_header},
     handshake::{Head, HeadError, accept_response, read_request},
 };
 
@@ -367,14 +365,14 @@ where
                     session.close(CloseReason::LocalClosed);
                 } else {
                     // The client started closing: answer with its code, then close.
-                    let _ = send_close(session, code, "").await;
+                    let _ = send_close(session, code, "");
                     session.close(CloseReason::RemoteClosed);
                 }
             }
             Package::Violation(code, why) => {
                 tracing::debug!(%code, why, "WebSocket protocol violation");
                 if !session.close_sent.swap(true, Ordering::AcqRel) {
-                    let _ = send_close(session, Some(code), why).await;
+                    let _ = send_close(session, Some(code), why);
                 }
                 session.close(CloseReason::ProtocolError);
             }
@@ -393,7 +391,7 @@ where
             _ => CloseCode::NORMAL,
         };
         if !session.close_sent.swap(true, Ordering::AcqRel) {
-            let _ = send_close(session, Some(code), "").await;
+            let _ = send_close(session, Some(code), "");
         }
     }
 }
@@ -446,12 +444,14 @@ pub(crate) async fn send_frame<S>(
     session.send_vectored(&[&header[..size], payload]).await
 }
 
-pub(crate) async fn send_close<S>(
+/// Queues a close frame as the last data of the session, so that no frame can follow it, not
+/// even one that another task is sending at the same moment.
+pub(crate) fn send_close<S>(
     session: &Session<S>,
     code: Option<CloseCode>,
     reason: &str,
 ) -> io::Result<()> {
-    let mut payload = [0; MAX_CONTROL_PAYLOAD];
-    let length = close_payload(code, reason, &mut payload);
-    send_frame(session, OP_CLOSE, &payload[..length]).await
+    let mut frame = [0; MAX_CLOSE_FRAME];
+    let length = close_frame(code, reason, None, &mut frame);
+    session.send_last(&frame[..length])
 }

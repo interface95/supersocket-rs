@@ -385,6 +385,13 @@ impl ClientSender {
         self.inner.shared.queue.send(data.as_ref()).await
     }
 
+    /// Queues `data` as the last data to send, without waiting for room: later sends fail, while
+    /// what is queued is still sent and the client keeps receiving. For a goodbye message that
+    /// nothing may follow, such as a WebSocket close frame.
+    pub fn send_last(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
+        self.inner.shared.queue.send_last(data.as_ref())
+    }
+
     /// Encodes `package` with `encoder` and queues it like [`send`](Self::send).
     pub async fn send_package<T: ?Sized>(
         &self,

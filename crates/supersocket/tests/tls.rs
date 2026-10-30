@@ -208,18 +208,35 @@ async fn client_certificates_can_be_optional() {
     server.shutdown().await;
 }
 
+/// A rustls configuration serving `certificate`, without client certificates.
+fn server_config(certificate: &TestCertificate) -> rustls::ServerConfig {
+    let key = PrivateKeyDer::from_pem_file(&certificate.key).unwrap();
+    rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.der.clone()], key)
+        .unwrap()
+}
+
+#[test]
+fn custom_configurations_cannot_be_mixed_with_certificate_files() {
+    let certificate = TestCertificate::new("mixed-config");
+    let tls = TlsOptions {
+        client_ca: Some("clients.pem".into()),
+        ..TlsOptions::with_config(Arc::new(server_config(&certificate)))
+    };
+    let listener = tls_listener(tls);
+    let result = Server::builder(LineFilter::default)
+        .configure(move |options| options.listeners.push(listener))
+        .build();
+    assert!(matches!(result, Err(supersocket::Error::InvalidOptions(_))));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn custom_rustls_configurations_are_used_as_given() {
     let certificate = TestCertificate::new("custom-config");
-    let key = PrivateKeyDer::from_pem_file(&certificate.key).unwrap();
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_no_client_auth()
-    .with_single_cert(vec![certificate.der.clone()], key)
-    .unwrap();
+    let mut config = server_config(&certificate);
     config.alpn_protocols = vec![b"chat/1".to_vec()];
     let (server, address, mut reports) =
         start_reporting(tls_listener(TlsOptions::with_config(Arc::new(config))));

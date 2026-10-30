@@ -370,13 +370,13 @@ socket option.
 ### Other transports and stream layers
 
 Connections do not have to come from the server's TCP listeners. Hand any byte stream to the
-server and it becomes a session like the others: middleware sees it, it joins the session
-container and shutting down closes it. A server may have no listeners at all.
+server once it is started, and it becomes a session like the others: middleware sees it, it
+joins the session container and shutting down closes it. A server may have no listeners at all.
 
 ```rust
 let listener = tokio::net::UnixListener::bind("/tmp/app.sock")?;
 while let Ok((stream, _)) = listener.accept().await {
-    server.serve_connection(stream, ConnectionInfo::default()); // no IP addresses on a Unix socket
+    server.serve_connection(stream, ConnectionInfo::default())?; // no IP addresses on a Unix socket
 }
 ```
 

@@ -340,13 +340,13 @@ ListenOptions {
 
 ### 其他传输层和流包装层
 
-连接不一定来自服务端自己的 TCP 监听器。任何字节流都可以交给服务端，它会和其他会话一样：经过中间件、进入会话容器、
+连接不一定来自服务端自己的 TCP 监听器。服务端启动后，任何字节流都可以交给它，它会和其他会话一样：经过中间件、进入会话容器、
 随服务端关闭而关闭。服务端也可以完全不配置监听地址。
 
 ```rust
 let listener = tokio::net::UnixListener::bind("/tmp/app.sock")?;
 while let Ok((stream, _)) = listener.accept().await {
-    server.serve_connection(stream, ConnectionInfo::default()); // Unix 套接字没有 IP 地址
+    server.serve_connection(stream, ConnectionInfo::default())?; // Unix 套接字没有 IP 地址
 }
 ```
 

@@ -21,8 +21,8 @@ use crate::{
     CloseCode, CloseFrame, Message,
     filter::{HeadFilter, Package, Role, WebSocketPackage},
     frame::{
-        MAX_CONTROL_PAYLOAD, MAX_HEADER_SIZE, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG, OP_TEXT,
-        apply_mask, close_payload, encode_header,
+        MAX_CLOSE_FRAME, MAX_CONTROL_PAYLOAD, MAX_HEADER_SIZE, OP_BINARY, OP_PING, OP_PONG,
+        OP_TEXT, apply_mask, close_frame, encode_header,
     },
     handshake::{Head, accept_key, base64, push_header},
 };
@@ -125,7 +125,7 @@ impl WebSocketClientBuilder {
         request.push_str("\r\n");
         let handshake = async {
             client.send(request).await?;
-            match client.receive().await.map_err(into_io_error)? {
+            match client.receive().await? {
                 Some(WebSocketPackage(Package::Handshake(Ok(head)))) => {
                     check_response(&head, &key, &self.subprotocols)
                 }
@@ -234,14 +234,14 @@ impl WebSocketClient {
                     self.close_frame = frame;
                     if !self.sender.close_sent.swap(true, Ordering::AcqRel) {
                         // The server started closing: answer with its code.
-                        let _ = self.sender.send_close(code, "").await;
+                        let _ = self.sender.send_close(code, "");
                     }
                     break;
                 }
                 Package::Violation(code, why) => {
                     self.finished = true;
                     if !self.sender.close_sent.swap(true, Ordering::AcqRel) {
-                        let _ = self.sender.send_close(Some(code), why).await;
+                        let _ = self.sender.send_close(Some(code), why);
                     }
                     return Err(ReadError::Protocol(ProtocolError::new(why)));
                 }
@@ -370,7 +370,7 @@ impl WebSocketSender {
         } else {
             CloseCode::NORMAL
         };
-        let _ = self.send_close(Some(code), reason).await;
+        let _ = self.send_close(Some(code), reason);
     }
 
     /// Whether the connection is closed or closing.
@@ -388,10 +388,11 @@ impl WebSocketSender {
         self.send_frame(opcode, payload).await
     }
 
-    async fn send_close(&self, code: Option<CloseCode>, reason: &str) -> io::Result<()> {
-        let mut payload = [0; MAX_CONTROL_PAYLOAD];
-        let length = close_payload(code, reason, &mut payload);
-        self.send_frame(OP_CLOSE, &payload[..length]).await
+    /// Queues a close frame as the last data, so that no frame can follow it.
+    fn send_close(&self, code: Option<CloseCode>, reason: &str) -> io::Result<()> {
+        let mut frame = [0; MAX_CLOSE_FRAME];
+        let length = close_frame(code, reason, Some(random_bytes()), &mut frame);
+        self.sender.send_last(&frame[..length])
     }
 
     async fn send_frame(&self, opcode: u8, payload: &[u8]) -> io::Result<()> {
@@ -469,13 +470,6 @@ fn invalid_data(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn into_io_error(error: ReadError) -> io::Error {
-    match error {
-        ReadError::Io(error) => error,
-        other => io::Error::new(io::ErrorKind::InvalidData, other),
-    }
-}
-
 /// Unpredictable bytes for masking keys and handshake keys, from the hasher the standard library
 /// keys with random numbers from the operating system.
 fn random_bytes<const N: usize>() -> [u8; N] {
@@ -509,6 +503,12 @@ impl Url {
                 format!("invalid WebSocket URL `{url}`: {why}"),
             )
         };
+        // The URL goes into the request line, where spaces or line breaks would change it.
+        if url.bytes().any(|byte| byte <= b' ' || byte == 0x7F) {
+            return Err(invalid(
+                "spaces and control characters must be percent-encoded",
+            ));
+        }
         let (scheme, rest) = url
             .split_once("://")
             .ok_or_else(|| invalid("expected ws:// or wss://"))?;
@@ -601,6 +601,8 @@ mod tests {
             "ws://::1/",
             "ws://example.com/#top",
             "ws://[::1",
+            "ws://example.com/a b",
+            "ws://example.com/x HTTP/1.1\r\nX-Injected: 1",
         ] {
             assert!(Url::parse(invalid).is_err(), "{invalid}");
         }
