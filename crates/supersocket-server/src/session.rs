@@ -44,6 +44,9 @@ pub enum CloseReason {
     ProtocolError,
     /// A middleware rejected the session.
     Rejected,
+    /// Application code panicked where the session cannot continue, such as in the pipeline
+    /// filter.
+    InternalError,
 }
 
 impl fmt::Display for CloseReason {
@@ -58,6 +61,7 @@ impl fmt::Display for CloseReason {
             Self::Timeout => "timeout",
             Self::ProtocolError => "protocol error",
             Self::Rejected => "rejected",
+            Self::InternalError => "internal error",
         })
     }
 }
@@ -253,7 +257,9 @@ impl<S> Session<S> {
                 if state.closed {
                     return Err(io::ErrorKind::BrokenPipe.into());
                 }
-                if state.pending.len() < limit {
+                // Always accept data when nothing is waiting, so a limit of zero or a send larger
+                // than the limit cannot block forever.
+                if state.pending.is_empty() || state.pending.len() < limit {
                     state.pending.extend_from_slice(data);
                     break;
                 }

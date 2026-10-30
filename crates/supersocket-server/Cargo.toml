@@ -18,7 +18,7 @@ config = ["dep:serde_json", "dep:toml"]
 [dependencies]
 supersocket-proto.workspace = true
 bytes.workspace = true
-humantime-serde.workspace = true
+humantime.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }

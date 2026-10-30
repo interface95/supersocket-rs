@@ -78,6 +78,9 @@ pub enum PackageError {
     /// The handler did not finish within the package handling timeout.
     #[error("package handling timed out after {0:?}")]
     Timeout(Duration),
+    /// The handler panicked; the value is the panic message.
+    #[error("package handler panicked: {0}")]
+    Panicked(String),
 }
 
 /// What to do with a session after handling one of its packages failed.
@@ -224,6 +227,7 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
         if self.options.listeners.is_empty() {
             return Err(Error::NoListener);
         }
+        self.options.validate()?;
         let listeners = self
             .options
             .listeners
@@ -320,6 +324,8 @@ impl Listener {
             } else {
                 TcpSocket::new_v6()?
             };
+            // On Windows SO_REUSEADDR would let another socket bind a port that is in use.
+            #[cfg(not(windows))]
             socket.set_reuseaddr(true)?;
             socket.bind(self.address)?;
             socket.listen(self.options.backlog)
@@ -371,9 +377,7 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
     pub fn start(&self) -> Result<Vec<SocketAddr>, Error> {
         let server = &self.inner;
         if server.started.swap(true, Ordering::SeqCst) {
-            return Err(Error::Io(io::Error::other(
-                "the server has already been started",
-            )));
+            return Err(Error::AlreadyStarted);
         }
         let bound = server
             .listeners

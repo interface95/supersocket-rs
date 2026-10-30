@@ -14,6 +14,10 @@ pub enum Error {
     #[error("no listener is configured")]
     NoListener,
 
+    /// The options contain a value that cannot work, such as a zero timeout.
+    #[error("invalid server options: {0}")]
+    InvalidOptions(String),
+
     /// A listener address could not be parsed.
     #[error("invalid listen address `{address}`: {source}")]
     InvalidAddress {
@@ -45,6 +49,10 @@ pub enum Error {
         /// What went wrong.
         message: String,
     },
+
+    /// [`Server::start`](crate::Server::start) was called more than once.
+    #[error("the server has already been started")]
+    AlreadyStarted,
 
     /// Any other I/O error.
     #[error(transparent)]

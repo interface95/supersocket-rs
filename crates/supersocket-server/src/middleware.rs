@@ -11,15 +11,31 @@ use crate::{
 /// Middleware run in ascending [`order`](Self::order) when a session connects and in the reverse
 /// order when it closes.
 ///
+/// Sessions connect concurrently, so a middleware that limits them keeps its own count instead of
+/// reading [`ServerInfo::session_count`], which only includes sessions that finished registering:
+///
 /// ```
+/// use std::sync::atomic::{AtomicUsize, Ordering};
 /// use supersocket_server::{Middleware, Session, SessionState};
 ///
 /// /// Rejects sessions beyond a limit.
-/// struct ConnectionLimit(usize);
+/// struct ConnectionLimit {
+///     limit: usize,
+///     current: AtomicUsize,
+/// }
 ///
 /// impl<S: SessionState> Middleware<S> for ConnectionLimit {
-///     async fn register_session(&self, session: &Session<S>) -> bool {
-///         session.server().session_count() < self.0
+///     async fn register_session(&self, _session: &Session<S>) -> bool {
+///         if self.current.fetch_add(1, Ordering::SeqCst) < self.limit {
+///             true
+///         } else {
+///             self.current.fetch_sub(1, Ordering::SeqCst);
+///             false
+///         }
+///     }
+///
+///     async fn unregister_session(&self, _session: &Session<S>) {
+///         self.current.fetch_sub(1, Ordering::SeqCst);
 ///     }
 /// }
 /// ```

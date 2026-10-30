@@ -16,7 +16,7 @@ supersocket-proto = { path = "crates/supersocket-proto", version = "0.1.0" }
 supersocket-server = { path = "crates/supersocket-server", version = "0.1.0" }
 
 bytes = "1.10"
-humantime-serde = "1.1"
+humantime = "2.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

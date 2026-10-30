@@ -1,4 +1,6 @@
 use std::{
+    cmp::Ordering,
+    ffi::OsString,
     io,
     path::{Path, PathBuf},
 };
@@ -59,7 +61,8 @@ impl ServerOptions {
     /// address = "0.0.0.0:4040"
     /// ```
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        Self::load_with_env(path, "SUPERSOCKET", std::env::vars())
+        let vars = utf8_env_vars("SUPERSOCKET", std::env::vars_os())?;
+        Self::load_with_env(path, "SUPERSOCKET", vars)
     }
 
     /// Loads options from a TOML or JSON file, then applies the variables in `vars` whose name
@@ -67,8 +70,9 @@ impl ServerOptions {
     ///
     /// The rest of a variable's name is the path of the field it sets, separated by `__`, with
     /// array indexes as numbers: `SUPERSOCKET__LISTENERS__0__ADDRESS=0.0.0.0:4041`. Names are
-    /// case-insensitive. A value that parses as a TOML value (a number, a boolean or a quoted
-    /// string) is used as such; anything else is a string.
+    /// case-insensitive, and the order of the variables does not matter. Values are converted to
+    /// the type of their field, so `SUPERSOCKET__NAME=8080` is a string and
+    /// `SUPERSOCKET__CLOSE_TIMEOUT=5` is five seconds. The loaded options are validated.
     pub fn load_with_env(
         path: impl AsRef<Path>,
         prefix: &str,
@@ -93,13 +97,49 @@ impl ServerOptions {
             _ => return Err(ConfigError::UnsupportedFormat(path.to_owned())),
         };
         apply_env(&mut value, prefix, vars)?;
-        serde_json::from_value(value).map_err(|error| ConfigError::Invalid(error.to_string()))
+        let options: Self = serde_json::from_value(value)
+            .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        options.validated()
     }
 
-    /// Parses options from TOML text.
+    /// Parses and validates options from TOML text.
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
-        toml::from_str(text).map_err(|error| ConfigError::Invalid(error.to_string()))
+        let options: Self =
+            toml::from_str(text).map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        options.validated()
     }
+
+    fn validated(self) -> Result<Self, ConfigError> {
+        self.validate()
+            .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        Ok(self)
+    }
+}
+
+/// Keeps the variables whose name and value are valid UTF-8. A variable with the prefix whose
+/// value is not UTF-8 is an error; other variables are none of our business.
+fn utf8_env_vars(
+    prefix: &str,
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<Vec<(String, String)>, ConfigError> {
+    let prefix = format!("{}__", prefix.to_ascii_uppercase());
+    let mut utf8 = Vec::new();
+    for (name, value) in vars {
+        let Ok(name) = name.into_string() else {
+            continue;
+        };
+        match value.into_string() {
+            Ok(value) => utf8.push((name, value)),
+            Err(_) if name.to_ascii_uppercase().starts_with(&prefix) => {
+                return Err(ConfigError::Env {
+                    name,
+                    message: "the value is not valid UTF-8".into(),
+                });
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(utf8)
 }
 
 fn apply_env(
@@ -108,6 +148,7 @@ fn apply_env(
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> Result<(), ConfigError> {
     let prefix = format!("{}__", prefix.to_ascii_uppercase());
+    let mut overrides = Vec::new();
     for (name, raw) in vars {
         let Some(path) = name
             .to_ascii_uppercase()
@@ -116,17 +157,37 @@ fn apply_env(
         else {
             continue;
         };
-        let segments: Vec<&str> = path.split("__").collect();
+        let segments: Vec<String> = path.split("__").map(str::to_owned).collect();
         if segments.iter().any(|segment| segment.is_empty()) {
             return Err(ConfigError::Env {
                 name,
                 message: "empty path segment".into(),
             });
         }
+        overrides.push((segments, name, raw));
+    }
+    // The environment lists variables in no particular order, but array items must be created in
+    // index order, so sort by path with indexes compared as numbers.
+    overrides.sort_by(|(left, ..), (right, ..)| compare_paths(left, right));
+    for (segments, name, raw) in overrides {
+        let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
         set_path(root, &segments, parse_env_value(&raw))
             .map_err(|message| ConfigError::Env { name, message })?;
     }
     Ok(())
+}
+
+fn compare_paths(left: &[String], right: &[String]) -> Ordering {
+    for (left, right) in left.iter().zip(right) {
+        let order = match (left.parse::<usize>(), right.parse::<usize>()) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            _ => left.cmp(right),
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    left.len().cmp(&right.len())
 }
 
 fn parse_env_value(raw: &str) -> Value {
@@ -269,5 +330,93 @@ mod tests {
         let error = ServerOptions::load_with_env(&path, "SUPERSOCKET", vars).unwrap_err();
         std::fs::remove_file(path).unwrap();
         assert!(matches!(error, ConfigError::Env { .. }), "{error}");
+    }
+
+    fn load_with(file: &str, vars: &[(&str, &str)]) -> Result<ServerOptions, ConfigError> {
+        let path = write_temp(file, "");
+        let vars = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()));
+        let result = ServerOptions::load_with_env(&path, "SUPERSOCKET", vars);
+        std::fs::remove_file(path).unwrap();
+        result
+    }
+
+    #[test]
+    fn array_overrides_do_not_depend_on_environment_order() {
+        let names: Vec<String> = (0..=10)
+            .rev()
+            .map(|index| format!("SUPERSOCKET__LISTENERS__{index}__ADDRESS"))
+            .collect();
+        let vars: Vec<(&str, &str)> = names
+            .iter()
+            .map(|name| (name.as_str(), "127.0.0.1:0"))
+            .collect();
+        let options = load_with("order.toml", &vars).unwrap();
+        assert_eq!(options.listeners.len(), 11);
+    }
+
+    #[test]
+    fn override_values_take_the_type_of_their_field() {
+        let options = load_with(
+            "types.toml",
+            &[
+                ("SUPERSOCKET__NAME", "8080"),
+                ("SUPERSOCKET__CLOSE_TIMEOUT", "5"),
+                ("SUPERSOCKET__SEND_BUFFER_LIMIT", "\"1024\""),
+                (
+                    "SUPERSOCKET__PACKAGE_HANDLING__CONCURRENT__MAX_IN_FLIGHT",
+                    "8",
+                ),
+                ("SUPERSOCKET__LISTENERS__0__ADDRESS", "127.0.0.1:0"),
+                ("SUPERSOCKET__LISTENERS__0__NO_DELAY", "\"false\""),
+            ],
+        )
+        .unwrap();
+        assert_eq!(options.name, "8080");
+        assert_eq!(options.close_timeout, Duration::from_secs(5));
+        assert_eq!(options.send_buffer_limit, 1024);
+        assert_eq!(
+            options.package_handling,
+            PackageHandling::Concurrent { max_in_flight: 8 }
+        );
+        assert!(!options.listeners[0].no_delay);
+    }
+
+    #[test]
+    fn invalid_values_are_rejected_when_loading() {
+        let error = load_with(
+            "invalid.toml",
+            &[
+                ("SUPERSOCKET__IDLE_SESSION_TIMEOUT", "1m"),
+                ("SUPERSOCKET__CLEAR_IDLE_SESSION_INTERVAL", "0s"),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid(_)), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_variables_are_skipped_unless_they_are_overrides() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = || OsString::from_vec(vec![0xff, 0xfe]);
+        let vars = utf8_env_vars(
+            "SUPERSOCKET",
+            [
+                (OsString::from("OTHER"), invalid()),
+                (invalid(), OsString::from("value")),
+                (OsString::from("SUPERSOCKET__NAME"), OsString::from("ok")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(vars, [("SUPERSOCKET__NAME".to_owned(), "ok".to_owned())]);
+
+        let error = utf8_env_vars(
+            "SUPERSOCKET",
+            [(OsString::from("SUPERSOCKET__NAME"), invalid())],
+        );
+        assert!(matches!(error, Err(ConfigError::Env { .. })));
     }
 }

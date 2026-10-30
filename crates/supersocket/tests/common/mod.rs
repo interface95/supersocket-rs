@@ -69,6 +69,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Client<R, W> {
         }
     }
 
+    pub fn reader(&mut self) -> &mut BufReader<R> {
+        &mut self.reader
+    }
+
     pub async fn send(&mut self, data: impl AsRef<[u8]>) {
         self.writer.write_all(data.as_ref()).await.unwrap();
         self.writer.flush().await.unwrap();

@@ -28,8 +28,10 @@ mod config;
 mod connection;
 mod error;
 mod extensions;
+mod lenient;
 mod middleware;
 mod options;
+mod panic;
 mod server;
 mod session;
 #[cfg(feature = "tls")]

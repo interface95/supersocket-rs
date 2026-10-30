@@ -446,17 +446,39 @@ async fn session_state_and_broadcast_through_the_session_container() {
     server.shutdown().await;
 }
 
-struct ConnectionLimit(usize);
+struct ConnectionLimit {
+    limit: usize,
+    current: AtomicUsize,
+}
+
+impl ConnectionLimit {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            current: AtomicUsize::new(0),
+        }
+    }
+}
 
 impl<S: SessionState> Middleware<S> for ConnectionLimit {
-    async fn register_session(&self, session: &Session<S>) -> bool {
-        session.server().session_count() < self.0
+    async fn register_session(&self, _session: &Session<S>) -> bool {
+        if self.current.fetch_add(1, Ordering::SeqCst) < self.limit {
+            true
+        } else {
+            self.current.fetch_sub(1, Ordering::SeqCst);
+            false
+        }
+    }
+
+    async fn unregister_session(&self, _session: &Session<S>) {
+        self.current.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn middleware_can_reject_sessions() {
-    let (builder, mut reasons) = track_close_reasons(echo_lines().middleware(ConnectionLimit(1)));
+    let (builder, mut reasons) =
+        track_close_reasons(echo_lines().middleware(ConnectionLimit::new(1)));
     let (server, address) = start(builder);
 
     let mut first = Client::connect(address).await;
@@ -471,6 +493,38 @@ async fn middleware_can_reject_sessions() {
     // A rejected session never connected, so it gets no closed event.
     assert!(reasons.try_recv().is_err());
 
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connection_limit_holds_under_a_burst_of_connections() {
+    let (server, address) = start(echo_lines().middleware(ConnectionLimit::new(5)));
+
+    let attempts = (0..20).map(|_| {
+        tokio::spawn(async move {
+            let mut client = Client::connect(address).await;
+            client.send(b"ping\r\n").await;
+            let mut line = String::new();
+            let accepted = tokio::time::timeout(
+                common::WAIT,
+                tokio::io::AsyncBufReadExt::read_line(client.reader(), &mut line),
+            )
+            .await
+            .is_ok_and(|read| read.is_ok_and(|length| length > 0));
+            (accepted, client)
+        })
+    });
+    let mut accepted = 0;
+    let mut clients = Vec::new();
+    for attempt in attempts.collect::<Vec<_>>() {
+        let (ok, client) = attempt.await.unwrap();
+        accepted += usize::from(ok);
+        clients.push(client);
+    }
+    assert_eq!(accepted, 5);
+    assert_eq!(server.info().session_count(), 5);
+
+    drop(clients);
     server.shutdown().await;
 }
 
@@ -689,4 +743,101 @@ fn building_without_listeners_or_with_bad_addresses_fails() {
         bad_address,
         Err(supersocket::Error::InvalidAddress { .. })
     ));
+}
+
+#[test]
+fn options_that_cannot_work_fail_the_build() {
+    let invalid: [fn(&mut ServerOptions); 3] = [
+        |options| options.package_handling = PackageHandling::Concurrent { max_in_flight: 0 },
+        |options| {
+            options.idle_session_timeout = Some(Duration::from_secs(60));
+            options.clear_idle_session_interval = Duration::ZERO;
+        },
+        |options| options.max_package_length = 0,
+    ];
+    for configure in invalid {
+        let result = Server::builder(LineFilter::default)
+            .listen("127.0.0.1:0")
+            .configure(configure)
+            .build();
+        assert!(matches!(result, Err(supersocket::Error::InvalidOptions(_))));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zero_send_buffer_limit_still_sends() {
+    let (server, address) = start(echo_lines().configure(|options| options.send_buffer_limit = 0));
+    let mut client = Client::connect(address).await;
+    client.send(b"one\r\ntwo\r\nthree\r\n").await;
+    assert_eq!(client.line().await, "one");
+    assert_eq!(client.line().await, "two");
+    assert_eq!(client.line().await, "three");
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handler_panics_reach_the_error_handler_and_shutdown_still_completes() {
+    let (server, address) = start(
+        Server::builder(LineFilter::default)
+            .on_package(async |session, package| {
+                if package.text == "boom" {
+                    panic!("handler exploded");
+                }
+                session.send(format!("{}\r\n", package.text)).await?;
+                Ok(())
+            })
+            .on_error(async |session, error| {
+                if let PackageError::Panicked(message) = error {
+                    let _ = session.send(format!("panicked: {message}\r\n")).await;
+                }
+                ErrorAction::Continue
+            }),
+    );
+    let mut client = Client::connect(address).await;
+    client.send(b"boom\r\nafter\r\n").await;
+    assert_eq!(client.line().await, "panicked: handler exploded");
+    assert_eq!(client.line().await, "after");
+
+    tokio::time::timeout(common::WAIT, server.shutdown())
+        .await
+        .expect("shutdown hung after a handler panic");
+    client.expect_closed().await;
+}
+
+/// Panics on `!`, otherwise cuts lines.
+#[derive(Default)]
+struct PanickyFilter(LineFilter);
+
+impl PipelineFilter for PanickyFilter {
+    type Package = TextPackage;
+
+    fn filter(&mut self, buf: &mut BytesMut) -> Result<Option<TextPackage>, ProtocolError> {
+        assert!(!buf.contains(&b'!'), "filter exploded");
+        self.0.filter(buf)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_filter_closes_only_its_session() {
+    let (builder, mut reasons) = track_close_reasons(
+        Server::builder(PanickyFilter::default).on_package(async |session, package| {
+            session.send(format!("{}\r\n", package.text)).await?;
+            Ok(())
+        }),
+    );
+    let (server, address) = start(builder);
+
+    let mut healthy = Client::connect(address).await;
+    let mut broken = Client::connect(address).await;
+    broken.send(b"bad!\r\n").await;
+    broken.expect_closed().await;
+    assert_eq!(next_reason(&mut reasons).await, CloseReason::InternalError);
+
+    healthy.send(b"fine\r\n").await;
+    assert_eq!(healthy.line().await, "fine");
+    assert_eq!(server.info().session_count(), 1);
+
+    tokio::time::timeout(common::WAIT, server.shutdown())
+        .await
+        .expect("shutdown hung after a filter panic");
 }
