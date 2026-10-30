@@ -18,7 +18,7 @@ use supersocket_proto::PackageEncoder;
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
 
-use crate::{BoxError, extensions::Extensions, server::ServerInfo};
+use crate::{BoxError, extensions::Extensions, proxy_protocol::ProxyInfo, server::ServerInfo};
 
 /// Why a session was closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -104,6 +104,37 @@ pub trait SessionState: Default + Send + Sync + 'static {
 
 impl SessionState for () {}
 
+/// Where the connection of a session comes from, as the server learned while accepting it.
+pub(crate) struct ConnectionInfo {
+    pub(crate) remote_addr: SocketAddr,
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) secure: bool,
+    pub(crate) proxy: Option<Box<ProxyInfo>>,
+    #[cfg(feature = "tls")]
+    pub(crate) tls: Option<Box<crate::TlsInfo>>,
+}
+
+impl ConnectionInfo {
+    pub(crate) fn new(remote_addr: SocketAddr, local_addr: SocketAddr) -> Self {
+        Self {
+            remote_addr,
+            local_addr,
+            secure: false,
+            proxy: None,
+            #[cfg(feature = "tls")]
+            tls: None,
+        }
+    }
+
+    /// Records what a PROXY protocol header said: the client's address replaces the proxy's.
+    pub(crate) fn set_proxy(&mut self, info: ProxyInfo) {
+        if let Some(source) = info.source() {
+            self.remote_addr = source;
+        }
+        self.proxy = Some(Box::new(info));
+    }
+}
+
 /// A connected client. Cloning is cheap; clones refer to the same session, so a session can be
 /// handed to other tasks that send to it.
 pub struct Session<S = ()> {
@@ -112,9 +143,7 @@ pub struct Session<S = ()> {
 
 struct SessionInner<S> {
     id: u64,
-    remote_addr: SocketAddr,
-    local_addr: SocketAddr,
-    secure: bool,
+    connection: ConnectionInfo,
     start_time: SystemTime,
     started_at: Instant,
     last_active_ms: AtomicU64,
@@ -147,8 +176,8 @@ impl<S> fmt::Debug for Session<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Session")
             .field("id", &self.inner.id)
-            .field("remote_addr", &self.inner.remote_addr)
-            .field("secure", &self.inner.secure)
+            .field("remote_addr", &self.inner.connection.remote_addr)
+            .field("secure", &self.inner.connection.secure)
             .finish_non_exhaustive()
     }
 }
@@ -156,9 +185,7 @@ impl<S> fmt::Debug for Session<S> {
 impl<S: SessionState> Session<S> {
     pub(crate) fn new(
         id: u64,
-        remote_addr: SocketAddr,
-        local_addr: SocketAddr,
-        secure: bool,
+        connection: ConnectionInfo,
         handshake_complete: bool,
         close_token: CancellationToken,
         server: Arc<ServerInfo<S>>,
@@ -167,9 +194,7 @@ impl<S: SessionState> Session<S> {
         Self {
             inner: Arc::new(SessionInner {
                 id,
-                remote_addr,
-                local_addr,
-                secure,
+                connection,
                 start_time: SystemTime::now(),
                 started_at: Instant::now(),
                 last_active_ms: AtomicU64::new(0),
@@ -191,19 +216,33 @@ impl<S> Session<S> {
         self.inner.id
     }
 
-    /// Address of the peer.
+    /// Address of the peer. On a listener that reads PROXY protocol headers it is the client's
+    /// address from the header, not the proxy's.
     pub fn remote_addr(&self) -> SocketAddr {
-        self.inner.remote_addr
+        self.inner.connection.remote_addr
     }
 
     /// Local address the peer connected to.
     pub fn local_addr(&self) -> SocketAddr {
-        self.inner.local_addr
+        self.inner.connection.local_addr
     }
 
     /// Whether the connection uses TLS.
     pub fn is_secure(&self) -> bool {
-        self.inner.secure
+        self.inner.connection.secure
+    }
+
+    /// What the PROXY protocol header of the connection said, on a listener with
+    /// [`proxy_protocol`](crate::ListenOptions::proxy_protocol).
+    pub fn proxy_info(&self) -> Option<&ProxyInfo> {
+        self.inner.connection.proxy.as_deref()
+    }
+
+    /// What the TLS handshake established, such as the certificate the client sent, on a TLS
+    /// listener.
+    #[cfg(feature = "tls")]
+    pub fn tls_info(&self) -> Option<&crate::TlsInfo> {
+        self.inner.connection.tls.as_deref()
     }
 
     /// When the session connected.

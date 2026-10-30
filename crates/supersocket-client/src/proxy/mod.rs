@@ -8,7 +8,7 @@ mod socks5;
 use std::{fmt, io};
 
 use bytes::BytesMut;
-use supersocket_connection::{PackageReader, ReadError, ReadOptions};
+use supersocket_connection::{PackageReader, ReadError, ReadOptions, Rewind};
 use supersocket_proto::BoxFilter;
 use tokio::net::TcpStream;
 
@@ -16,7 +16,7 @@ pub use http::HttpProxy;
 pub use socks4::Socks4Proxy;
 pub use socks5::Socks5Proxy;
 
-use crate::{BoxStream, Connection, Endpoint, TcpConnector, rewind::Rewind};
+use crate::{BoxStream, Connection, Endpoint, TcpConnector};
 
 const HANDSHAKE_LIMITS: ReadOptions = ReadOptions {
     max_package_length: 64 * 1024,

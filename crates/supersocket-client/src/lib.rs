@@ -25,7 +25,6 @@ mod connector;
 mod endpoint;
 #[cfg(feature = "proxy")]
 mod proxy;
-mod rewind;
 #[cfg(feature = "tls")]
 mod tls;
 

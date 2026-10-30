@@ -31,6 +31,7 @@ mod extensions;
 mod lenient;
 mod middleware;
 mod options;
+mod proxy_protocol;
 mod server;
 mod session;
 #[cfg(feature = "tls")]
@@ -43,7 +44,12 @@ pub use error::{BoxError, Error, HandlerResult};
 pub use extensions::Extensions;
 pub use middleware::Middleware;
 pub use options::{ListenOptions, PackageHandling, ServerOptions, TlsOptions};
+pub use proxy_protocol::{ProxyCommand, ProxyInfo};
 pub use server::{ErrorAction, PackageError, PackageHandler, Server, ServerBuilder, ServerInfo};
 pub use session::{CloseReason, Session, SessionContainer, SessionState};
+#[cfg(feature = "tls")]
+pub use tls::TlsInfo;
+#[cfg(feature = "tls")]
+pub use tokio_rustls::rustls;
 
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;

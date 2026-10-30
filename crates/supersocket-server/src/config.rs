@@ -288,6 +288,41 @@ mod tests {
     }
 
     #[test]
+    fn reads_connection_settings_of_listeners() {
+        let options = ServerOptions::from_toml_str(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:4040"
+            proxy_protocol = true
+            keepalive = "1m"
+            socket_receive_buffer_size = 262144
+            socket_send_buffer_size = "131072"
+
+            [listeners.tls]
+            cert = "cert.pem"
+            key = "key.pem"
+            client_ca = "clients.pem"
+            client_auth_optional = "true"
+            "#,
+        )
+        .unwrap();
+        let listener = &options.listeners[0];
+        assert!(listener.proxy_protocol);
+        assert_eq!(listener.keepalive, Some(Duration::from_secs(60)));
+        assert_eq!(listener.socket_receive_buffer_size, Some(262_144));
+        assert_eq!(listener.socket_send_buffer_size, Some(131_072));
+        let tls = listener.tls.as_ref().unwrap();
+        assert_eq!(tls.client_ca.as_deref(), Some(Path::new("clients.pem")));
+        assert!(tls.client_auth_optional);
+
+        let zero = "[[listeners]]\naddress = \"0.0.0.0:4040\"\nkeepalive = \"0s\"";
+        assert!(matches!(
+            ServerOptions::from_toml_str(zero),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn environment_overrides_file_values() {
         let path = write_temp("env.toml", TOML);
         let vars = [

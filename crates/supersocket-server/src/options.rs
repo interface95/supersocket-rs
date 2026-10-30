@@ -56,8 +56,9 @@ pub struct ServerOptions {
 
     /// How long a session may take to complete its handshake on a server that requires one, such
     /// as a WebSocket server; see
-    /// [`ServerBuilder::require_handshake`](crate::ServerBuilder::require_handshake). Default:
-    /// 10 seconds.
+    /// [`ServerBuilder::require_handshake`](crate::ServerBuilder::require_handshake). A listener
+    /// with [`proxy_protocol`](ListenOptions::proxy_protocol) also waits this long for the
+    /// header. Default: 10 seconds.
     #[serde(with = "lenient::duration")]
     pub handshake_timeout: Duration,
 }
@@ -113,11 +114,23 @@ impl ServerOptions {
             return invalid("handshake_timeout must be greater than zero".into());
         }
         for listener in &self.listeners {
-            if listener.backlog == 0 {
-                return invalid(format!(
-                    "listener {}: backlog must be greater than zero",
+            let zero = |field: &str| {
+                invalid(format!(
+                    "listener {}: {field} must be greater than zero",
                     listener.address
-                ));
+                ))
+            };
+            if listener.backlog == 0 {
+                return zero("backlog");
+            }
+            if listener.keepalive.is_some_and(|time| time.is_zero()) {
+                return zero("keepalive");
+            }
+            if listener.socket_receive_buffer_size == Some(0) {
+                return zero("socket_receive_buffer_size");
+            }
+            if listener.socket_send_buffer_size == Some(0) {
+                return zero("socket_send_buffer_size");
             }
             if let Some(tls) = &listener.tls {
                 if tls.handshake_timeout.is_zero() {
@@ -148,7 +161,7 @@ pub enum PackageHandling {
     },
 }
 
-/// A listening address.
+/// A listening address and the settings of the connections accepted on it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenOptions {
@@ -164,6 +177,30 @@ pub struct ListenOptions {
     #[serde(default = "default_no_delay", deserialize_with = "lenient::bool")]
     pub no_delay: bool,
 
+    /// Send TCP keepalive probes once a connection has been idle this long, so that connections
+    /// whose peer vanished are noticed. Default: off.
+    #[serde(default, with = "lenient::option_duration")]
+    pub keepalive: Option<Duration>,
+
+    /// Size of the kernel's receive buffer of each connection, `SO_RCVBUF`. Unrelated to
+    /// [`ServerOptions::receive_buffer_size`], which is how much the server reads at a time.
+    /// Default: the operating system's.
+    #[serde(default, deserialize_with = "lenient::option_u32")]
+    pub socket_receive_buffer_size: Option<u32>,
+
+    /// Size of the kernel's send buffer of each connection, `SO_SNDBUF`. Default: the operating
+    /// system's.
+    #[serde(default, deserialize_with = "lenient::option_u32")]
+    pub socket_send_buffer_size: Option<u32>,
+
+    /// Whether connections start with a PROXY protocol header, version 1 or 2, as they do behind
+    /// HAProxy, nginx or an AWS Network Load Balancer configured to send one. The header tells
+    /// the client's address, which [`Session::remote_addr`](crate::Session::remote_addr) then
+    /// reports. Connections without a valid header are closed, so enable it only on listeners
+    /// that are reachable through the proxy alone. Default: `false`.
+    #[serde(default, deserialize_with = "lenient::bool")]
+    pub proxy_protocol: bool,
+
     /// Accept TLS connections with this certificate. Requires the `tls` feature.
     #[serde(default)]
     pub tls: Option<TlsOptions>,
@@ -176,6 +213,10 @@ impl ListenOptions {
             address: address.into(),
             backlog: default_backlog(),
             no_delay: default_no_delay(),
+            keepalive: None,
+            socket_receive_buffer_size: None,
+            socket_send_buffer_size: None,
+            proxy_protocol: false,
             tls: None,
         }
     }
@@ -189,8 +230,9 @@ fn default_no_delay() -> bool {
     true
 }
 
-/// TLS settings of a listener. The certificate chain and the private key are PEM files.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// TLS settings of a listener. The certificate chain, the private key and the client certificate
+/// authorities are PEM files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsOptions {
     /// PEM file with the certificate chain, leaf certificate first.
@@ -201,9 +243,28 @@ pub struct TlsOptions {
     #[serde(deserialize_with = "lenient::path")]
     pub key: PathBuf,
 
+    /// PEM file with the certificate authorities that client certificates must chain to.
+    /// Setting it makes the server ask every client for a certificate and refuse clients
+    /// without a valid one; see [`Session::tls_info`](crate::Session::tls_info) for the
+    /// certificate a client sent. Default: none.
+    #[serde(default, deserialize_with = "lenient::option_path")]
+    pub client_ca: Option<PathBuf>,
+
+    /// With `client_ca`, still accept clients that send no certificate. Those that send one must
+    /// send a valid one. Default: `false`.
+    #[serde(default, deserialize_with = "lenient::bool")]
+    pub client_auth_optional: bool,
+
     /// How long a client may take to complete the handshake. Default: 10 seconds.
     #[serde(default = "default_handshake_timeout", with = "lenient::duration")]
     pub handshake_timeout: Duration,
+
+    /// A complete rustls configuration to use instead of one built from the files above, for
+    /// what they cannot express, such as ALPN, a certificate per server name or a custom client
+    /// certificate verifier. Not read from config files.
+    #[cfg(feature = "tls")]
+    #[serde(skip)]
+    pub config: Option<std::sync::Arc<tokio_rustls::rustls::ServerConfig>>,
 }
 
 impl TlsOptions {
@@ -212,8 +273,39 @@ impl TlsOptions {
         Self {
             cert: cert.into(),
             key: key.into(),
+            client_ca: None,
+            client_auth_optional: false,
             handshake_timeout: default_handshake_timeout(),
+            #[cfg(feature = "tls")]
+            config: None,
         }
+    }
+
+    /// TLS with a complete rustls configuration; see [`config`](Self::config).
+    #[cfg(feature = "tls")]
+    pub fn with_config(config: std::sync::Arc<tokio_rustls::rustls::ServerConfig>) -> Self {
+        Self {
+            config: Some(config),
+            ..Self::new(PathBuf::new(), PathBuf::new())
+        }
+    }
+}
+
+impl PartialEq for TlsOptions {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(feature = "tls")]
+        let same_config = match (&self.config, &other.config) {
+            (Some(ours), Some(theirs)) => std::sync::Arc::ptr_eq(ours, theirs),
+            (ours, theirs) => ours.is_none() && theirs.is_none(),
+        };
+        #[cfg(not(feature = "tls"))]
+        let same_config = true;
+        same_config
+            && self.cert == other.cert
+            && self.key == other.key
+            && self.client_ca == other.client_ca
+            && self.client_auth_optional == other.client_auth_optional
+            && self.handshake_timeout == other.handshake_timeout
     }
 }
 

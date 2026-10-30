@@ -41,8 +41,9 @@ async fn main() -> Result<(), supersocket::Error> {
   复用服务端的协议过滤器和发送队列。
 - **WebSocket**（RFC 6455）服务端和客户端建在同一个核心上：握手过滤器读完升级请求后切换到帧过滤器，握手完成后会话才算连上。
   分片、ping 和关闭握手都替你处理好了，并和 tungstenite 做过互通测试。
-- 通过 rustls 支持 **TLS**；**配置**可以从 TOML 或 JSON 文件读取，并用环境变量覆盖；日志用 **tracing**；
-  收到 Ctrl+C 或 SIGTERM 时优雅关闭。
+- 通过 rustls 支持 **TLS**，包括客户端证书认证；部署在负载均衡后面时支持 **PROXY protocol** v1 和 v2；
+  每个监听地址可以单独设置 TCP keepalive 和 socket 收发缓冲区。
+- **配置**可以从 TOML 或 JSON 文件读取，并用环境变量覆盖；日志用 **tracing**；收到 Ctrl+C 或 SIGTERM 时优雅关闭。
 
 ## 开始使用
 
@@ -304,6 +305,37 @@ impl<S: SessionState> Middleware<S> for ConnectionLimit {
 
 TLS 握手在每个连接自己的任务里进行，慢客户端不会拖住接受新连接。
 
+要求客户端出示证书时，配上签发客户端证书的 CA；会话里可以拿到客户端发来的证书：
+
+```rust
+let tls = TlsOptions {
+    client_ca: Some("clients.pem".into()),
+    client_auth_optional: false, // 设为 true 时，没有证书的客户端也接受
+    ..TlsOptions::new("cert.pem", "key.pem")
+};
+// 处理函数里：session.tls_info().unwrap().peer_certificates()
+```
+
+其他需求，比如 ALPN、按域名用不同证书，可以用 `TlsOptions::with_config(Arc::new(server_config))`
+直接传入完整的 rustls 配置。
+
+### 部署在代理后面
+
+放在 HAProxy、nginx 或 AWS Network Load Balancer 后面、并且代理会发 PROXY protocol 头时，给监听地址打开这个选项。
+这样 `session.remote_addr()` 就是客户端的地址而不是代理的地址，中间件一开始就能看到；头里的其他内容在
+`session.proxy_info()` 里。没有合法头的连接会被直接关闭，所以只在只能经由代理访问的监听地址上打开。
+
+```rust
+ListenOptions {
+    proxy_protocol: true,                        // 支持 v1 和 v2；同时开 TLS 时先读头再握手
+    keepalive: Some(Duration::from_secs(60)),    // TCP keepalive
+    socket_receive_buffer_size: Some(256 * 1024), // SO_RCVBUF；发送缓冲区用 socket_send_buffer_size
+    ..ListenOptions::new("0.0.0.0:4040")
+}
+```
+
+其他 socket 选项可以用 `ServerBuilder::configure_socket(|stream| ...)`，每个新连接都会调用。
+
 ### 配置
 
 开启 `config` feature 后，`ServerOptions::load` 可以读取 TOML 或 JSON 文件。每个字段都有默认值，环境变量可以覆盖文件里的值。值会按字段类型转换，数字可以写成字符串，时长可以写 `"30s"` 或秒数：
@@ -350,6 +382,7 @@ Server::builder(LineFilter::default).options(options)
 ## 路线图
 
 - WebSocket 压缩（permessage-deflate），并跑一遍 Autobahn 测试套件
+- 接入其他传输层的连接（比如 Unix 套接字），以及 GZip 流压缩
 - 用派生宏注册命令
 - UDP 会话（有需求再做）
 

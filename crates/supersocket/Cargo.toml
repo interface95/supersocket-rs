@@ -32,6 +32,7 @@ supersocket-websocket = { workspace = true, optional = true }
 [dev-dependencies]
 futures-util.workspace = true
 rcgen.workspace = true
+socket2 = { workspace = true, features = ["all"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true

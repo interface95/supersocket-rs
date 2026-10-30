@@ -47,18 +47,31 @@ pub(crate) fn path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf
 }
 
 fn unsigned<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-    match Scalar::deserialize(deserializer)? {
+    unsigned_from(Scalar::deserialize(deserializer)?)
+}
+
+fn unsigned_from<E: serde::de::Error>(scalar: Scalar) -> Result<u64, E> {
+    match scalar {
         Scalar::Unsigned(value) => Ok(value),
         Scalar::Text(text) => text.trim().parse().map_err(|_| {
-            D::Error::custom(format!(
+            E::custom(format!(
                 "expected a non-negative integer, found string {text:?}"
             ))
         }),
-        other => Err(D::Error::custom(format!(
+        other => Err(E::custom(format!(
             "expected a non-negative integer, found {}",
             other.describe()
         ))),
     }
+}
+
+pub(crate) fn option_path<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PathBuf>, D::Error> {
+    Ok(
+        Option::<Scalar>::deserialize(deserializer)?
+            .map(|scalar| PathBuf::from(scalar.into_text())),
+    )
 }
 
 pub(crate) fn usize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<usize, D::Error> {
@@ -69,6 +82,17 @@ pub(crate) fn usize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<usize,
 pub(crate) fn u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
     let value = unsigned(deserializer)?;
     u32::try_from(value).map_err(|_| D::Error::custom(format!("{value} is too large")))
+}
+
+pub(crate) fn option_u32<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    Option::<Scalar>::deserialize(deserializer)?
+        .map(|scalar| {
+            let value = unsigned_from(scalar)?;
+            u32::try_from(value).map_err(|_| D::Error::custom(format!("{value} is too large")))
+        })
+        .transpose()
 }
 
 pub(crate) fn bool<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {

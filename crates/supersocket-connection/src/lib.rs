@@ -9,11 +9,15 @@
 //!
 //! [`catch_panic`] and [`catch_panic_sync`] run application code and turn a panic into an error,
 //! so it cannot unwind through the connection's own tasks.
+//!
+//! [`Rewind`] puts bytes that were read too early back in front of a stream.
 
 mod panic;
 mod reader;
+mod rewind;
 mod send_queue;
 
 pub use panic::{catch_panic, catch_panic_sync};
 pub use reader::{PackageReader, ReadError, ReadOptions};
+pub use rewind::Rewind;
 pub use send_queue::SendQueue;

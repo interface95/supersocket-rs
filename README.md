@@ -49,8 +49,10 @@ async fn main() -> Result<(), supersocket::Error> {
 - **WebSocket** (RFC 6455) server and client built on the same core: the handshake filter
   switches to the frame filter, and sessions count as connected once the handshake is complete.
   Fragments, pings and the closing handshake are handled for you; tested against tungstenite.
-- **TLS** through rustls, **configuration** from TOML or JSON files with environment overrides,
-  **tracing** for logs, graceful shutdown on Ctrl+C or SIGTERM.
+- **TLS** through rustls, including client certificates, **PROXY protocol** v1 and v2 behind load
+  balancers, TCP keepalive and socket buffer sizes per listener.
+- **Configuration** from TOML or JSON files with environment overrides, **tracing** for logs,
+  graceful shutdown on Ctrl+C or SIGTERM.
 
 ## Getting started
 
@@ -328,6 +330,41 @@ Enable the `tls` feature and give a listener a PEM certificate chain and private
 
 The handshake runs in the connection's own task, so slow clients never hold up accepting.
 
+To require client certificates, add the authorities they must chain to; the session then
+tells which certificate a client sent:
+
+```rust
+let tls = TlsOptions {
+    client_ca: Some("clients.pem".into()),
+    client_auth_optional: false, // true also accepts clients without a certificate
+    ..TlsOptions::new("cert.pem", "key.pem")
+};
+// In a handler: session.tls_info().unwrap().peer_certificates()
+```
+
+For anything else, such as ALPN or a certificate per server name, pass a complete rustls
+configuration with `TlsOptions::with_config(Arc::new(server_config))`.
+
+### Connections behind a proxy
+
+Behind HAProxy, nginx or an AWS Network Load Balancer that sends a PROXY protocol header, turn
+it on for the listener. `session.remote_addr()` is then the client's address rather than the
+proxy's, already when middleware sees the session, and `session.proxy_info()` has the rest of the
+header. Connections without a valid header are closed, so enable it only where the proxy is the
+only way in.
+
+```rust
+ListenOptions {
+    proxy_protocol: true,                        // version 1 and 2, before TLS if both are on
+    keepalive: Some(Duration::from_secs(60)),    // TCP keepalive
+    socket_receive_buffer_size: Some(256 * 1024), // SO_RCVBUF; also socket_send_buffer_size
+    ..ListenOptions::new("0.0.0.0:4040")
+}
+```
+
+`ServerBuilder::configure_socket(|stream| ...)` runs on every accepted connection for any other
+socket option.
+
 ### Configuration
 
 With the `config` feature, `ServerOptions::load` reads a TOML or JSON file. Every field has a
@@ -380,6 +417,7 @@ their time elsewhere.
 ## Roadmap
 
 - WebSocket compression (permessage-deflate) and a run of the Autobahn test suite
+- Serving connections from other transports, such as Unix sockets, and GZip streams
 - Derive-style command registration
 - UDP sessions, if there is demand
 

@@ -85,10 +85,21 @@ where
 {
     /// Creates a reader that cuts what `reader` delivers into packages with `filter`.
     pub fn new(reader: R, filter: BoxFilter<P>, options: ReadOptions) -> Self {
+        Self::with_buffered(reader, filter, options, BytesMut::new())
+    }
+
+    /// Like [`new`](Self::new), for a reader whose first bytes were already read, such as data
+    /// that arrived together with a PROXY protocol header. They are cut into packages first.
+    pub fn with_buffered(
+        reader: R,
+        filter: BoxFilter<P>,
+        options: ReadOptions,
+        buffered: BytesMut,
+    ) -> Self {
         Self {
             reader,
             filter,
-            buf: BytesMut::new(),
+            buf: buffered,
             options,
         }
     }
@@ -286,6 +297,18 @@ mod tests {
             reader.next().await,
             Err(ReadError::FilterPanicked(message)) if message == "filter exploded"
         ));
+    }
+
+    #[tokio::test]
+    async fn bytes_read_earlier_come_first() {
+        let data: &[u8] = b"lo\r\n";
+        let mut reader = PackageReader::with_buffered(
+            data,
+            Box::new(LineFilter::default()),
+            ReadOptions::default(),
+            BytesMut::from(&b"hel"[..]),
+        );
+        assert_eq!(reader.next().await.unwrap().unwrap().text, "hello");
     }
 
     #[tokio::test]

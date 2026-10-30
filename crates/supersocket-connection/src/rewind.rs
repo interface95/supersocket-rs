@@ -1,5 +1,5 @@
 use std::{
-    io,
+    fmt, io,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -8,17 +8,30 @@ use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// A stream that first yields bytes already read from it, such as data a proxy sent right after
-/// its handshake reply.
-#[cfg_attr(not(feature = "proxy"), allow(dead_code))]
-pub(crate) struct Rewind<S> {
+/// its handshake, then reads on from the stream. Writes go straight to the stream.
+pub struct Rewind<S> {
     prefix: Bytes,
     inner: S,
 }
 
-#[cfg_attr(not(feature = "proxy"), allow(dead_code))]
 impl<S> Rewind<S> {
-    pub(crate) fn new(prefix: Bytes, inner: S) -> Self {
+    /// A stream that yields `prefix`, then what `inner` delivers.
+    pub fn new(prefix: Bytes, inner: S) -> Self {
         Self { prefix, inner }
+    }
+
+    /// The underlying stream.
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: fmt::Debug> fmt::Debug for Rewind<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rewind")
+            .field("prefix", &self.prefix.len())
+            .field("inner", &self.inner)
+            .finish()
     }
 }
 

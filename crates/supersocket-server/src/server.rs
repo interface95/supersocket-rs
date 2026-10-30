@@ -14,7 +14,7 @@ use std::{
 
 use supersocket_connection::catch_panic;
 use supersocket_proto::{BoxFilter, PipelineFilter};
-use tokio::net::{TcpListener, TcpSocket};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
@@ -228,6 +228,7 @@ type ClosedHandler<S> =
     Arc<dyn Fn(Session<S>, CloseReason) -> BoxFuture<'static, ()> + Send + Sync>;
 type ErrorHandler<S> =
     Arc<dyn Fn(Session<S>, PackageError) -> BoxFuture<'static, ErrorAction> + Send + Sync>;
+type SocketConfigurator = Box<dyn Fn(&TcpStream) + Send + Sync>;
 
 /// Builds a [`Server`]. Created by [`Server::builder`].
 pub struct ServerBuilder<P, S = ()> {
@@ -240,6 +241,7 @@ pub struct ServerBuilder<P, S = ()> {
     on_error: Option<ErrorHandler<S>>,
     middlewares: Vec<Box<dyn DynMiddleware<S>>>,
     handshake_required: bool,
+    configure_socket: Option<SocketConfigurator>,
 }
 
 impl<P: Send + 'static> ServerBuilder<P> {
@@ -268,6 +270,7 @@ impl<P: Send + 'static> ServerBuilder<P> {
             on_error: None,
             middlewares: Vec::new(),
             handshake_required: self.handshake_required,
+            configure_socket: self.configure_socket,
         }
     }
 }
@@ -348,6 +351,17 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
         self
     }
 
+    /// Runs `configure` on every accepted TCP connection, after the listener's own settings, for
+    /// socket options that [`ListenOptions`] does not cover, for example through
+    /// `socket2::SockRef::from(stream)`. Errors are the closure's to handle.
+    pub fn configure_socket(
+        mut self,
+        configure: impl Fn(&TcpStream) + Send + Sync + 'static,
+    ) -> Self {
+        self.configure_socket = Some(Box::new(configure));
+        self
+    }
+
     /// Listens on `address` with plain TCP, such as `"0.0.0.0:4040"`. Use
     /// [`configure`](Self::configure) for TLS or other listener settings.
     pub fn listen(mut self, address: impl Into<String>) -> Self {
@@ -401,6 +415,7 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
                 on_error: self.on_error,
                 middlewares,
                 handshake_required: self.handshake_required,
+                configure_socket: self.configure_socket,
                 listeners,
                 next_session_id: AtomicU64::new(1),
                 started: AtomicBool::new(false),
@@ -426,6 +441,7 @@ pub(crate) struct ServerInner<P, S> {
     pub(crate) on_error: Option<ErrorHandler<S>>,
     pub(crate) middlewares: Vec<Box<dyn DynMiddleware<S>>>,
     pub(crate) handshake_required: bool,
+    pub(crate) configure_socket: Option<SocketConfigurator>,
     listeners: Vec<Arc<Listener>>,
     pub(crate) next_session_id: AtomicU64,
     started: AtomicBool,
@@ -480,6 +496,14 @@ impl Listener {
             // On Windows SO_REUSEADDR would let another socket bind a port that is in use.
             #[cfg(not(windows))]
             socket.set_reuseaddr(true)?;
+            // The receive buffer must be set before listening to count for the window scaling
+            // of new connections. Each accepted connection gets the sizes again in `configure`.
+            if let Some(size) = self.options.socket_receive_buffer_size {
+                socket.set_recv_buffer_size(size)?;
+            }
+            if let Some(size) = self.options.socket_send_buffer_size {
+                socket.set_send_buffer_size(size)?;
+            }
             socket.bind(self.address)?;
             socket.listen(self.options.backlog)
         };
@@ -487,6 +511,29 @@ impl Listener {
             address: self.address,
             source,
         })
+    }
+
+    /// Applies the listener's settings to a connection it accepted.
+    pub(crate) fn configure(&self, stream: &TcpStream) {
+        let _ = stream.set_nodelay(self.options.no_delay);
+        let socket = socket2::SockRef::from(stream);
+        // Linux passes the listener's buffer sizes on to accepted connections, but macOS does not.
+        if let Some(size) = self.options.socket_receive_buffer_size {
+            if let Err(error) = socket.set_recv_buffer_size(size as usize) {
+                tracing::debug!(%error, "setting the receive buffer size failed");
+            }
+        }
+        if let Some(size) = self.options.socket_send_buffer_size {
+            if let Err(error) = socket.set_send_buffer_size(size as usize) {
+                tracing::debug!(%error, "setting the send buffer size failed");
+            }
+        }
+        if let Some(time) = self.options.keepalive {
+            let keepalive = socket2::TcpKeepalive::new().with_time(time);
+            if let Err(error) = socket.set_tcp_keepalive(&keepalive) {
+                tracing::debug!(%error, "enabling TCP keepalive failed");
+            }
+        }
     }
 }
 
@@ -516,6 +563,7 @@ impl<P: Send + 'static> Server<P> {
             on_error: None,
             middlewares: Vec::new(),
             handshake_required: false,
+            configure_socket: None,
         }
     }
 }
@@ -610,6 +658,11 @@ async fn accept_loop<P: Send + 'static, S: SessionState>(
                 // The TLS handshake and session setup run in the connection's own task, so a slow
                 // client never holds up the accept loop.
                 Ok((stream, _)) => {
+                    #[cfg(feature = "tls")]
+                    if listener.tls.is_some() {
+                        server.tracker.spawn(connection::serve_tls(server.clone(), stream, listener.clone()));
+                        continue;
+                    }
                     server.tracker.spawn(connection::serve(server.clone(), stream, listener.clone()));
                 }
                 Err(error) => {

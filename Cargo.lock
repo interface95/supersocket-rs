@@ -712,6 +712,7 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "rcgen",
+ "socket2",
  "supersocket-client",
  "supersocket-connection",
  "supersocket-proto",
@@ -764,6 +765,7 @@ dependencies = [
  "humantime",
  "serde",
  "serde_json",
+ "socket2",
  "supersocket-connection",
  "supersocket-proto",
  "thiserror",

@@ -21,6 +21,7 @@ supersocket-proto.workspace = true
 bytes.workspace = true
 humantime.workspace = true
 serde.workspace = true
+socket2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
