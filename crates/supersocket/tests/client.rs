@@ -5,6 +5,8 @@ mod common;
 use std::{
     io,
     net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -12,10 +14,15 @@ use common::{WAIT, next_reason, start, track_close_reasons};
 use supersocket::{
     FixedHeaderFilter, FixedHeaderProtocol, ServerBuilder,
     bytes::{BufMut, Bytes, BytesMut},
-    client::ReadError,
+    client::{Connection, Connector, Endpoint, ReadError},
     prelude::*,
 };
-use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpListener,
+    sync::mpsc,
+    time::timeout,
+};
 
 fn echo_lines() -> ServerBuilder<TextPackage> {
     Server::builder(LineFilter::default).on_package(async |session, package| {
@@ -111,29 +118,56 @@ async fn dropping_every_sender_closes_a_receiving_client() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn close_gives_up_on_a_server_that_stops_reading() {
-    // Accepts the connection but never reads from it. A tiny receive buffer keeps the receive
-    // window small on every platform (it also turns off Windows' receive autotuning), so the
-    // client's writer blocks after a little data rather than the kernel swallowing it all.
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    socket2::SockRef::from(&listener)
-        .set_recv_buffer_size(4 * 1024)
-        .unwrap();
-    let address = listener.local_addr().unwrap();
-    let accepting = tokio::spawn(async move { listener.accept().await.unwrap() });
+/// A stream whose writes never finish and whose reads never end, so a client writing to it is
+/// stuck until something cancels it. It drives nothing itself; the close timeout wakes the task.
+struct Stall;
 
+impl AsyncRead for Stall {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for Stall {
+    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
+        Poll::Pending
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Opens every connection on a [`Stall`] stream.
+struct StallConnector;
+
+impl Connector for StallConnector {
+    async fn connect(&self, _: &Endpoint, _: Option<Connection>) -> io::Result<Connection> {
+        Ok(Connection::new(Stall))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_gives_up_when_data_cannot_be_sent() {
+    // The connection never accepts the queued data, so `close` can only give up after its
+    // timeout. A stalling stream makes this deterministic on every platform, unlike relying on
+    // filling the operating system's socket buffers.
     let close_timeout = Duration::from_millis(200);
     let client = EasyClient::builder(LineFilter::default)
         .configure(|options| options.close_timeout = close_timeout)
-        .connect(address)
+        .proxy(StallConnector)
+        .connect("127.0.0.1:1")
         .await
         .unwrap();
-    let _server_side = accepting.await.unwrap();
-    // Far more than the socket buffers hold, so the writer gets stuck.
-    client.send(vec![b'x'; 16 * 1024 * 1024]).await.unwrap();
+    client.send("stuck forever\r\n").await.unwrap();
 
-    // Every caller waits for the queued data, and gives up once the close timeout has passed.
+    // Every caller waits for the queued data, and all give up once the close timeout has passed.
     let started = Instant::now();
     let close = |sender: ClientSender| async move {
         sender.close().await;
