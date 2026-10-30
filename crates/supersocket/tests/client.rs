@@ -113,8 +113,13 @@ async fn dropping_every_sender_closes_a_receiving_client() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_gives_up_on_a_server_that_stops_reading() {
-    // Accepts the connection but never reads from it.
+    // Accepts the connection but never reads from it. A tiny receive buffer keeps the receive
+    // window small on every platform (it also turns off Windows' receive autotuning), so the
+    // client's writer blocks after a little data rather than the kernel swallowing it all.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    socket2::SockRef::from(&listener)
+        .set_recv_buffer_size(4 * 1024)
+        .unwrap();
     let address = listener.local_addr().unwrap();
     let accepting = tokio::spawn(async move { listener.accept().await.unwrap() });
 
