@@ -43,6 +43,8 @@ async fn main() -> Result<(), supersocket::Error> {
   分片、ping 和关闭握手都替你处理好了，并和 tungstenite 做过互通测试。
 - 通过 rustls 支持 **TLS**，包括客户端证书认证；部署在负载均衡后面时支持 **PROXY protocol** v1 和 v2；
   每个监听地址可以单独设置 TCP keepalive 和 socket 收发缓冲区。
+- **任意传输层**：Unix 套接字、stdin/stdout、HTTP 升级后的连接都能交给服务端处理；连接还可以套上**流包装层**，
+  比如内置的 gzip 压缩。
 - **配置**可以从 TOML 或 JSON 文件读取，并用环境变量覆盖；日志用 **tracing**；收到 Ctrl+C 或 SIGTERM 时优雅关闭。
 
 ## 开始使用
@@ -51,7 +53,7 @@ async fn main() -> Result<(), supersocket::Error> {
 
 ```toml
 [dependencies]
-supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # 可选 feature："tls"、"config"、"client"、"proxy"、"websocket"
+supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # 可选 feature："tls"、"config"、"client"、"proxy"、"websocket"、"gzip"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -336,6 +338,28 @@ ListenOptions {
 
 其他 socket 选项可以用 `ServerBuilder::configure_socket(|stream| ...)`，每个新连接都会调用。
 
+### 其他传输层和流包装层
+
+连接不一定来自服务端自己的 TCP 监听器。任何字节流都可以交给服务端，它会和其他会话一样：经过中间件、进入会话容器、
+随服务端关闭而关闭。服务端也可以完全不配置监听地址。
+
+```rust
+let listener = tokio::net::UnixListener::bind("/tmp/app.sock")?;
+while let Ok((stream, _)) = listener.accept().await {
+    server.serve_connection(stream, ConnectionInfo::default()); // Unix 套接字没有 IP 地址
+}
+```
+
+流包装层在 TLS 握手之后包住每个连接，对应 SuperSocket 的 `IConnectionStreamInitializer`。启用 `gzip` feature 后，
+`GzipLayer` 对连接双向压缩，客户端用 `GzipConnector` 配合：
+
+```rust
+Server::builder(LineFilter::default).stream_layer(GzipLayer)
+EasyClient::builder(LineFilter::default()).connector(GzipConnector)
+```
+
+自己的包装层（比如流量统计、其他加密）实现 `StreamLayer` 即可。
+
 ### 配置
 
 开启 `config` feature 后，`ServerOptions::load` 可以读取 TOML 或 JSON 文件。每个字段都有默认值，环境变量可以覆盖文件里的值。值会按字段类型转换，数字可以写成字符串，时长可以写 `"30s"` 或秒数：
@@ -382,7 +406,6 @@ Server::builder(LineFilter::default).options(options)
 ## 路线图
 
 - WebSocket 压缩（permessage-deflate），并跑一遍 Autobahn 测试套件
-- 接入其他传输层的连接（比如 Unix 套接字），以及 GZip 流压缩
 - 用派生宏注册命令
 - UDP 会话（有需求再做）
 

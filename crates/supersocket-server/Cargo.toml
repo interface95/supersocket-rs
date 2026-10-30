@@ -14,6 +14,8 @@ categories.workspace = true
 tls = ["dep:tokio-rustls"]
 ## Loading `ServerOptions` from TOML or JSON files with environment overrides.
 config = ["dep:serde_json", "dep:toml"]
+## `GzipLayer`, which compresses connections with gzip.
+gzip = ["supersocket-connection/gzip"]
 
 [dependencies]
 supersocket-connection.workspace = true

@@ -1,19 +1,9 @@
 use std::{fmt, future::Future, io, net::SocketAddr};
 
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::{TcpSocket, TcpStream},
-};
+use supersocket_connection::BoxStream;
+use tokio::net::{TcpSocket, TcpStream};
 
 use crate::{BoxFuture, Endpoint};
-
-/// A byte stream a connection runs on.
-pub trait Stream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
-
-impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Stream for T {}
-
-/// A boxed [`Stream`].
-pub type BoxStream = Box<dyn Stream>;
 
 /// A connection being built by a chain of [`Connector`]s.
 pub struct Connection {
@@ -75,6 +65,34 @@ pub(crate) fn must_be_first(name: &str, previous: &Option<Connection>) -> io::Re
             format!("{name} opens the connection, so it must be the first connector"),
         )),
         None => Ok(()),
+    }
+}
+
+/// Compresses the connection with gzip in both directions, like SuperSocket's `GZipConnector`.
+/// The server must compress too, as with `GzipLayer` from `supersocket-server`. It wraps the
+/// connection made so far, so add it after the connector that opens it and after TLS.
+#[cfg(feature = "gzip")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GzipConnector;
+
+#[cfg(feature = "gzip")]
+impl Connector for GzipConnector {
+    async fn connect(
+        &self,
+        _target: &Endpoint,
+        previous: Option<Connection>,
+    ) -> io::Result<Connection> {
+        let connection = previous.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GzipConnector wraps a connection, so it cannot be the first connector",
+            )
+        })?;
+        Ok(Connection {
+            stream: supersocket_connection::gzip(connection.stream),
+            local_addr: connection.local_addr,
+            peer_addr: connection.peer_addr,
+        })
     }
 }
 

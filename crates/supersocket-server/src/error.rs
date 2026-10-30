@@ -10,10 +10,6 @@ pub type HandlerResult = Result<(), BoxError>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// [`ServerBuilder::build`](crate::ServerBuilder::build) was called without any listener.
-    #[error("no listener is configured")]
-    NoListener,
-
     /// The options contain a value that cannot work, such as a zero timeout.
     #[error("invalid server options: {0}")]
     InvalidOptions(String),

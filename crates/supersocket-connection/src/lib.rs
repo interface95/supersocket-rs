@@ -12,12 +12,18 @@
 //!
 //! [`Rewind`] puts bytes that were read too early back in front of a stream.
 
+#[cfg(feature = "gzip")]
+mod gzip;
 mod panic;
 mod reader;
 mod rewind;
 mod send_queue;
+mod stream;
 
+#[cfg(feature = "gzip")]
+pub use gzip::gzip;
 pub use panic::{catch_panic, catch_panic_sync};
 pub use reader::{PackageReader, ReadError, ReadOptions};
 pub use rewind::Rewind;
 pub use send_queue::SendQueue;
+pub use stream::{BoxStream, Stream};

@@ -736,9 +736,7 @@ async fn shutdown_closes_sessions_and_listeners() {
 }
 
 #[test]
-fn building_without_listeners_or_with_bad_addresses_fails() {
-    let no_listener = Server::builder(LineFilter::default).build();
-    assert!(matches!(no_listener, Err(supersocket::Error::NoListener)));
+fn building_with_bad_addresses_fails() {
     let bad_address = Server::builder(LineFilter::default)
         .listen("not an address")
         .build();

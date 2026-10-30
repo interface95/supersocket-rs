@@ -51,6 +51,8 @@ async fn main() -> Result<(), supersocket::Error> {
   Fragments, pings and the closing handshake are handled for you; tested against tungstenite.
 - **TLS** through rustls, including client certificates, **PROXY protocol** v1 and v2 behind load
   balancers, TCP keepalive and socket buffer sizes per listener.
+- **Any transport**: hand the server connections from Unix sockets, stdin and stdout or an HTTP
+  upgrade, and wrap connections in **stream layers** such as the built-in gzip compression.
 - **Configuration** from TOML or JSON files with environment overrides, **tracing** for logs,
   graceful shutdown on Ctrl+C or SIGTERM.
 
@@ -60,7 +62,7 @@ Until the first release, depend on the repository:
 
 ```toml
 [dependencies]
-supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # optional features: "tls", "config", "client", "proxy", "websocket"
+supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # optional features: "tls", "config", "client", "proxy", "websocket", "gzip"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -365,6 +367,30 @@ ListenOptions {
 `ServerBuilder::configure_socket(|stream| ...)` runs on every accepted connection for any other
 socket option.
 
+### Other transports and stream layers
+
+Connections do not have to come from the server's TCP listeners. Hand any byte stream to the
+server and it becomes a session like the others: middleware sees it, it joins the session
+container and shutting down closes it. A server may have no listeners at all.
+
+```rust
+let listener = tokio::net::UnixListener::bind("/tmp/app.sock")?;
+while let Ok((stream, _)) = listener.accept().await {
+    server.serve_connection(stream, ConnectionInfo::default()); // no IP addresses on a Unix socket
+}
+```
+
+Stream layers wrap every connection after the TLS handshake, like SuperSocket's
+`IConnectionStreamInitializer`. With the `gzip` feature, `GzipLayer` compresses connections in
+both directions, and `GzipConnector` does the same on the client:
+
+```rust
+Server::builder(LineFilter::default).stream_layer(GzipLayer)
+EasyClient::builder(LineFilter::default()).connector(GzipConnector)
+```
+
+Implement `StreamLayer` for your own layers, such as accounting or another encryption.
+
 ### Configuration
 
 With the `config` feature, `ServerOptions::load` reads a TOML or JSON file. Every field has a
@@ -417,7 +443,6 @@ their time elsewhere.
 ## Roadmap
 
 - WebSocket compression (permessage-deflate) and a run of the Autobahn test suite
-- Serving connections from other transports, such as Unix sockets, and GZip streams
 - Derive-style command registration
 - UDP sessions, if there is demand
 

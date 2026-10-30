@@ -104,8 +104,11 @@ pub trait SessionState: Default + Send + Sync + 'static {
 
 impl SessionState for () {}
 
-/// Where the connection of a session comes from, as the server learned while accepting it.
-pub(crate) struct ConnectionInfo {
+/// Where the connection of a session comes from: its addresses and whether it is encrypted. The
+/// server fills it in for the connections it accepts; describe other connections with it for
+/// [`Server::serve_connection`](crate::Server::serve_connection).
+#[derive(Debug, Clone)]
+pub struct ConnectionInfo {
     pub(crate) remote_addr: SocketAddr,
     pub(crate) local_addr: SocketAddr,
     pub(crate) secure: bool,
@@ -115,7 +118,9 @@ pub(crate) struct ConnectionInfo {
 }
 
 impl ConnectionInfo {
-    pub(crate) fn new(remote_addr: SocketAddr, local_addr: SocketAddr) -> Self {
+    /// A connection between `remote_addr` and `local_addr`. For transports without IP addresses,
+    /// such as Unix sockets, use [`default`](Self::default).
+    pub fn new(remote_addr: SocketAddr, local_addr: SocketAddr) -> Self {
         Self {
             remote_addr,
             local_addr,
@@ -126,12 +131,52 @@ impl ConnectionInfo {
         }
     }
 
+    /// Marks the connection as encrypted, which [`Session::is_secure`] reports.
+    pub fn secure(mut self, secure: bool) -> Self {
+        self.secure = secure;
+        self
+    }
+
+    /// Address of the peer.
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
+    /// Local address the peer connected to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Whether the connection is encrypted.
+    pub fn is_secure(&self) -> bool {
+        self.secure
+    }
+
+    /// What the PROXY protocol header of the connection said.
+    pub fn proxy_info(&self) -> Option<&ProxyInfo> {
+        self.proxy.as_deref()
+    }
+
+    /// What the TLS handshake established.
+    #[cfg(feature = "tls")]
+    pub fn tls_info(&self) -> Option<&crate::TlsInfo> {
+        self.tls.as_deref()
+    }
+
     /// Records what a PROXY protocol header said: the client's address replaces the proxy's.
     pub(crate) fn set_proxy(&mut self, info: ProxyInfo) {
         if let Some(source) = info.source() {
             self.remote_addr = source;
         }
         self.proxy = Some(Box::new(info));
+    }
+}
+
+impl Default for ConnectionInfo {
+    /// A connection whose addresses are unknown: both are `0.0.0.0:0`.
+    fn default() -> Self {
+        let unknown = SocketAddr::from(([0, 0, 0, 0], 0));
+        Self::new(unknown, unknown)
     }
 }
 
@@ -235,14 +280,19 @@ impl<S> Session<S> {
     /// What the PROXY protocol header of the connection said, on a listener with
     /// [`proxy_protocol`](crate::ListenOptions::proxy_protocol).
     pub fn proxy_info(&self) -> Option<&ProxyInfo> {
-        self.inner.connection.proxy.as_deref()
+        self.inner.connection.proxy_info()
     }
 
     /// What the TLS handshake established, such as the certificate the client sent, on a TLS
     /// listener.
     #[cfg(feature = "tls")]
     pub fn tls_info(&self) -> Option<&crate::TlsInfo> {
-        self.inner.connection.tls.as_deref()
+        self.inner.connection.tls_info()
+    }
+
+    /// Everything known about where the connection comes from.
+    pub fn connection_info(&self) -> &ConnectionInfo {
+        &self.inner.connection
     }
 
     /// When the session connected.

@@ -9,8 +9,13 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+## Gzip compression of whole byte streams.
+gzip = ["dep:async-compression"]
+
 [dependencies]
 supersocket-proto.workspace = true
+async-compression = { workspace = true, optional = true }
 bytes.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "time"] }

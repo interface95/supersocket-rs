@@ -28,6 +28,8 @@
 //! - `proxy`: HTTP CONNECT, SOCKS4 and SOCKS5 proxy connectors for the client.
 //! - `websocket`: the WebSocket server in the `websocket` module, and with `client` the WebSocket
 //!   client.
+//! - `gzip`: gzip compression of connections, `GzipLayer` for the server and, with `client`,
+//!   `GzipConnector` for the client.
 
 #[cfg(feature = "client")]
 pub use supersocket_client as client;

@@ -12,16 +12,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use supersocket_connection::catch_panic;
+use supersocket_connection::{Stream, catch_panic};
 use supersocket_proto::{BoxFilter, PipelineFilter};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     BoxError, BoxFuture, Error, HandlerResult, connection,
+    layer::{DynStreamLayer, StreamLayer},
     middleware::{DynMiddleware, Middleware},
     options::{ListenOptions, ServerOptions},
-    session::{CloseReason, Session, SessionContainer, SessionState},
+    session::{CloseReason, ConnectionInfo, Session, SessionContainer, SessionState},
 };
 
 /// Information about a server, available to every session through [`Session::server`].
@@ -242,6 +243,7 @@ pub struct ServerBuilder<P, S = ()> {
     middlewares: Vec<Box<dyn DynMiddleware<S>>>,
     handshake_required: bool,
     configure_socket: Option<SocketConfigurator>,
+    layers: Vec<Box<dyn DynStreamLayer>>,
 }
 
 impl<P: Send + 'static> ServerBuilder<P> {
@@ -271,6 +273,7 @@ impl<P: Send + 'static> ServerBuilder<P> {
             middlewares: Vec::new(),
             handshake_required: self.handshake_required,
             configure_socket: self.configure_socket,
+            layers: self.layers,
         }
     }
 }
@@ -362,6 +365,13 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
         self
     }
 
+    /// Wraps the stream of every connection with `layer`, after any TLS handshake. Layers wrap in
+    /// the order they were added, so the first one added is closest to the socket.
+    pub fn stream_layer(mut self, layer: impl StreamLayer) -> Self {
+        self.layers.push(Box::new(layer));
+        self
+    }
+
     /// Listens on `address` with plain TCP, such as `"0.0.0.0:4040"`. Use
     /// [`configure`](Self::configure) for TLS or other listener settings.
     pub fn listen(mut self, address: impl Into<String>) -> Self {
@@ -387,11 +397,9 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
         self
     }
 
-    /// Checks the options and loads TLS certificates.
+    /// Checks the options and loads TLS certificates. A server without listeners only serves the
+    /// connections handed to [`Server::serve_connection`].
     pub fn build(self) -> Result<Server<P, S>, Error> {
-        if self.options.listeners.is_empty() {
-            return Err(Error::NoListener);
-        }
         self.options.validate()?;
         let listeners = self
             .options
@@ -416,6 +424,7 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
                 middlewares,
                 handshake_required: self.handshake_required,
                 configure_socket: self.configure_socket,
+                layers: self.layers,
                 listeners,
                 next_session_id: AtomicU64::new(1),
                 started: AtomicBool::new(false),
@@ -442,6 +451,7 @@ pub(crate) struct ServerInner<P, S> {
     pub(crate) middlewares: Vec<Box<dyn DynMiddleware<S>>>,
     pub(crate) handshake_required: bool,
     pub(crate) configure_socket: Option<SocketConfigurator>,
+    pub(crate) layers: Vec<Box<dyn DynStreamLayer>>,
     listeners: Vec<Arc<Listener>>,
     pub(crate) next_session_id: AtomicU64,
     started: AtomicBool,
@@ -564,6 +574,7 @@ impl<P: Send + 'static> Server<P> {
             middlewares: Vec::new(),
             handshake_required: false,
             configure_socket: None,
+            layers: Vec::new(),
         }
     }
 }
@@ -596,6 +607,12 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
                 "no package handler or commands configured, packages are dropped"
             );
         }
+        if server.listeners.is_empty() {
+            tracing::warn!(
+                server = server.info.name(),
+                "no listeners configured, only connections passed to serve_connection are served"
+            );
+        }
         for middleware in &server.middlewares {
             middleware.start(&server.info);
         }
@@ -611,6 +628,20 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
                 .spawn(clear_idle_sessions(server.clone(), timeout));
         }
         Ok(addresses)
+    }
+
+    /// Runs a session on a connection that did not come through the server's listeners, such as
+    /// a Unix socket, stdin and stdout joined with `tokio::io::join`, a connection an HTTP server
+    /// upgraded, or an in-memory pipe in a test. The session is like any other: middleware sees
+    /// it, stream layers wrap it, it joins the session container, and shutting down closes it.
+    /// `connection` tells its addresses. Must be called from within a Tokio runtime.
+    pub fn serve_connection(&self, stream: impl Stream, connection: ConnectionInfo) {
+        let server = &self.inner;
+        server.tracker.spawn(connection::serve_stream(
+            server.clone(),
+            Box::new(stream),
+            connection,
+        ));
     }
 
     /// Stops accepting connections, closes every session with [`CloseReason::ServerShutdown`] and
@@ -658,6 +689,10 @@ async fn accept_loop<P: Send + 'static, S: SessionState>(
                 // The TLS handshake and session setup run in the connection's own task, so a slow
                 // client never holds up the accept loop.
                 Ok((stream, _)) => {
+                    if !server.layers.is_empty() {
+                        server.tracker.spawn(connection::serve_layered_tcp(server.clone(), stream, listener.clone()));
+                        continue;
+                    }
                     #[cfg(feature = "tls")]
                     if listener.tls.is_some() {
                         server.tracker.spawn(connection::serve_tls(server.clone(), stream, listener.clone()));

@@ -256,3 +256,41 @@ async fn proxy_protocol_headers_come_before_the_tls_handshake() {
     assert_eq!(report.remote_addr, "203.0.113.5:50000".parse().unwrap());
     server.shutdown().await;
 }
+
+/// Greets every connection it wraps.
+struct Greeting;
+
+impl supersocket::StreamLayer for Greeting {
+    async fn wrap(
+        &self,
+        mut stream: supersocket::BoxStream,
+        connection: &supersocket::ConnectionInfo,
+    ) -> std::io::Result<supersocket::BoxStream> {
+        let greeting = format!("welcome secure={}\r\n", connection.is_secure());
+        stream.write_all(greeting.as_bytes()).await?;
+        Ok(stream)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_layers_run_inside_tls() {
+    let certificate = TestCertificate::new("layered");
+    let listener = certificate.listener();
+    let server = Server::builder(LineFilter::default)
+        .stream_layer(Greeting)
+        .on_package(async |session, package| {
+            session.send(format!("{}\r\n", package.text)).await?;
+            Ok(())
+        })
+        .configure(move |options| options.listeners.push(listener))
+        .build()
+        .unwrap();
+    let address = server.start().unwrap()[0];
+
+    let (reader, writer) = tokio::io::split(certificate.connect(address).await);
+    let mut client = Client::new(reader, writer);
+    assert_eq!(client.line().await, "welcome secure=true");
+    client.send(b"hello\r\n").await;
+    assert_eq!(client.line().await, "hello");
+    server.shutdown().await;
+}

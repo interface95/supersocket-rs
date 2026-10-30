@@ -14,6 +14,8 @@ categories.workspace = true
 tls = ["dep:tokio-rustls", "dep:webpki-roots"]
 ## HTTP CONNECT, SOCKS4 and SOCKS5 proxy connectors.
 proxy = []
+## `GzipConnector`, which compresses the connection with gzip.
+gzip = ["supersocket-connection/gzip"]
 
 [dependencies]
 supersocket-connection.workspace = true

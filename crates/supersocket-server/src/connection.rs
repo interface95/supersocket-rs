@@ -6,7 +6,7 @@ use std::{
 
 use bytes::BytesMut;
 use supersocket_connection::{
-    PackageReader, ReadError, ReadOptions, catch_panic, catch_panic_sync,
+    BoxStream, PackageReader, ReadError, ReadOptions, Rewind, catch_panic, catch_panic_sync,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -52,8 +52,9 @@ pub(crate) async fn serve<P: Send + 'static, S: SessionState>(
     .await
 }
 
-/// Serves a TCP connection accepted on a TLS listener. The handshake runs in a task of its own
-/// type, so that plain connections do not carry its state.
+/// Serves a TCP connection accepted on a TLS listener. Each kind of connection runs in a task of
+/// its own type, so that plain connections do not carry the handshake's state, nor these the
+/// state of stream layers.
 #[cfg(feature = "tls")]
 pub(crate) async fn serve_tls<P: Send + 'static, S: SessionState>(
     server: Arc<ServerInner<P, S>>,
@@ -74,7 +75,7 @@ pub(crate) async fn serve_tls<P: Send + 'static, S: SessionState>(
             let tls = listener.tls.as_ref().expect("a TLS listener");
             // Bytes that arrived with a PROXY protocol header are the start of the handshake.
             // Boxed, so that the session does not keep the handshake's state.
-            let stream = supersocket_connection::Rewind::new(buffered.freeze(), stream);
+            let stream = Rewind::new(buffered.freeze(), stream);
             let stream = match Box::pin(tls.accept(stream)).await {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -100,6 +101,80 @@ pub(crate) async fn serve_tls<P: Send + 'static, S: SessionState>(
     }
     .instrument(span)
     .await
+}
+
+/// Serves a TCP connection on a server with stream layers, after the PROXY protocol header and
+/// the TLS handshake where the listener asks for them.
+pub(crate) async fn serve_layered_tcp<P: Send + 'static, S: SessionState>(
+    server: Arc<ServerInner<P, S>>,
+    stream: TcpStream,
+    listener: Arc<Listener>,
+) {
+    let Some((id, span, connection)) = accept(&server, &stream, &listener) else {
+        return;
+    };
+    async move {
+        let (mut stream, mut connection) = (stream, connection);
+        let Some(buffered) =
+            read_proxy_header(&server, &listener, &mut stream, &mut connection).await
+        else {
+            return;
+        };
+        let stream = Rewind::new(buffered.freeze(), stream);
+        #[cfg(feature = "tls")]
+        if let Some(tls) = &listener.tls {
+            let stream = match Box::pin(tls.accept(stream)).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::debug!(%error, "TLS handshake failed");
+                    return;
+                }
+            };
+            connection.secure = true;
+            connection.tls = Some(Box::new(crate::TlsInfo::new(stream.get_ref().1)));
+            return serve_layered(&server, id, Box::new(stream), connection).await;
+        }
+        serve_layered(&server, id, Box::new(stream), connection).await;
+    }
+    .instrument(span)
+    .await
+}
+
+/// Serves a connection handed over with [`Server::serve_connection`](crate::Server::serve_connection).
+pub(crate) async fn serve_stream<P: Send + 'static, S: SessionState>(
+    server: Arc<ServerInner<P, S>>,
+    stream: BoxStream,
+    connection: ConnectionInfo,
+) {
+    let id = server.next_session_id.fetch_add(1, Ordering::Relaxed);
+    let span = tracing::debug_span!("session", id, remote = %connection.remote_addr);
+    serve_layered(&server, id, stream, connection)
+        .instrument(span)
+        .await
+}
+
+/// Wraps `stream` with the stream layers, in the order they were added, then runs the session.
+async fn serve_layered<P: Send + 'static, S: SessionState>(
+    server: &Arc<ServerInner<P, S>>,
+    id: u64,
+    mut stream: BoxStream,
+    connection: ConnectionInfo,
+) {
+    for layer in &server.layers {
+        stream = match layer.wrap(stream, &connection).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::debug!(%error, "a stream layer refused the connection");
+                return;
+            }
+        };
+    }
+    let (reader, writer) = tokio::io::split(stream);
+    let writer = Box::new(writer);
+    let Some(session) = start(server, id, connection, reader, writer, BytesMut::new()) else {
+        return;
+    };
+    session.await;
 }
 
 /// Applies the socket settings to an accepted connection and gives it an id and a span. `None`

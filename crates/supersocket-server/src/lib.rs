@@ -28,6 +28,7 @@ mod config;
 mod connection;
 mod error;
 mod extensions;
+mod layer;
 mod lenient;
 mod middleware;
 mod options;
@@ -42,11 +43,15 @@ pub use command::{AsyncCommand, AsyncCommandExt, CommandFilter, Commands, Filter
 pub use config::ConfigError;
 pub use error::{BoxError, Error, HandlerResult};
 pub use extensions::Extensions;
+#[cfg(feature = "gzip")]
+pub use layer::GzipLayer;
+pub use layer::StreamLayer;
 pub use middleware::Middleware;
 pub use options::{ListenOptions, PackageHandling, ServerOptions, TlsOptions};
 pub use proxy_protocol::{ProxyCommand, ProxyInfo};
 pub use server::{ErrorAction, PackageError, PackageHandler, Server, ServerBuilder, ServerInfo};
-pub use session::{CloseReason, Session, SessionContainer, SessionState};
+pub use session::{CloseReason, ConnectionInfo, Session, SessionContainer, SessionState};
+pub use supersocket_connection::{BoxStream, Stream};
 #[cfg(feature = "tls")]
 pub use tls::TlsInfo;
 #[cfg(feature = "tls")]
