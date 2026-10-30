@@ -6,20 +6,23 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use supersocket_server::{
-    CloseReason, Error, ErrorAction, HandlerResult, ListenOptions, Middleware, PackageError,
-    PackageHandler, Server, ServerBuilder, ServerInfo, ServerOptions, Session, SessionState,
+    CloseReason, ConnectionInfo, Error, ErrorAction, HandlerResult, ListenOptions, Middleware,
+    PackageError, PackageHandler, Server, ServerBuilder, ServerInfo, ServerOptions, Session,
+    SessionState, StreamLayer,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    CloseCode, CloseFrame, HandshakeRequest, Message, Rejection, WebSocketSession,
+    Accept, CloseCode, CloseFrame, HandshakeRequest, Message, Rejection, WebSocketSession,
     filter::{HeadFilter, Package, Role, WebSocketPackage},
-    frame::{MAX_CLOSE_FRAME, MAX_HEADER_SIZE, OP_PONG, close_frame, encode_header},
+    frame::{MAX_CLOSE_FRAME, MAX_HEADER_SIZE, OP_PING, OP_PONG, close_frame, encode_header},
     handshake::{Head, HeadError, accept_response, read_request},
 };
 
@@ -28,7 +31,8 @@ type CoreBuilder<S> = ServerBuilder<WebSocketPackage, WebSocketState<S>>;
 type Deferred<S> = Box<dyn FnOnce(CoreBuilder<S>) -> CoreBuilder<S> + Send>;
 type InstallHandler<S> = Box<dyn FnOnce(CoreBuilder<S>, Settings<S>) -> CoreBuilder<S> + Send>;
 type HandshakeHandler<S> =
-    Box<dyn Fn(WebSocketSession<S>) -> BoxFuture<Result<(), Rejection>> + Send + Sync>;
+    Box<dyn Fn(WebSocketSession<S>) -> BoxFuture<Result<Accept, Rejection>> + Send + Sync>;
+type StateFactory<S> = Arc<dyn Fn(&ConnectionInfo) -> S + Send + Sync>;
 
 /// The session state of a WebSocket server: the state of the WebSocket connection and your own,
 /// `S`, which [`WebSocketSession`] dereferences to.
@@ -41,19 +45,25 @@ pub struct WebSocketState<S = ()> {
     pub(crate) user: S,
 }
 
-impl<S: Default> Default for WebSocketState<S> {
-    fn default() -> Self {
+impl<S> WebSocketState<S> {
+    fn new(user: S) -> Self {
         Self {
             request: OnceLock::new(),
             protocol: OnceLock::new(),
             close_sent: AtomicBool::new(false),
             close_frame: OnceLock::new(),
-            user: S::default(),
+            user,
         }
     }
 }
 
-impl<S: Default + Send + Sync + 'static> SessionState for WebSocketState<S> {}
+impl<S: Default> Default for WebSocketState<S> {
+    fn default() -> Self {
+        Self::new(S::default())
+    }
+}
+
+impl<S: Send + Sync + 'static> SessionState for WebSocketState<S> {}
 
 impl<S> fmt::Debug for WebSocketState<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -69,6 +79,18 @@ impl<S> fmt::Debug for WebSocketState<S> {
 /// [`WebSocketServer::builder`].
 pub struct WebSocketServer<S = ()> {
     server: Server<WebSocketPackage, WebSocketState<S>>,
+    keepalive: Option<Keepalive>,
+    /// Stops the keepalive task.
+    stop: CancellationToken,
+    /// The running keepalive task, awaited on shutdown.
+    watchdog: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// How often to ping, and how long without data from a client is too long.
+#[derive(Debug, Clone, Copy)]
+struct Keepalive {
+    ping_interval: Duration,
+    pong_timeout: Option<Duration>,
 }
 
 impl WebSocketServer {
@@ -80,11 +102,13 @@ impl WebSocketServer {
             on_handshake: None,
             install: None,
             deferred: Vec::new(),
+            state_factory: Arc::new(|_| ()),
+            keepalive: None,
         }
     }
 }
 
-impl<S: Default + Send + Sync + 'static> WebSocketServer<S> {
+impl<S: Send + Sync + 'static> WebSocketServer<S> {
     /// Information about the server, including its sessions.
     pub fn info(&self) -> &ServerInfo<WebSocketState<S>> {
         self.server.info()
@@ -97,18 +121,56 @@ impl<S: Default + Send + Sync + 'static> WebSocketServer<S> {
 
     /// Binds all listeners and starts accepting connections; see [`Server::start`].
     pub fn start(&self) -> Result<Vec<SocketAddr>, Error> {
-        self.server.start()
+        let addresses = self.server.start()?;
+        if let Some(keepalive) = self.keepalive {
+            let task = tokio::spawn(run_keepalive(
+                self.server.clone(),
+                keepalive,
+                self.stop.clone(),
+            ));
+            *self.watchdog.lock().unwrap() = Some(task);
+        }
+        Ok(addresses)
+    }
+
+    /// Closes the listeners but keeps serving the sessions; see [`Server::stop_accepting`].
+    pub fn stop_accepting(&self) {
+        self.server.stop_accepting();
     }
 
     /// Stops accepting connections and closes every session, sending close code 1001 (going
     /// away); see [`Server::shutdown`].
     pub async fn shutdown(&self) {
+        self.stop.cancel();
+        // Wait for the keepalive task to see the cancellation and stop, so that shutting down
+        // truly waits for everything, like the server's own tasks.
+        let watchdog = self.watchdog.lock().unwrap().take();
+        if let Some(watchdog) = watchdog {
+            let _ = watchdog.await;
+        }
         self.server.shutdown().await;
     }
 
     /// Starts the server, waits for Ctrl+C or SIGTERM, then shuts down gracefully.
     pub async fn run(self) -> Result<(), Error> {
-        self.server.run().await
+        self.run_until(supersocket_server::shutdown_signal()).await
+    }
+
+    /// Starts the server, waits for `signal` to complete, then shuts down gracefully.
+    pub async fn run_until<T>(self, signal: impl Future<Output = T>) -> Result<(), Error> {
+        self.start()?;
+        signal.await;
+        self.shutdown().await;
+        Ok(())
+    }
+
+    /// Runs a session on a connection from another transport; see [`Server::serve_connection`].
+    pub fn serve_connection(
+        &self,
+        stream: impl supersocket_server::Stream,
+        connection: ConnectionInfo,
+    ) -> Result<(), Error> {
+        self.server.serve_connection(stream, connection)
     }
 }
 
@@ -140,6 +202,8 @@ pub struct WebSocketBuilder<S = ()> {
     // Applied to the server builder at the end, once the options, which the filter needs, are
     // final.
     deferred: Vec<Deferred<S>>,
+    state_factory: StateFactory<S>,
+    keepalive: Option<Keepalive>,
 }
 
 impl WebSocketBuilder {
@@ -151,9 +215,24 @@ impl WebSocketBuilder {
     /// Handlers and middleware depend on the session type, so this must be called before any of
     /// them is registered; otherwise it panics.
     pub fn session<S: Default + Send + Sync + 'static>(self) -> WebSocketBuilder<S> {
+        self.session_with(|_| S::default())
+    }
+
+    /// Uses `S` as your per-session state, created by `factory` for each connection from its
+    /// addresses, PROXY protocol header or TLS client certificate; see
+    /// [`ServerBuilder::session_with`]. Like [`session`](Self::session), this must be called
+    /// before handlers or middleware are registered.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a handler or middleware was registered already.
+    pub fn session_with<S: Send + Sync + 'static>(
+        self,
+        factory: impl Fn(&ConnectionInfo) -> S + Send + Sync + 'static,
+    ) -> WebSocketBuilder<S> {
         assert!(
             self.on_handshake.is_none() && self.install.is_none() && self.deferred.is_empty(),
-            "`session` must be called before registering handlers or middleware"
+            "the session state must be chosen before registering handlers or middleware"
         );
         WebSocketBuilder {
             options: self.options,
@@ -161,11 +240,13 @@ impl WebSocketBuilder {
             on_handshake: None,
             install: None,
             deferred: Vec::new(),
+            state_factory: Arc::new(factory),
+            keepalive: self.keepalive,
         }
     }
 }
 
-impl<S: Default + Send + Sync + 'static> WebSocketBuilder<S> {
+impl<S: Send + Sync + 'static> WebSocketBuilder<S> {
     /// Handles every text and binary message. Messages of a session are handled one at a time
     /// unless concurrent package handling is configured.
     pub fn on_message<F, Fut>(mut self, handler: F) -> Self
@@ -184,14 +265,43 @@ impl<S: Default + Send + Sync + 'static> WebSocketBuilder<S> {
 
     /// Decides whether to accept a handshake, for example by checking a token in
     /// [`request`](WebSocketSession::request). Returning a [`Rejection`] answers with that HTTP
-    /// error and closes the connection. The session can be given data here, such as the user it
-    /// belongs to.
+    /// error and closes the connection; an [`Accept`] may add header fields to the response,
+    /// such as a cookie. The session can be given data here, such as the user it belongs to.
     pub fn on_handshake<F, Fut>(mut self, handler: F) -> Self
     where
         F: Fn(WebSocketSession<S>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<(), Rejection>> + Send + 'static,
+        Fut: Future<Output = Result<Accept, Rejection>> + Send + 'static,
     {
         self.on_handshake = Some(Box::new(move |session| Box::pin(handler(session))));
+        self
+    }
+
+    /// Pings every connected client this often. Browsers answer with a pong, which counts as
+    /// activity, so with [`pong_timeout`](Self::pong_timeout) connections whose peer vanished are
+    /// noticed and closed. Default: no pings.
+    pub fn ping_interval(mut self, interval: Duration) -> Self {
+        let keepalive = self.keepalive.get_or_insert(Keepalive {
+            ping_interval: interval,
+            pong_timeout: None,
+        });
+        keepalive.ping_interval = interval;
+        self
+    }
+
+    /// Closes connections from which nothing, not even a pong, arrived for this long, with close
+    /// code 1001. Checked on every ping, so it takes effect with
+    /// [`ping_interval`](Self::ping_interval), and should be at least twice the interval.
+    /// Default: never.
+    pub fn pong_timeout(mut self, timeout: Duration) -> Self {
+        match &mut self.keepalive {
+            Some(keepalive) => keepalive.pong_timeout = Some(timeout),
+            None => {
+                self.keepalive = Some(Keepalive {
+                    ping_interval: timeout / 2,
+                    pong_timeout: Some(timeout),
+                })
+            }
+        }
         self
     }
 
@@ -243,6 +353,29 @@ impl<S: Default + Send + Sync + 'static> WebSocketBuilder<S> {
         self.defer(move |builder| builder.middleware(middleware))
     }
 
+    /// Decides whether to serve a connection before anything is read from it; see
+    /// [`ServerBuilder::on_accept`].
+    pub fn on_accept(
+        self,
+        accept: impl Fn(&ConnectionInfo) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.defer(move |builder| builder.on_accept(accept))
+    }
+
+    /// Runs `configure` on every accepted TCP connection; see
+    /// [`ServerBuilder::configure_socket`].
+    pub fn configure_socket(
+        self,
+        configure: impl Fn(&tokio::net::TcpStream) + Send + Sync + 'static,
+    ) -> Self {
+        self.defer(move |builder| builder.configure_socket(configure))
+    }
+
+    /// Wraps the stream of every connection; see [`ServerBuilder::stream_layer`].
+    pub fn stream_layer(self, layer: impl StreamLayer) -> Self {
+        self.defer(move |builder| builder.stream_layer(layer))
+    }
+
     /// Registers a shared service that handlers reach through [`ServerInfo::service`].
     pub fn service<T: Any + Send + Sync>(self, service: T) -> Self {
         self.defer(move |builder| builder.service(service))
@@ -274,8 +407,9 @@ impl<S: Default + Send + Sync + 'static> WebSocketBuilder<S> {
             subprotocols: self.subprotocols,
             on_handshake: self.on_handshake,
         };
+        let state_factory = self.state_factory;
         let builder = Server::builder(move || HeadFilter::new(Role::Server, max_size))
-            .session::<WebSocketState<S>>()
+            .session_with(move |connection| WebSocketState::new(state_factory(connection)))
             .options(self.options)
             .require_handshake();
         let mut builder = match self.install {
@@ -290,6 +424,9 @@ impl<S: Default + Send + Sync + 'static> WebSocketBuilder<S> {
         }
         Ok(WebSocketServer {
             server: builder.build()?,
+            keepalive: self.keepalive,
+            stop: CancellationToken::new(),
+            watchdog: std::sync::Mutex::new(None),
         })
     }
 
@@ -329,7 +466,7 @@ struct Handler<S, F> {
 
 impl<S, F, Fut> PackageHandler<WebSocketPackage, WebSocketState<S>> for Handler<S, F>
 where
-    S: Default + Send + Sync + 'static,
+    S: Send + Sync + 'static,
     F: Fn(WebSocketSession<S>, Message) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = HandlerResult> + Send + 'static,
 {
@@ -396,7 +533,7 @@ where
     }
 }
 
-impl<S: Default + Send + Sync + 'static, F> Handler<S, F> {
+impl<S: Send + Sync + 'static, F> Handler<S, F> {
     async fn handshake(&self, session: &Session<WebSocketState<S>>, head: Result<Head, HeadError>) {
         let (request, key) = match head.map_err(Rejection::from).and_then(read_request) {
             Ok(accepted) => accepted,
@@ -411,12 +548,14 @@ impl<S: Default + Send + Sync + 'static, F> Handler<S, F> {
             let _ = session.protocol.set(protocol.clone());
         }
         let _ = session.request.set(request);
-        if let Some(validate) = &self.settings.on_handshake {
-            if let Err(rejection) = validate(WebSocketSession::from(session.clone())).await {
-                return reject(session, &rejection).await;
-            }
-        }
-        let response = accept_response(&key, protocol.map(String::as_str));
+        let accept = match &self.settings.on_handshake {
+            Some(validate) => match validate(WebSocketSession::from(session.clone())).await {
+                Ok(accept) => accept,
+                Err(rejection) => return reject(session, &rejection).await,
+            },
+            None => Accept::new(),
+        };
+        let response = accept_response(&key, protocol.map(String::as_str), &accept);
         if session.send(response).await.is_ok() {
             session.complete_handshake();
         }
@@ -431,6 +570,53 @@ async fn reject<S>(session: &Session<S>, rejection: &Rejection) {
     );
     let _ = session.send(rejection.response()).await;
     session.close(CloseReason::Rejected);
+}
+
+/// Pings the connected sessions every interval, and closes those that have been silent for the
+/// pong timeout, until `stop` is cancelled.
+async fn run_keepalive<S: Send + Sync + 'static>(
+    server: Server<WebSocketPackage, WebSocketState<S>>,
+    keepalive: Keepalive,
+    stop: CancellationToken,
+) {
+    let mut ticks = tokio::time::interval(keepalive.ping_interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticks.tick().await;
+    loop {
+        tokio::select! {
+            () = stop.cancelled() => return,
+            _ = ticks.tick() => {}
+        }
+        let now = std::time::Instant::now();
+        server.info().sessions().for_each(|session| {
+            if session.close_sent.load(Ordering::Acquire) {
+                return;
+            }
+            let silent = now.saturating_duration_since(session.last_active_time());
+            if keepalive
+                .pong_timeout
+                .is_some_and(|timeout| silent > timeout)
+            {
+                tracing::debug!(session = session.id(), ?silent, "no pong, closing");
+                let _ = WebSocketSession::from(session.clone()).close(CloseCode::GOING_AWAY, "");
+                session.close(CloseReason::Timeout);
+                return;
+            }
+            // A session whose send buffer is full is busy anyway; skip it this time.
+            let _ = try_send_frame(session, OP_PING, b"");
+        });
+    }
+}
+
+/// Queues an unfragmented frame without waiting; see [`Session::try_send_vectored`].
+pub(crate) fn try_send_frame<S>(
+    session: &Session<S>,
+    opcode: u8,
+    payload: &[u8],
+) -> io::Result<()> {
+    let mut header = [0; MAX_HEADER_SIZE];
+    let size = encode_header(opcode, payload.len(), None, &mut header);
+    session.try_send_vectored(&[&header[..size], payload])
 }
 
 /// Sends an unfragmented frame without copying the payload into a buffer first.

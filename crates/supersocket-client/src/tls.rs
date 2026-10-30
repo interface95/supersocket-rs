@@ -82,10 +82,12 @@ impl Connector for TlsConnector {
             .unwrap_or_else(|| target.host().to_owned());
         let name = ServerName::try_from(name)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let stream = self.connector.connect(name, previous.stream).await?;
-        Ok(Connection {
-            stream: Box::new(stream),
-            ..previous
-        })
+        let (stream, local_addr, peer_addr) = previous.into_parts();
+        let stream = self.connector.connect(name, stream).await?;
+        Ok(Connection::from_parts(
+            Box::new(stream),
+            local_addr,
+            peer_addr,
+        ))
     }
 }

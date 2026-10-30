@@ -74,7 +74,7 @@ async fn talks_to_the_websocket_server() {
     client.send_binary(&large).await.unwrap();
     assert_eq!(receive(&mut client).await, Some(Message::from(large)));
 
-    client.close(CloseCode::NORMAL, "done").await;
+    client.close(CloseCode::NORMAL, "done").await.unwrap();
     let (reason, frame) = timeout(WAIT, closed.recv()).await.unwrap().unwrap();
     assert_eq!(reason, CloseReason::RemoteClosed);
     assert_eq!(
@@ -91,7 +91,7 @@ async fn talks_to_the_websocket_server() {
 async fn receive_ends_when_the_server_closes() {
     let (server, address) = start(WebSocketServer::builder().on_message(
         async |session, _message| {
-            session.close(CloseCode::new(4001), "bye").await;
+            session.close(CloseCode::new(4001), "bye")?;
             Ok(())
         },
     ));
@@ -178,7 +178,7 @@ async fn talks_to_tungstenite() {
     let large = (0..200_000).map(|index| index as u8).collect::<Vec<_>>();
     client.send_binary(&large).await.unwrap();
     assert_eq!(receive(&mut client).await, Some(Message::from(large)));
-    client.close(CloseCode::NORMAL, "").await;
+    client.close(CloseCode::NORMAL, "").await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -205,7 +205,7 @@ async fn connects_over_tls() {
         receive(&mut client).await,
         Some(Message::from("secure=true"))
     );
-    client.close(CloseCode::NORMAL, "").await;
+    client.close(CloseCode::NORMAL, "").await.unwrap();
     server.shutdown().await;
 }
 

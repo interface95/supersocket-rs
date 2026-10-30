@@ -1,0 +1,36 @@
+# Checked by `cargo deny check` in CI: known vulnerabilities, licenses and dependency sources.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # `time` is only reached through rcgen, which the tests use to generate certificates; the
+    # vulnerable RFC 2822 parser never sees input there. The fixed versions require Rust 1.88,
+    # above the minimum supported version.
+    { id = "RUSTSEC-2026-0009", reason = "dev dependency; the fixed versions need Rust 1.88" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    # The root certificate data of webpki-roots.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

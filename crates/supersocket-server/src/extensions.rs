@@ -32,7 +32,8 @@ impl Extensions {
             .and_then(|value| value.downcast_ref().cloned())
     }
 
-    /// Runs `f` with a reference to the value of type `T`, for values that are not `Clone`.
+    /// Runs `f` with a reference to the value of type `T`, for values that are not `Clone`. `f`
+    /// must not use these extensions itself: they are locked while it runs.
     pub fn with<T: Send + Sync + 'static, R>(&self, f: impl FnOnce(Option<&T>) -> R) -> R {
         let map = self.map.lock().unwrap();
         f(map

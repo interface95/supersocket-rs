@@ -16,12 +16,15 @@ impl<P> TerminatorFilter<P> {
     /// # Panics
     ///
     /// Panics if `terminator` is empty.
-    pub fn new(terminator: impl Into<Bytes>, decoder: Decoder<P>) -> Self {
+    pub fn new(
+        terminator: impl Into<Bytes>,
+        decoder: impl FnMut(Bytes) -> Result<P, ProtocolError> + Send + 'static,
+    ) -> Self {
         let terminator = terminator.into();
         assert!(!terminator.is_empty(), "terminator must not be empty");
         Self {
             terminator,
-            decoder,
+            decoder: Box::new(decoder),
             searched: 0,
         }
     }
@@ -104,6 +107,18 @@ mod tests {
     }
 
     #[test]
+    fn decoders_may_hold_state() {
+        let mut count = 0;
+        let mut filter = TerminatorFilter::new(&b"\n"[..], move |bytes: Bytes| {
+            count += 1;
+            Ok(format!("{count}:{}", String::from_utf8_lossy(&bytes)))
+        });
+        let mut buf = BytesMut::from(&b"a\nb\n"[..]);
+        assert_eq!(filter.filter(&mut buf).unwrap().unwrap(), "1:a");
+        assert_eq!(filter.filter(&mut buf).unwrap().unwrap(), "2:b");
+    }
+
+    #[test]
     fn splits_merged_lines() {
         let packages = feed(&mut LineFilter::default(), &[b"a\r\nbb\r\n\r\nccc\r\n"]);
         assert_eq!(texts(packages), ["a", "bb", "", "ccc"]);
@@ -128,7 +143,7 @@ mod tests {
     #[test]
     fn decodes_command_lines() {
         let packages = feed(&mut CommandLineFilter::default(), &[b"ADD 1 2\r\nPING\r\n"]);
-        assert_eq!(packages[0].args, ["1", "2"]);
+        assert_eq!(packages[0].args().collect::<Vec<_>>(), ["1", "2"]);
         assert_eq!(packages[1].key, "PING");
     }
 }

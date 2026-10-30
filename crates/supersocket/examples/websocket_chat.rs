@@ -9,7 +9,7 @@
 
 use std::sync::Mutex;
 
-use supersocket::websocket::{Message, Rejection, WebSocketServer, WebSocketSession};
+use supersocket::websocket::{Accept, Message, Rejection, WebSocketServer, WebSocketSession};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Default)]
@@ -43,7 +43,7 @@ async fn main() -> Result<(), supersocket::Error> {
                 .and_then(|query| query.strip_prefix("name="))
                 .map_or_else(|| format!("guest{}", session.id()), str::to_owned);
             *session.name.lock().unwrap() = name;
-            Ok(())
+            Ok(Accept::new())
         })
         .on_connected(async |session: WebSocketSession<Chatter>| {
             let name = session.name.lock().unwrap().clone();

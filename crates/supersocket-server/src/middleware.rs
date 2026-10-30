@@ -1,7 +1,7 @@
 use std::future::Future;
 
 use crate::{
-    BoxFuture,
+    BoxError, BoxFuture,
     server::ServerInfo,
     session::{Session, SessionState},
 };
@@ -46,7 +46,9 @@ pub trait Middleware<S = ()>: Send + Sync + 'static {
     }
 
     /// Called when the server starts.
-    fn start(&self, _server: &ServerInfo<S>) {}
+    fn start(&self, _server: &ServerInfo<S>) -> Result<(), BoxError> {
+        Ok(())
+    }
 
     /// Called after the server stopped.
     fn shutdown(&self, _server: &ServerInfo<S>) {}
@@ -67,7 +69,7 @@ pub trait Middleware<S = ()>: Send + Sync + 'static {
 // behind this boxed-future version.
 pub(crate) trait DynMiddleware<S>: Send + Sync {
     fn order(&self) -> i32;
-    fn start(&self, server: &ServerInfo<S>);
+    fn start(&self, server: &ServerInfo<S>) -> Result<(), BoxError>;
     fn shutdown(&self, server: &ServerInfo<S>);
     fn register_session<'a>(&'a self, session: &'a Session<S>) -> BoxFuture<'a, bool>;
     fn unregister_session<'a>(&'a self, session: &'a Session<S>) -> BoxFuture<'a, ()>;
@@ -78,8 +80,8 @@ impl<S: SessionState, M: Middleware<S>> DynMiddleware<S> for M {
         Middleware::order(self)
     }
 
-    fn start(&self, server: &ServerInfo<S>) {
-        Middleware::start(self, server);
+    fn start(&self, server: &ServerInfo<S>) -> Result<(), BoxError> {
+        Middleware::start(self, server)
     }
 
     fn shutdown(&self, server: &ServerInfo<S>) {

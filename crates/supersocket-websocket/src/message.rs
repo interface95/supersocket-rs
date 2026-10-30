@@ -5,6 +5,7 @@ use bytes::Bytes;
 /// A WebSocket message. Control frames (ping, pong and close) are handled by the server and the
 /// client themselves.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Message {
     /// A text message.
     Text(String),

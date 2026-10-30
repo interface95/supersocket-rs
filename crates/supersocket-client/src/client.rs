@@ -46,19 +46,34 @@ impl Default for ClientOptions {
     }
 }
 
-/// Builds an [`EasyClient`]. Created by [`EasyClient::builder`].
+type FilterFactory<P> = Arc<dyn Fn() -> BoxFilter<P> + Send + Sync>;
+
+/// Builds an [`EasyClient`]. Created by [`EasyClient::builder`]. A builder can be kept and used
+/// again, for example to reconnect, and cloned.
 pub struct ClientBuilder<P> {
-    filter: BoxFilter<P>,
+    filter: FilterFactory<P>,
     tcp: TcpConnector,
-    proxy: Option<Box<dyn DynConnector>>,
-    layers: Vec<Box<dyn DynConnector>>,
+    proxy: Option<Arc<dyn DynConnector>>,
+    layers: Vec<Arc<dyn DynConnector>>,
     options: ClientOptions,
+}
+
+impl<P> Clone for ClientBuilder<P> {
+    fn clone(&self) -> Self {
+        Self {
+            filter: self.filter.clone(),
+            tcp: self.tcp.clone(),
+            proxy: self.proxy.clone(),
+            layers: self.layers.clone(),
+            options: self.options.clone(),
+        }
+    }
 }
 
 impl<P: Send + 'static> ClientBuilder<P> {
     /// Connects through `proxy` instead of directly, like setting `EasyClient.Proxy`.
     pub fn proxy(mut self, proxy: impl Connector) -> Self {
-        self.proxy = Some(Box::new(proxy));
+        self.proxy = Some(Arc::new(proxy));
         self
     }
 
@@ -71,7 +86,7 @@ impl<P: Send + 'static> ClientBuilder<P> {
     /// Adds a connector that wraps the connection. Connectors added this way, including
     /// [`tls`](Self::tls), run in the order they were added, after the connection is opened.
     pub fn connector(mut self, connector: impl Connector) -> Self {
-        self.layers.push(Box::new(connector));
+        self.layers.push(Arc::new(connector));
         self
     }
 
@@ -101,7 +116,7 @@ impl<P: Send + 'static> ClientBuilder<P> {
 
     /// Connects to `target`, which is a `"host:port"` string, a socket address or an
     /// [`Endpoint`](crate::Endpoint).
-    pub async fn connect(self, target: impl ToEndpoint) -> io::Result<EasyClient<P>> {
+    pub async fn connect(&self, target: impl ToEndpoint) -> io::Result<EasyClient<P>> {
         let target = target.to_endpoint()?;
         let connecting = async {
             let mut connection = match &self.proxy {
@@ -123,7 +138,7 @@ impl<P: Send + 'static> ClientBuilder<P> {
             })??;
         Ok(EasyClient::from_connection(
             connection,
-            self.filter,
+            (self.filter)(),
             &self.options,
         ))
     }
@@ -140,10 +155,15 @@ pub struct EasyClient<P> {
 }
 
 impl<P: Send + 'static> EasyClient<P> {
-    /// Starts building a client whose received data is cut into packages by `filter`.
-    pub fn builder(filter: impl PipelineFilter<Package = P>) -> ClientBuilder<P> {
+    /// Starts building a client. `make_filter` creates the pipeline filter that cuts what the
+    /// server sends into packages, once per connection, so a builder can connect many times.
+    pub fn builder<F, M>(make_filter: M) -> ClientBuilder<P>
+    where
+        M: Fn() -> F + Send + Sync + 'static,
+        F: PipelineFilter<Package = P>,
+    {
         ClientBuilder {
-            filter: Box::new(filter),
+            filter: Arc::new(move || Box::new(make_filter())),
             tcp: TcpConnector::new(),
             proxy: None,
             layers: Vec::new(),
@@ -156,7 +176,8 @@ impl<P: Send + 'static> EasyClient<P> {
         filter: BoxFilter<P>,
         options: &ClientOptions,
     ) -> Self {
-        let (reader, writer) = tokio::io::split(connection.stream);
+        let (stream, local_addr, peer_addr) = connection.into_parts();
+        let (reader, writer) = tokio::io::split(stream);
         let shared = Arc::new(Shared {
             queue: SendQueue::new(options.send_buffer_limit),
             closing: CancellationToken::new(),
@@ -181,8 +202,8 @@ impl<P: Send + 'static> EasyClient<P> {
             sender: ClientSender {
                 inner: Arc::new(SenderInner {
                     shared,
-                    local_addr: connection.local_addr,
-                    peer_addr: connection.peer_addr,
+                    local_addr,
+                    peer_addr,
                 }),
             },
         }
@@ -383,6 +404,12 @@ impl ClientSender {
     /// send buffer limit is reached, and fails once the connection is closing.
     pub async fn send(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
         self.inner.shared.queue.send(data.as_ref()).await
+    }
+
+    /// Queues `data` without waiting: fails with [`ErrorKind::WouldBlock`](io::ErrorKind::WouldBlock)
+    /// while the send buffer limit is reached.
+    pub fn try_send(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
+        self.inner.shared.queue.try_send(data.as_ref())
     }
 
     /// Queues `data` as the last data to send, without waiting for room: later sends fail, while

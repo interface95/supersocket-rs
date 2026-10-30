@@ -3,17 +3,19 @@
 mod common;
 
 use std::{
+    collections::HashMap,
+    net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use common::{Client, next_reason, start, track_close_reasons};
 use supersocket::{
-    BeginEndMarkFilter, BoxFilter, FixedHeaderFilter, FixedHeaderProtocol, PackageHandler,
-    PackageHandling, PipelineFilterExt, ServerBuilder,
+    BeginEndMarkFilter, BoxError, BoxFilter, FixedHeaderFilter, FixedHeaderProtocol,
+    PackageHandler, PackageHandling, PipelineFilterExt, ServerBuilder, ServerInfo,
     bytes::{Buf, BufMut, Bytes, BytesMut},
     prelude::*,
 };
@@ -58,8 +60,7 @@ impl AsyncCommand<CommandPackage> for Add {
 
     async fn execute(&self, session: &Session, package: CommandPackage) -> HandlerResult {
         let sum = package
-            .args
-            .iter()
+            .args()
             .map(|arg| arg.parse::<i64>())
             .sum::<Result<i64, _>>()?;
         session.send(format!("{sum}\r\n")).await?;
@@ -1047,5 +1048,211 @@ async fn the_handshake_timeout_also_limits_handling() {
     let mut client = Client::connect(address).await;
     client.send(b"hello\r\n").await;
     client.expect_closed().await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_connection_limit_pauses_accepting() {
+    let (server, address) =
+        start(echo_lines().configure(|options| options.max_connections = Some(2)));
+    let mut first = Client::connect(address).await;
+    let second = Client::connect(address).await;
+    first.send(b"one\r\n").await;
+    assert_eq!(first.line().await, "one");
+
+    // The third connection waits in the backlog until a session ends.
+    let mut third = Client::connect(address).await;
+    third.send(b"three\r\n").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(server.info().session_count(), 2);
+    drop(second);
+    assert_eq!(third.line().await, "three");
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_accept_hook_refuses_connections_before_they_become_sessions() {
+    let allow = Arc::new(AtomicBool::new(false));
+    let gate = allow.clone();
+    let (server, address) = start(echo_lines().on_accept(move |_| gate.load(Ordering::SeqCst)));
+
+    let mut refused = Client::connect(address).await;
+    refused.expect_closed().await;
+    assert_eq!(server.info().session_count(), 0);
+
+    allow.store(true, Ordering::SeqCst);
+    let mut client = Client::connect(address).await;
+    client.send(b"in\r\n").await;
+    assert_eq!(client.line().await, "in");
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_accepting_closes_the_listeners_but_keeps_the_sessions() {
+    let (server, address) = start(echo_lines());
+    let mut client = Client::connect(address).await;
+    // A round trip, so that the session exists before the listener closes; connections still in
+    // the backlog at that moment are reset.
+    client.send(b"hello\r\n").await;
+    assert_eq!(client.line().await, "hello");
+    server.stop_accepting();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        TcpStream::connect(address).await.is_err(),
+        "the listener should be closed"
+    );
+    client.send(b"still here\r\n").await;
+    assert_eq!(client.line().await, "still here");
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_until_stops_on_the_given_signal() {
+    let server = echo_lines().listen("127.0.0.1:0").build().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run_until(async {
+        let _ = stopped.await;
+    }));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    stop.send(()).unwrap();
+    tokio::time::timeout(common::WAIT, running)
+        .await
+        .expect("run_until did not stop")
+        .unwrap()
+        .unwrap();
+}
+
+struct FailsToStart;
+
+impl Middleware for FailsToStart {
+    fn start(&self, _server: &ServerInfo) -> Result<(), BoxError> {
+        Err("no database".into())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_bind_can_be_retried() {
+    // Hold a port, so binding it fails.
+    let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let taken = held.local_addr().unwrap();
+    let server = echo_lines().listen(taken).build().unwrap();
+
+    let error = server.start().unwrap_err();
+    assert!(matches!(error, supersocket::Error::Bind { .. }), "{error}");
+    // The failed start must not leave the server marked as started: a retry binds again rather
+    // than reporting AlreadyStarted.
+    let error = server.start().unwrap_err();
+    assert!(matches!(error, supersocket::Error::Bind { .. }), "{error}");
+
+    // Once the port is free, the same server starts.
+    drop(held);
+    server.start().unwrap();
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_middleware_that_fails_to_start_stops_the_server_from_starting() {
+    let server = echo_lines()
+        .middleware(FailsToStart)
+        .listen("127.0.0.1:0")
+        .build()
+        .unwrap();
+    let error = server.start().unwrap_err();
+    assert!(
+        matches!(error, supersocket::Error::Middleware(_)),
+        "{error}"
+    );
+    // Starting can be tried again; the failure did not leave the server half started.
+    let error = server.start().unwrap_err();
+    assert!(
+        matches!(error, supersocket::Error::Middleware(_)),
+        "{error}"
+    );
+}
+
+struct Visitor {
+    from: SocketAddr,
+}
+
+impl SessionState for Visitor {}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_state_can_be_built_from_the_connection() {
+    let (server, address) = start(
+        Server::builder(LineFilter::default)
+            .session_with(|connection| Visitor {
+                from: connection.remote_addr(),
+            })
+            .on_package(async |session, package| {
+                session
+                    .send(format!("{} from {}\r\n", package.text, session.from))
+                    .await?;
+                Ok(())
+            }),
+    );
+    let mut client = Client::connect(address).await;
+    client.send(b"hi\r\n").await;
+    let line = client.line().await;
+    assert!(line.starts_with("hi from 127.0.0.1:"), "{line}");
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listeners_take_host_names_and_socket_addresses() {
+    let server = echo_lines().listen("localhost:0").build().unwrap();
+    let address = server.start().unwrap()[0];
+    assert!(address.ip().is_loopback());
+    server.shutdown().await;
+
+    let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = echo_lines().listen(bound).build().unwrap();
+    assert_eq!(server.start().unwrap()[0].ip(), bound.ip());
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn broadcasts_with_try_send_skip_sessions_that_do_not_read() {
+    let (server, address) = start(
+        Server::builder(LineFilter::default)
+            .configure(|options| {
+                options.send_buffer_limit = 16;
+                options.close_timeout = Duration::from_millis(100);
+            })
+            .on_package(async |session, package| {
+                match package.text.as_str() {
+                    // Far more than the socket buffers hold: the queue stays full.
+                    "flood" => session.send(vec![b'x'; 4 * 1024 * 1024]).await?,
+                    "broadcast" => {
+                        let (mut sent, mut skipped) = (0, 0);
+                        session.server().sessions().for_each(|other| {
+                            match other.try_send("news\r\n") {
+                                Ok(()) => sent += 1,
+                                Err(_) => skipped += 1,
+                            }
+                        });
+                        session
+                            .send(format!("sent {sent} skipped {skipped}\r\n"))
+                            .await?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }),
+    );
+    let mut reader = Client::connect(address).await;
+    let mut stalled = Client::connect(address).await;
+    stalled.send(b"flood\r\n").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    reader.send(b"broadcast\r\n").await;
+    assert_eq!(reader.line().await, "news");
+    assert_eq!(reader.line().await, "sent 1 skipped 1");
+
+    // Sessions compare by identity, and are kept in maps by id, for rooms and the like.
+    let sessions = server.info().sessions().all();
+    let members: HashMap<u64, Session> = sessions.iter().map(|s| (s.id(), s.clone())).collect();
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[&sessions[0].id()], sessions[0]);
+    assert_ne!(sessions[0], sessions[1]);
     server.shutdown().await;
 }

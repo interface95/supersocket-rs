@@ -28,8 +28,6 @@ pub struct CommandPackage {
     pub key: String,
     /// Everything after the key and the space that follows it.
     pub body: String,
-    /// The body split by whitespace.
-    pub args: Vec<String>,
 }
 
 impl CommandPackage {
@@ -40,8 +38,12 @@ impl CommandPackage {
         Ok(Self {
             key: key.to_owned(),
             body: body.to_owned(),
-            args: body.split_whitespace().map(str::to_owned).collect(),
         })
+    }
+
+    /// The arguments: the body split at whitespace.
+    pub fn args(&self) -> impl Iterator<Item = &str> {
+        self.body.split_whitespace()
     }
 }
 
@@ -54,11 +56,11 @@ mod tests {
         let package = CommandPackage::decode(Bytes::from_static(b"ADD 1  2")).unwrap();
         assert_eq!(package.key, "ADD");
         assert_eq!(package.body, "1  2");
-        assert_eq!(package.args, ["1", "2"]);
+        assert_eq!(package.args().collect::<Vec<_>>(), ["1", "2"]);
 
         let package = CommandPackage::decode(Bytes::from_static(b"PING")).unwrap();
         assert_eq!((package.key.as_str(), package.body.as_str()), ("PING", ""));
-        assert!(package.args.is_empty());
+        assert_eq!(package.args().count(), 0);
     }
 
     #[test]

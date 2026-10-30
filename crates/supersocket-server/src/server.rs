@@ -14,7 +14,10 @@ use std::{
 
 use supersocket_connection::{Stream, catch_panic};
 use supersocket_proto::{BoxFilter, PipelineFilter};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::{
+    net::{TcpListener, TcpSocket, TcpStream},
+    sync::Semaphore,
+};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
@@ -87,6 +90,7 @@ pub enum PackageError {
 
 /// What to do with a session after handling one of its packages failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorAction {
     /// Keep the session and go on with its next package.
     Continue,
@@ -230,6 +234,8 @@ type ClosedHandler<S> =
 type ErrorHandler<S> =
     Arc<dyn Fn(Session<S>, PackageError) -> BoxFuture<'static, ErrorAction> + Send + Sync>;
 type SocketConfigurator = Box<dyn Fn(&TcpStream) + Send + Sync>;
+type AcceptHook = Box<dyn Fn(&ConnectionInfo) -> bool + Send + Sync>;
+type SessionFactory<S> = Arc<dyn Fn(&ConnectionInfo) -> S + Send + Sync>;
 
 /// Builds a [`Server`]. Created by [`Server::builder`].
 pub struct ServerBuilder<P, S = ()> {
@@ -243,7 +249,9 @@ pub struct ServerBuilder<P, S = ()> {
     middlewares: Vec<Box<dyn DynMiddleware<S>>>,
     handshake_required: bool,
     configure_socket: Option<SocketConfigurator>,
+    on_accept: Option<AcceptHook>,
     layers: Vec<Box<dyn DynStreamLayer>>,
+    session_factory: SessionFactory<S>,
 }
 
 impl<P: Send + 'static> ServerBuilder<P> {
@@ -253,14 +261,29 @@ impl<P: Send + 'static> ServerBuilder<P> {
     ///
     /// Handlers, commands and middleware depend on the session type, so this must be called
     /// before any of them is registered; otherwise it panics.
-    pub fn session<S: SessionState>(self) -> ServerBuilder<P, S> {
+    pub fn session<S: SessionState + Default>(self) -> ServerBuilder<P, S> {
+        self.session_with(|_| S::default())
+    }
+
+    /// Uses `S` as the per-session state, created by `factory` for each session from where its
+    /// connection comes from: the addresses, the PROXY protocol header or the TLS client
+    /// certificate. Like [`session`](Self::session), this must be called before handlers,
+    /// commands or middleware are registered.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a handler, commands or middleware were registered already.
+    pub fn session_with<S: SessionState>(
+        self,
+        factory: impl Fn(&ConnectionInfo) -> S + Send + Sync + 'static,
+    ) -> ServerBuilder<P, S> {
         assert!(
             self.package_handler.is_none()
                 && self.on_connected.is_none()
                 && self.on_closed.is_none()
                 && self.on_error.is_none()
                 && self.middlewares.is_empty(),
-            "`session` must be called before registering handlers, commands or middleware"
+            "the session state must be chosen before registering handlers, commands or middleware"
         );
         ServerBuilder {
             filter_factory: self.filter_factory,
@@ -273,7 +296,9 @@ impl<P: Send + 'static> ServerBuilder<P> {
             middlewares: Vec::new(),
             handshake_required: self.handshake_required,
             configure_socket: self.configure_socket,
+            on_accept: self.on_accept,
             layers: self.layers,
+            session_factory: Arc::new(factory),
         }
     }
 }
@@ -372,10 +397,25 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
         self
     }
 
-    /// Listens on `address` with plain TCP, such as `"0.0.0.0:4040"`. Use
+    /// Decides whether to serve a connection, before any TLS handshake and before it costs
+    /// anything else: for bans and limits by address. It runs after the PROXY protocol header,
+    /// so `remote_addr` is the client's. Returning `false` drops the connection. It must not
+    /// block; for decisions that take time, use a [`Middleware`].
+    pub fn on_accept(
+        mut self,
+        accept: impl Fn(&ConnectionInfo) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.on_accept = Some(Box::new(accept));
+        self
+    }
+
+    /// Listens on `address` with plain TCP: a socket address such as `"0.0.0.0:4040"`, or a host
+    /// name such as `"localhost:4040"`, which is resolved when the server is built. Use
     /// [`configure`](Self::configure) for TLS or other listener settings.
-    pub fn listen(mut self, address: impl Into<String>) -> Self {
-        self.options.listeners.push(ListenOptions::new(address));
+    pub fn listen(mut self, address: impl ToString) -> Self {
+        self.options
+            .listeners
+            .push(ListenOptions::new(address.to_string()));
         self
     }
 
@@ -409,6 +449,10 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
             .collect::<Result<Vec<_>, _>>()?;
         let mut middlewares = self.middlewares;
         middlewares.sort_by_key(|middleware| middleware.order());
+        let connection_limit = self
+            .options
+            .max_connections
+            .map(|limit| Arc::new(Semaphore::new(limit)));
         Ok(Server {
             inner: Arc::new(ServerInner {
                 info: Arc::new(ServerInfo {
@@ -424,11 +468,15 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
                 middlewares,
                 handshake_required: self.handshake_required,
                 configure_socket: self.configure_socket,
+                on_accept: self.on_accept,
                 layers: self.layers,
+                session_factory: self.session_factory,
                 listeners,
+                connection_limit,
                 next_session_id: AtomicU64::new(1),
                 started: AtomicBool::new(false),
                 stopped: AtomicBool::new(false),
+                accepting: CancellationToken::new(),
                 shutdown: CancellationToken::new(),
                 tracker: TaskTracker::new(),
             }),
@@ -451,11 +499,16 @@ pub(crate) struct ServerInner<P, S> {
     pub(crate) middlewares: Vec<Box<dyn DynMiddleware<S>>>,
     pub(crate) handshake_required: bool,
     pub(crate) configure_socket: Option<SocketConfigurator>,
+    pub(crate) on_accept: Option<AcceptHook>,
     pub(crate) layers: Vec<Box<dyn DynStreamLayer>>,
+    pub(crate) session_factory: SessionFactory<S>,
     listeners: Vec<Arc<Listener>>,
+    connection_limit: Option<Arc<Semaphore>>,
     pub(crate) next_session_id: AtomicU64,
     started: AtomicBool,
     stopped: AtomicBool,
+    /// Cancelled to close the listeners while the sessions go on.
+    accepting: CancellationToken,
     pub(crate) shutdown: CancellationToken,
     pub(crate) tracker: TaskTracker,
 }
@@ -469,12 +522,19 @@ pub(crate) struct Listener {
 
 impl Listener {
     fn prepare(options: &ListenOptions) -> Result<Arc<Self>, Error> {
-        let address = options
-            .address
-            .parse()
-            .map_err(|source| Error::InvalidAddress {
-                address: options.address.clone(),
-                source,
+        let invalid = |source| Error::InvalidAddress {
+            address: options.address.clone(),
+            source,
+        };
+        // Host names are resolved once, here; a socket address resolves to itself.
+        let address = std::net::ToSocketAddrs::to_socket_addrs(options.address.as_str())
+            .map_err(invalid)?
+            .next()
+            .ok_or_else(|| {
+                invalid(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the host name did not resolve to any address",
+                ))
             })?;
         #[cfg(not(feature = "tls"))]
         if options.tls.is_some() {
@@ -574,7 +634,9 @@ impl<P: Send + 'static> Server<P> {
             middlewares: Vec::new(),
             handshake_required: false,
             configure_socket: None,
+            on_accept: None,
             layers: Vec::new(),
+            session_factory: Arc::new(|_| ()),
         }
     }
 }
@@ -592,15 +654,27 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
         if server.started.swap(true, Ordering::SeqCst) {
             return Err(Error::AlreadyStarted);
         }
-        let bound = server
-            .listeners
-            .iter()
-            .map(|listener| Ok((listener.bind()?, listener.clone())))
-            .collect::<Result<Vec<_>, Error>>()?;
-        let addresses = bound
-            .iter()
-            .map(|(tcp, _)| tcp.local_addr())
-            .collect::<io::Result<Vec<_>>>()?;
+        // Binding can fail, most often because a port is taken; let the caller try again rather
+        // than leaving the server permanently marked as started.
+        let bind = || {
+            let bound = server
+                .listeners
+                .iter()
+                .map(|listener| Ok((listener.bind()?, listener.clone())))
+                .collect::<Result<Vec<_>, Error>>()?;
+            let addresses = bound
+                .iter()
+                .map(|(tcp, _)| tcp.local_addr())
+                .collect::<io::Result<Vec<_>>>()?;
+            Ok::<_, Error>((bound, addresses))
+        };
+        let (bound, addresses) = match bind() {
+            Ok(result) => result,
+            Err(error) => {
+                server.started.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
         if server.package_handler.is_none() {
             tracing::warn!(
                 server = server.info.name(),
@@ -613,8 +687,15 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
                 "no listeners configured, only connections passed to serve_connection are served"
             );
         }
-        for middleware in &server.middlewares {
-            middleware.start(&server.info);
+        for (index, middleware) in server.middlewares.iter().enumerate() {
+            if let Err(error) = middleware.start(&server.info) {
+                // Undo what started: the listeners close when `bound` is dropped.
+                for started in server.middlewares[..index].iter().rev() {
+                    started.shutdown(&server.info);
+                }
+                server.started.store(false, Ordering::SeqCst);
+                return Err(Error::Middleware(error));
+            }
         }
         for ((tcp, listener), address) in bound.into_iter().zip(&addresses) {
             tracing::info!(server = server.info.name(), %address, tls = listener.is_secure(), "listening");
@@ -632,11 +713,12 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
 
     /// Runs a session on a connection that did not come through the server's listeners, such as
     /// a Unix socket, stdin and stdout joined with `tokio::io::join`, a connection an HTTP server
-    /// upgraded, or an in-memory pipe in a test. The session is like any other: middleware sees
-    /// it, stream layers wrap it, it joins the session container, and shutting down closes it.
-    /// `connection` tells its addresses. Fails with [`Error::NotRunning`] before
-    /// [`start`](Self::start) and after [`shutdown`](Self::shutdown). Must be called from within a
-    /// Tokio runtime.
+    /// upgraded, or an in-memory pipe in a test. The session is like any other: the accept hook
+    /// and middleware see it, stream layers wrap it, it joins the session container, and shutting
+    /// down closes it. `connection` tells its addresses. Fails with [`Error::NotRunning`] before
+    /// [`start`](Self::start) and after [`shutdown`](Self::shutdown), and with
+    /// [`Error::ConnectionLimit`] at [`max_connections`](ServerOptions::max_connections). Must be
+    /// called from within a Tokio runtime.
     pub fn serve_connection(
         &self,
         stream: impl Stream,
@@ -646,12 +728,33 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
         if !server.started.load(Ordering::SeqCst) || server.shutdown.is_cancelled() {
             return Err(Error::NotRunning);
         }
+        let permit = match &server.connection_limit {
+            Some(limit) => Some(
+                limit
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| Error::ConnectionLimit)?,
+            ),
+            None => None,
+        };
         server.tracker.spawn(connection::serve_stream(
             server.clone(),
             Box::new(stream),
             connection,
+            permit,
         ));
         Ok(())
+    }
+
+    /// Closes the listeners but keeps serving the sessions, to drain before a shutdown: a load
+    /// balancer stops sending new connections while the existing ones finish. Connections handed
+    /// to [`serve_connection`](Self::serve_connection) are still served.
+    pub fn stop_accepting(&self) {
+        tracing::info!(
+            server = self.inner.info.name(),
+            "no longer accepting connections"
+        );
+        self.inner.accepting.cancel();
     }
 
     /// Stops accepting connections, closes every session with [`CloseReason::ServerShutdown`] and
@@ -672,10 +775,26 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
 
     /// Starts the server, waits for Ctrl+C or SIGTERM, then shuts down gracefully.
     pub async fn run(self) -> Result<(), Error> {
+        self.run_until(shutdown_signal()).await
+    }
+
+    /// Starts the server, waits for `signal` to complete, then shuts down gracefully; for
+    /// servers that stop on something other than a signal, such as a message from an
+    /// administration endpoint.
+    pub async fn run_until<T>(self, signal: impl Future<Output = T>) -> Result<(), Error> {
         self.start()?;
-        wait_for_shutdown_signal().await?;
+        signal.await;
         self.shutdown().await;
         Ok(())
+    }
+}
+
+impl<P, S> Clone for Server<P, S> {
+    /// A handle to the same server, for tasks that serve connections or shut it down.
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -693,22 +812,34 @@ async fn accept_loop<P: Send + 'static, S: SessionState>(
     listener: Arc<Listener>,
 ) {
     loop {
+        // At the connection limit, wait for a session to end before accepting the next one.
+        let permit = match &server.connection_limit {
+            Some(limit) => tokio::select! {
+                _ = server.shutdown.cancelled() => return,
+                _ = server.accepting.cancelled() => return,
+                permit = limit.clone().acquire_owned() => {
+                    Some(permit.expect("the connection limit is never closed"))
+                }
+            },
+            None => None,
+        };
         tokio::select! {
             _ = server.shutdown.cancelled() => return,
+            _ = server.accepting.cancelled() => return,
             accepted = tcp.accept() => match accepted {
                 // The TLS handshake and session setup run in the connection's own task, so a slow
                 // client never holds up the accept loop.
                 Ok((stream, _)) => {
                     if !server.layers.is_empty() {
-                        server.tracker.spawn(connection::serve_layered_tcp(server.clone(), stream, listener.clone()));
+                        server.tracker.spawn(connection::serve_layered_tcp(server.clone(), stream, listener.clone(), permit));
                         continue;
                     }
                     #[cfg(feature = "tls")]
                     if listener.tls.is_some() {
-                        server.tracker.spawn(connection::serve_tls(server.clone(), stream, listener.clone()));
+                        server.tracker.spawn(connection::serve_tls(server.clone(), stream, listener.clone(), permit));
                         continue;
                     }
-                    server.tracker.spawn(connection::serve(server.clone(), stream, listener.clone()));
+                    server.tracker.spawn(connection::serve(server.clone(), stream, listener.clone(), permit));
                 }
                 Err(error) => {
                     // Typically running out of file descriptors; back off instead of spinning.
@@ -740,8 +871,10 @@ async fn clear_idle_sessions<P: Send + 'static, S: SessionState>(
     }
 }
 
+/// Completes when the process is asked to stop: on Ctrl+C, or on Unix also on SIGTERM. This is
+/// what [`Server::run`] waits for, for servers with a run loop of their own.
 #[cfg(unix)]
-async fn wait_for_shutdown_signal() -> io::Result<()> {
+pub async fn shutdown_signal() -> io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut terminate = signal(SignalKind::terminate())?;
@@ -751,7 +884,9 @@ async fn wait_for_shutdown_signal() -> io::Result<()> {
     }
 }
 
+/// Completes when the process is asked to stop: on Ctrl+C, or on Unix also on SIGTERM. This is
+/// what [`Server::run`] waits for, for servers with a run loop of their own.
 #[cfg(not(unix))]
-async fn wait_for_shutdown_signal() -> io::Result<()> {
+pub async fn shutdown_signal() -> io::Result<()> {
     tokio::signal::ctrl_c().await
 }

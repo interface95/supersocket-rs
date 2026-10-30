@@ -10,6 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 readme = "../../README.md"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 ## TLS through rustls, for listeners and, with `client`, for the clients.
 tls = ["supersocket-server/tls", "supersocket-client?/tls", "supersocket-websocket?/tls"]
@@ -23,6 +26,8 @@ proxy = ["client", "supersocket-client/proxy"]
 websocket = ["dep:supersocket-websocket"]
 ## Gzip compression of connections: `GzipLayer`, and with `client` `GzipConnector`.
 gzip = ["supersocket-server/gzip", "supersocket-client?/gzip"]
+## `CodecFilter`, which runs a `tokio_util::codec::Decoder` as a pipeline filter.
+codec = ["supersocket-proto/codec"]
 
 [dependencies]
 supersocket-connection.workspace = true

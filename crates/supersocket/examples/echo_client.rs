@@ -13,7 +13,7 @@ use supersocket::prelude::*;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pull: send a line, wait for its echo.
-    let mut client = EasyClient::builder(LineFilter::default())
+    let mut client = EasyClient::builder(LineFilter::default)
         .connect("127.0.0.1:4040")
         .await?;
     for text in ["hello", "supersocket"] {

@@ -1,18 +1,61 @@
 use std::{fmt, future::Future, io, net::SocketAddr};
 
-use supersocket_connection::BoxStream;
+use supersocket_connection::{BoxStream, Stream};
 use tokio::net::{TcpSocket, TcpStream};
 
 use crate::{BoxFuture, Endpoint};
 
-/// A connection being built by a chain of [`Connector`]s.
+/// A connection being built by a chain of [`Connector`]s: a stream and, when known, the
+/// addresses of the socket under it.
 pub struct Connection {
-    /// The stream to read from and write to.
-    pub stream: BoxStream,
+    stream: BoxStream,
+    local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
+}
+
+impl Connection {
+    /// A connection on `stream` whose addresses are not known.
+    pub fn new(stream: impl Stream) -> Self {
+        Self::from_parts(Box::new(stream), None, None)
+    }
+
+    /// A connection on `stream` with the given addresses.
+    pub fn from_parts(
+        stream: BoxStream,
+        local_addr: Option<SocketAddr>,
+        peer_addr: Option<SocketAddr>,
+    ) -> Self {
+        Self {
+            stream,
+            local_addr,
+            peer_addr,
+        }
+    }
+
     /// Local address of the underlying socket.
-    pub local_addr: Option<SocketAddr>,
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.local_addr
+    }
+
     /// Address the underlying socket is connected to: the proxy when connecting through one.
-    pub peer_addr: Option<SocketAddr>,
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
+    }
+
+    /// Wraps the stream, keeping the addresses; for connectors that add a layer, such as
+    /// compression.
+    pub fn map_stream(self, wrap: impl FnOnce(BoxStream) -> BoxStream) -> Self {
+        Self {
+            stream: wrap(self.stream),
+            ..self
+        }
+    }
+
+    /// Takes the connection apart, for connectors that replace the stream asynchronously, such
+    /// as a TLS handshake; put it back together with [`from_parts`](Self::from_parts).
+    pub fn into_parts(self) -> (BoxStream, Option<SocketAddr>, Option<SocketAddr>) {
+        (self.stream, self.local_addr, self.peer_addr)
+    }
 }
 
 impl fmt::Debug for Connection {
@@ -88,11 +131,7 @@ impl Connector for GzipConnector {
                 "GzipConnector wraps a connection, so it cannot be the first connector",
             )
         })?;
-        Ok(Connection {
-            stream: supersocket_connection::gzip(connection.stream),
-            local_addr: connection.local_addr,
-            peer_addr: connection.peer_addr,
-        })
+        Ok(connection.map_stream(supersocket_connection::gzip))
     }
 }
 
@@ -178,10 +217,11 @@ impl Connector for TcpConnector {
     ) -> io::Result<Connection> {
         must_be_first("TcpConnector", &previous)?;
         let stream = self.open(target).await?;
-        Ok(Connection {
-            local_addr: stream.local_addr().ok(),
-            peer_addr: stream.peer_addr().ok(),
-            stream: Box::new(stream),
-        })
+        let (local_addr, peer_addr) = (stream.local_addr().ok(), stream.peer_addr().ok());
+        Ok(Connection::from_parts(
+            Box::new(stream),
+            local_addr,
+            peer_addr,
+        ))
     }
 }

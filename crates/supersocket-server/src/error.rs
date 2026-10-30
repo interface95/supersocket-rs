@@ -25,7 +25,7 @@ pub enum Error {
         /// The address as configured.
         address: String,
         /// Why it could not be parsed.
-        source: std::net::AddrParseError,
+        source: io::Error,
     },
 
     /// Binding a listener failed.
@@ -54,6 +54,15 @@ pub enum Error {
     /// [`Server::start`](crate::Server::start) was called more than once.
     #[error("the server has already been started")]
     AlreadyStarted,
+
+    /// A middleware failed to start; see [`Middleware::start`](crate::Middleware::start).
+    #[error("a middleware failed to start: {0}")]
+    Middleware(#[source] BoxError),
+
+    /// [`Server::serve_connection`](crate::Server::serve_connection) was called while
+    /// [`max_connections`](crate::ServerOptions::max_connections) sessions are being served.
+    #[error("the connection limit is reached")]
+    ConnectionLimit,
 
     /// Any other I/O error.
     #[error(transparent)]

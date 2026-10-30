@@ -2,7 +2,11 @@
 
 mod common;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use common::{
     Client, WAIT,
@@ -309,5 +313,30 @@ async fn stream_layers_run_inside_tls() {
     assert_eq!(client.line().await, "welcome secure=true");
     client.send(b"hello\r\n").await;
     assert_eq!(client.line().await, "hello");
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_handshakes_must_finish_within_the_handshake_timeout() {
+    let certificate = TestCertificate::new("slow-handshake");
+    let listener = certificate.listener();
+    let limit = Duration::from_millis(200);
+    let server = Server::builder(LineFilter::default)
+        .configure(move |options| {
+            options.handshake_timeout = limit;
+            options.listeners.push(listener);
+        })
+        .build()
+        .unwrap();
+    let address = server.start().unwrap()[0];
+
+    // Connected, but never starts the handshake.
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    let started = Instant::now();
+    let mut rest = Vec::new();
+    let _ = timeout(WAIT, stream.read_to_end(&mut rest))
+        .await
+        .expect("the connection stayed open");
+    assert!(started.elapsed() >= limit);
     server.shutdown().await;
 }

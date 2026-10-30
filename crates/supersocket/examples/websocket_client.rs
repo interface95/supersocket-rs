@@ -16,6 +16,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("received {:?}", reply.as_text().unwrap_or("<binary>"));
         }
     }
-    client.close(CloseCode::NORMAL, "done").await;
+    client.close(CloseCode::NORMAL, "done").await?;
     Ok(())
 }

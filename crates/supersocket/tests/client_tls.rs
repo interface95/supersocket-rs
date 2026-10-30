@@ -14,7 +14,7 @@ async fn client_talks_tls_to_a_tls_listener() {
     let certificate = TestCertificate::new("client");
     let (server, address) = start_tls_echo(&certificate);
 
-    let mut client = EasyClient::builder(LineFilter::default())
+    let mut client = EasyClient::builder(LineFilter::default)
         .tls(TlsConnector::with_root_certificates(certificate.roots()).server_name("localhost"))
         .connect(address)
         .await
@@ -33,7 +33,7 @@ async fn untrusted_certificates_are_rejected() {
     let (server, address) = start_tls_echo(&certificate);
 
     // The default roots do not include the self-signed test certificate.
-    let result = EasyClient::builder(LineFilter::default())
+    let result = EasyClient::builder(LineFilter::default)
         .tls(TlsConnector::new().server_name("localhost"))
         .connect(address)
         .await;

@@ -39,14 +39,17 @@ pub struct SendQueue {
 #[derive(Default)]
 struct State {
     pending: BytesMut,
+    /// Bytes the writer took and is still writing.
+    in_flight: usize,
     closed: bool,
     /// The last data has been queued: nothing more is accepted, but the queue is still written.
     sealed: bool,
 }
 
 impl SendQueue {
-    /// A queue whose [`send`](Self::send) waits once `limit` bytes are waiting. A send is
-    /// accepted whenever nothing is waiting, so a limit of zero sends one piece at a time.
+    /// A queue whose [`send`](Self::send) waits once `limit` bytes are waiting to be written or
+    /// being written. A send is accepted whenever nothing is, so a limit of zero sends one piece
+    /// at a time.
     pub fn new(limit: usize) -> Self {
         Self {
             state: Mutex::default(),
@@ -67,25 +70,51 @@ impl SendQueue {
     pub async fn send_vectored(&self, parts: &[&[u8]]) -> io::Result<()> {
         loop {
             let drained = self.drained.notified();
-            {
-                let mut state = self.state.lock().unwrap();
-                if state.closed || state.sealed {
-                    return Err(io::ErrorKind::BrokenPipe.into());
-                }
-                if state.pending.is_empty() || state.pending.len() < self.limit {
-                    state
-                        .pending
-                        .reserve(parts.iter().map(|part| part.len()).sum());
-                    for part in parts {
-                        state.pending.extend_from_slice(part);
-                    }
-                    break;
-                }
+            if self.enqueue(parts)? {
+                break;
             }
             drained.await;
         }
         self.data_available.notify_one();
         Ok(())
+    }
+
+    /// Queues `data` without waiting: fails with [`ErrorKind::WouldBlock`](io::ErrorKind::WouldBlock)
+    /// while the limit is reached, and with [`ErrorKind::BrokenPipe`](io::ErrorKind::BrokenPipe)
+    /// once the queue is closed. For broadcasts, where a peer that reads slowly should be skipped
+    /// rather than waited for.
+    pub fn try_send(&self, data: &[u8]) -> io::Result<()> {
+        self.try_send_vectored(&[data])
+    }
+
+    /// Queues `parts` back to back as one piece without waiting, like [`try_send`](Self::try_send).
+    pub fn try_send_vectored(&self, parts: &[&[u8]]) -> io::Result<()> {
+        if !self.enqueue(parts)? {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        self.data_available.notify_one();
+        Ok(())
+    }
+
+    /// Queues `parts` when there is room; `Ok(false)` means the limit is reached.
+    fn enqueue(&self, parts: &[&[u8]]) -> io::Result<bool> {
+        let mut state = self.state.lock().unwrap();
+        if state.closed || state.sealed {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        // What is queued and what is being written both count; a peer that stopped reading
+        // leaves a batch in flight for good.
+        let waiting = state.pending.len() + state.in_flight;
+        if waiting != 0 && waiting >= self.limit {
+            return Ok(false);
+        }
+        state
+            .pending
+            .reserve(parts.iter().map(|part| part.len()).sum());
+        for part in parts {
+            state.pending.extend_from_slice(part);
+        }
+        Ok(true)
     }
 
     /// Queues `data` as the last data to send, without waiting for room: every later send fails,
@@ -134,20 +163,25 @@ impl SendQueue {
         loop {
             let chunk = {
                 let mut state = self.state.lock().unwrap();
+                // The previous batch is written.
+                state.in_flight = 0;
                 if state.pending.is_empty() {
                     if state.closed {
                         break;
                     }
                     None
                 } else {
-                    Some(std::mem::take(&mut state.pending))
+                    let chunk = std::mem::take(&mut state.pending);
+                    state.in_flight = chunk.len();
+                    Some(chunk)
                 }
             };
+            // Room may have opened up: the previous batch is written.
+            self.drained.notify_waiters();
             let Some(chunk) = chunk else {
                 self.data_available.notified().await;
                 continue;
             };
-            self.drained.notify_waiters();
             let write = async {
                 writer.write_all(&chunk).await?;
                 writer.flush().await
@@ -179,6 +213,7 @@ impl fmt::Debug for SendQueue {
         let state = self.state.lock().unwrap();
         f.debug_struct("SendQueue")
             .field("pending", &state.pending.len())
+            .field("in_flight", &state.in_flight)
             .field("closed", &state.closed)
             .field("limit", &self.limit)
             .finish()
@@ -214,6 +249,21 @@ mod tests {
         let mut received = String::new();
         reader.read_to_string(&mut received).await.unwrap();
         assert_eq!(received, "one two three");
+    }
+
+    #[test]
+    fn try_send_never_waits() {
+        let queue = SendQueue::new(8);
+        queue.try_send(b"12345678").unwrap();
+        assert_eq!(
+            queue.try_send(b"x").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        queue.close();
+        assert_eq!(
+            queue.try_send(b"x").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[tokio::test]

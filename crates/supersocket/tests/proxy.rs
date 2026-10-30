@@ -211,7 +211,7 @@ async fn http_proxy_connects_and_keeps_data_sent_with_its_reply() {
     // "user:pass" in base64.
     let proxy = spawn_proxy(|client| http_proxy(client, Some("dXNlcjpwYXNz"), "\r\n")).await;
 
-    let client = EasyClient::builder(LineFilter::default())
+    let client = EasyClient::builder(LineFilter::default)
         .proxy(HttpProxy::new(proxy.to_string()).credentials("user", "pass"))
         .connect(("localhost", address.port()))
         .await
@@ -226,7 +226,7 @@ async fn http_proxy_rejection_is_an_error() {
     let (server, address) = start_greeting_echo();
     let proxy = spawn_proxy(|client| http_proxy(client, Some("dXNlcjpwYXNz"), "\r\n")).await;
 
-    let error = EasyClient::builder(LineFilter::default())
+    let error = EasyClient::builder(LineFilter::default)
         .proxy(HttpProxy::new(proxy.to_string()).credentials("user", "wrong"))
         .connect(address)
         .await
@@ -241,7 +241,7 @@ async fn http_proxy_replies_may_end_lines_with_a_bare_newline() {
     let (server, address) = start_greeting_echo();
     let proxy = spawn_proxy(|client| http_proxy(client, None, "\n")).await;
 
-    let client = EasyClient::builder(LineFilter::default())
+    let client = EasyClient::builder(LineFilter::default)
         .proxy(HttpProxy::new(proxy.to_string()))
         .connect(address)
         .await
@@ -255,7 +255,7 @@ async fn socks5_proxy_resolves_host_names() {
     let (server, address) = start_greeting_echo();
     let proxy = spawn_proxy(|client| socks5_proxy(client, None)).await;
 
-    let client = EasyClient::builder(LineFilter::default())
+    let client = EasyClient::builder(LineFilter::default)
         .proxy(Socks5Proxy::new(proxy.to_string()))
         .connect(("localhost", address.port()))
         .await
@@ -269,21 +269,21 @@ async fn socks5_proxy_authenticates() {
     let (server, address) = start_greeting_echo();
     let proxy = spawn_proxy(|client| socks5_proxy(client, Some(("user", "secret")))).await;
 
-    let client = EasyClient::builder(LineFilter::default())
+    let client = EasyClient::builder(LineFilter::default)
         .proxy(Socks5Proxy::new(proxy.to_string()).credentials("user", "secret"))
         .connect(address)
         .await
         .unwrap();
     assert_greeting_and_echo(client).await;
 
-    let error = EasyClient::builder(LineFilter::default())
+    let error = EasyClient::builder(LineFilter::default)
         .proxy(Socks5Proxy::new(proxy.to_string()).credentials("user", "wrong"))
         .connect(address)
         .await
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
 
-    let error = EasyClient::builder(LineFilter::default())
+    let error = EasyClient::builder(LineFilter::default)
         .proxy(Socks5Proxy::new(proxy.to_string()))
         .connect(address)
         .await
@@ -298,7 +298,7 @@ async fn socks4_proxy_connects_by_address_and_by_host_name() {
     let proxy = spawn_proxy(socks4_proxy).await;
 
     for target in [address.to_string(), format!("localhost:{}", address.port())] {
-        let client = EasyClient::builder(LineFilter::default())
+        let client = EasyClient::builder(LineFilter::default)
             .proxy(Socks4Proxy::new(proxy.to_string()).user_id("tester"))
             .connect(target)
             .await

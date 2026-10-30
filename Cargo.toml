@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "tools/*"]
+# The fuzz targets build with cargo-fuzz on nightly, as a workspace of their own.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -40,6 +42,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [workspace.lints.rust]
 missing_docs = "warn"
 unsafe_code = "forbid"
+# `cargo fuzz` builds with `--cfg fuzzing`, which enables the fuzzing entry points.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

@@ -30,14 +30,34 @@
 //!   client.
 //! - `gzip`: gzip compression of connections, `GzipLayer` for the server and, with `client`,
 //!   `GzipConnector` for the client.
+//! - `codec`: `CodecFilter`, which runs a `tokio_util::codec::Decoder` as a pipeline filter.
 
 #[cfg(feature = "client")]
 pub use supersocket_client as client;
 pub use supersocket_connection as connection;
 pub use supersocket_proto as proto;
-pub use supersocket_proto::*;
+#[cfg(feature = "codec")]
+pub use supersocket_proto::CodecFilter;
+pub use supersocket_proto::{
+    BeginEndMarkFilter, BoxFilter, CommandLineFilter, CommandPackage, Decoder, FixedHeaderFilter,
+    FixedHeaderProtocol, FixedSizeFilter, LineFilter, PackageEncoder, PipelineFilter,
+    PipelineFilterExt, ProtocolError, SwitchAfterPackage, TerminatorFilter, TextPackage,
+    TransparentFilter, bytes,
+};
 pub use supersocket_server as server;
-pub use supersocket_server::*;
+#[cfg(feature = "config")]
+pub use supersocket_server::ConfigError;
+#[cfg(feature = "gzip")]
+pub use supersocket_server::GzipLayer;
+pub use supersocket_server::{
+    AsyncCommand, AsyncCommandExt, BoxError, BoxStream, CloseReason, CommandFilter, Commands,
+    ConnectionInfo, Error, ErrorAction, Extensions, Filtered, HandlerResult, KeyedPackage,
+    ListenOptions, Middleware, PackageError, PackageHandler, PackageHandling, ProxyCommand,
+    ProxyInfo, Server, ServerBuilder, ServerInfo, ServerOptions, Session, SessionContainer,
+    SessionState, Stream, StreamLayer, TlsOptions, shutdown_signal,
+};
+#[cfg(feature = "tls")]
+pub use supersocket_server::{TlsInfo, rustls};
 #[cfg(feature = "websocket")]
 pub use supersocket_websocket as websocket;
 

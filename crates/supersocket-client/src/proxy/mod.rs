@@ -73,11 +73,7 @@ fn finish(stream: TcpStream, rest: BytesMut) -> Connection {
     } else {
         Box::new(Rewind::new(rest.freeze(), stream))
     };
-    Connection {
-        stream,
-        local_addr,
-        peer_addr,
-    }
+    Connection::from_parts(stream, local_addr, peer_addr)
 }
 
 /// A username and password. `Debug` output leaves out the password.

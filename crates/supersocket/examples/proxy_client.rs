@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("usage: proxy_client <proxy host:port> <target host:port>");
         std::process::exit(2);
     };
-    let mut client = EasyClient::builder(LineFilter::default())
+    let mut client = EasyClient::builder(LineFilter::default)
         .proxy(Socks5Proxy::new(proxy.as_str()))
         .connect(target.as_str())
         .await?;

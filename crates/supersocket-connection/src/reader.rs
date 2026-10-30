@@ -7,7 +7,7 @@ use std::{
     task::{Poll, ready},
 };
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use supersocket_proto::{BoxFilter, ProtocolError};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
@@ -20,7 +20,8 @@ const STACK_READ_SIZE: usize = 8 * 1024;
 /// Limits of a [`PackageReader`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadOptions {
-    /// Largest package the filter may buffer before it is an error. Default: 1 MiB.
+    /// Largest package, framing included. Never more than this is buffered, so a longer package
+    /// is an error as soon as this much has arrived without completing it. Default: 1 MiB.
     pub max_package_length: usize,
     /// How much to read at a time while a package is incomplete. Default: 4 KiB.
     pub receive_buffer_size: usize,
@@ -45,7 +46,7 @@ pub enum ReadError {
     /// The pipeline filter rejected the data.
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
-    /// More than the maximum package length was buffered without completing a package.
+    /// The maximum package length was buffered without completing a package.
     #[error("package exceeds the maximum length of {limit} bytes")]
     TooLarge {
         /// The maximum package length.
@@ -134,14 +135,21 @@ where
     ///
     /// While nothing is buffered, nothing is allocated until data arrives. This is cancel safe.
     pub async fn fill(&mut self) -> Result<usize, ReadError> {
+        let limit = self.options.max_package_length;
+        if self.buf.len() >= limit {
+            return Err(ReadError::TooLarge { limit });
+        }
         // Everything received has been consumed: drop the buffer so an idle connection holds none.
         if self.buf.is_empty() {
             self.buf = BytesMut::new();
         }
+        // Never buffer more than the limit, so that no package can exceed it.
+        let room = limit - self.buf.len();
         Ok(read_some(
             &mut self.reader,
             &mut self.buf,
             self.options.receive_buffer_size,
+            room,
         )
         .await?)
     }
@@ -156,7 +164,7 @@ where
                 Step::Package(package) => return Ok(Some(package)),
                 Step::Switched => {}
                 Step::NeedMore => {
-                    if self.buf.len() > self.options.max_package_length {
+                    if self.buf.len() >= self.options.max_package_length {
                         return Err(ReadError::TooLarge {
                             limit: self.options.max_package_length,
                         });
@@ -215,19 +223,23 @@ fn decode_step<P: Send + 'static>(
     })
 }
 
-/// Reads more data into `buf`. While `buf` is empty, nothing is allocated until data arrives.
+/// Reads up to `room` more bytes into `buf`. While `buf` is empty, nothing is allocated until data
+/// arrives.
 async fn read_some<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut BytesMut,
     chunk_size: usize,
+    room: usize,
 ) -> io::Result<usize> {
     if !buf.is_empty() {
-        buf.reserve(chunk_size);
-        return reader.read_buf(buf).await;
+        let chunk = chunk_size.min(room);
+        buf.reserve(chunk);
+        return reader.read_buf(&mut (&mut *buf).limit(chunk)).await;
     }
+    let size = STACK_READ_SIZE.min(room);
     poll_fn(|cx| {
         let mut stack = [MaybeUninit::<u8>::uninit(); STACK_READ_SIZE];
-        let mut read_buf = ReadBuf::uninit(&mut stack);
+        let mut read_buf = ReadBuf::uninit(&mut stack[..size]);
         ready!(Pin::new(&mut *reader).poll_read(cx, &mut read_buf))?;
         buf.extend_from_slice(read_buf.filled());
         Poll::Ready(Ok(read_buf.filled().len()))
@@ -274,6 +286,24 @@ mod tests {
         assert_eq!(reader.fill().await.unwrap(), 7);
         assert!(reader.try_next().unwrap().is_none());
         assert_eq!(reader.fill().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn packages_may_not_exceed_the_maximum_length() {
+        let options = ReadOptions {
+            max_package_length: 16,
+            ..ReadOptions::default()
+        };
+        // Exactly the limit, terminator included.
+        let data: &[u8] = b"xxxxxxxxxxxxxx\r\n";
+        let package = lines(data, options).next().await.unwrap().unwrap();
+        assert_eq!(package.text, "xxxxxxxxxxxxxx");
+        // One byte more, although it would arrive in one read.
+        let data: &[u8] = b"xxxxxxxxxxxxxxx\r\n";
+        assert!(matches!(
+            lines(data, options).next().await,
+            Err(ReadError::TooLarge { limit: 16 })
+        ));
     }
 
     #[tokio::test]

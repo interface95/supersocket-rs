@@ -9,6 +9,9 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 ## TLS listeners through rustls.
 tls = ["dep:tokio-rustls"]

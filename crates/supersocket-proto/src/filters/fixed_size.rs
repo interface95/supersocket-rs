@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 
 use super::Decoder;
 use crate::{PipelineFilter, ProtocolError};
@@ -15,9 +15,15 @@ impl<P> FixedSizeFilter<P> {
     /// # Panics
     ///
     /// Panics if `size` is zero.
-    pub fn new(size: usize, decoder: Decoder<P>) -> Self {
+    pub fn new(
+        size: usize,
+        decoder: impl FnMut(Bytes) -> Result<P, ProtocolError> + Send + 'static,
+    ) -> Self {
         assert!(size > 0, "package size must not be zero");
-        Self { size, decoder }
+        Self {
+            size,
+            decoder: Box::new(decoder),
+        }
     }
 }
 

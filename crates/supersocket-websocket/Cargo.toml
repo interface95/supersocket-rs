@@ -9,6 +9,9 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 ## The WebSocket client, built on `EasyClient`.
 client = ["dep:supersocket-client"]
@@ -16,11 +19,13 @@ client = ["dep:supersocket-client"]
 tls = ["supersocket-client?/tls"]
 
 [dependencies]
+supersocket-connection.workspace = true
 supersocket-proto.workspace = true
 supersocket-server.workspace = true
 supersocket-client = { workspace = true, optional = true }
 bytes.workspace = true
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio-util.workspace = true
 tracing.workspace = true
 
 [lints]

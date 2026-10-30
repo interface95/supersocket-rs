@@ -1,4 +1,4 @@
-use std::{io, path::Path, sync::Arc, time::Duration};
+use std::{io, path::Path, sync::Arc};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{
@@ -59,7 +59,6 @@ impl TlsInfo {
 
 pub(crate) struct TlsListener {
     acceptor: TlsAcceptor,
-    handshake_timeout: Duration,
 }
 
 impl TlsListener {
@@ -73,15 +72,19 @@ impl TlsListener {
         };
         Ok(Self {
             acceptor: TlsAcceptor::from(config),
-            handshake_timeout: options.handshake_timeout,
         })
     }
 
-    pub(crate) async fn accept<IO>(&self, stream: IO) -> io::Result<TlsStream<IO>>
+    /// Performs the handshake, giving up at `deadline`.
+    pub(crate) async fn accept<IO>(
+        &self,
+        stream: IO,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<TlsStream<IO>>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
-        tokio::time::timeout(self.handshake_timeout, self.acceptor.accept(stream))
+        tokio::time::timeout_at(deadline, self.acceptor.accept(stream))
             .await
             .unwrap_or_else(|_| {
                 Err(io::Error::new(

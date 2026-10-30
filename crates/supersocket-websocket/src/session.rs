@@ -6,7 +6,7 @@ use crate::{
     CloseCode, CloseFrame, HandshakeRequest, Message, WebSocketState,
     frame::{MAX_CONTROL_PAYLOAD, OP_BINARY, OP_PING, OP_TEXT},
     handshake::NO_REQUEST,
-    server::{send_close, send_frame},
+    server::{send_close, send_frame, try_send_frame},
 };
 
 /// A WebSocket connection on the server, handed to the handlers of a
@@ -102,6 +102,24 @@ impl<S> WebSocketSession<S> {
         self.send_data(OP_BINARY, data).await
     }
 
+    /// Queues `message` without waiting: fails with
+    /// [`ErrorKind::WouldBlock`](io::ErrorKind::WouldBlock) while the send buffer limit is
+    /// reached. For broadcasts, where a client that reads slowly should be skipped rather than
+    /// hold up the others.
+    pub fn try_send(&self, message: &Message) -> io::Result<()> {
+        if self.session.close_sent.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the WebSocket connection is closing",
+            ));
+        }
+        let (opcode, payload) = match message {
+            Message::Text(text) => (OP_TEXT, text.as_bytes()),
+            Message::Binary(data) => (OP_BINARY, &data[..]),
+        };
+        try_send_frame(&self.session, opcode, payload)
+    }
+
     /// Sends a ping with up to 125 bytes of `payload`; the client answers with a pong.
     pub async fn ping(&self, payload: &[u8]) -> io::Result<()> {
         if payload.len() > MAX_CONTROL_PAYLOAD {
@@ -125,20 +143,24 @@ impl<S> WebSocketSession<S> {
 }
 
 impl<S: Send + Sync + 'static> WebSocketSession<S> {
-    /// Starts the closing handshake: sends a close frame with `code` and `reason`, then closes
-    /// the connection when the client answers, or after the close timeout. A code that may not
+    /// Starts the closing handshake: queues a close frame with `code` and `reason` as the last
+    /// data, then closes the connection when the client answers, or after the close timeout.
+    /// Fails when the connection is already closing. A code that may not
     /// be sent (see [`CloseCode::is_allowed`]) is replaced by 1000, and a reason longer than 123
     /// bytes is cut short.
-    pub async fn close(&self, code: CloseCode, reason: &str) {
+    pub fn close(&self, code: CloseCode, reason: &str) -> io::Result<()> {
         if self.session.close_sent.swap(true, Ordering::AcqRel) {
-            return;
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the WebSocket connection is closing",
+            ));
         }
         let code = if code.is_allowed() {
             code
         } else {
             CloseCode::NORMAL
         };
-        let _ = send_close(&self.session, Some(code), reason);
+        let sent = send_close(&self.session, Some(code), reason);
         let session = self.session.clone();
         let limit = session.server().options().close_timeout;
         tokio::spawn(async move {
@@ -146,6 +168,7 @@ impl<S: Send + Sync + 'static> WebSocketSession<S> {
                 session.close(CloseReason::LocalClosed);
             }
         });
+        sent
     }
 }
 

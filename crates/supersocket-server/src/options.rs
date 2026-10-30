@@ -54,13 +54,17 @@ pub struct ServerOptions {
     #[serde(with = "lenient::duration")]
     pub close_timeout: Duration,
 
-    /// How long a session may take to complete its handshake on a server that requires one, such
-    /// as a WebSocket server; see
-    /// [`ServerBuilder::require_handshake`](crate::ServerBuilder::require_handshake). A listener
-    /// with [`proxy_protocol`](ListenOptions::proxy_protocol) also waits this long for the
-    /// header. Default: 10 seconds.
+    /// How long a connection may take from being accepted to being connected: reading the PROXY
+    /// protocol header, the TLS handshake, the stream layers and the protocol handshake of a
+    /// server that [requires one](crate::ServerBuilder::require_handshake), all together. A
+    /// connection that takes longer is dropped. Default: 10 seconds.
     #[serde(with = "lenient::duration")]
     pub handshake_timeout: Duration,
+
+    /// How many connections the server serves at a time. At the limit, accepting pauses until a
+    /// session ends, so new connections wait in the listen backlog. Default: no limit.
+    #[serde(deserialize_with = "lenient::option_usize")]
+    pub max_connections: Option<usize>,
 }
 
 impl Default for ServerOptions {
@@ -78,6 +82,7 @@ impl Default for ServerOptions {
             send_buffer_limit: 64 * 1024,
             close_timeout: Duration::from_secs(5),
             handshake_timeout: Duration::from_secs(10),
+            max_connections: None,
         }
     }
 }
@@ -113,6 +118,9 @@ impl ServerOptions {
         if self.handshake_timeout.is_zero() {
             return invalid("handshake_timeout must be greater than zero".into());
         }
+        if self.max_connections == Some(0) {
+            return invalid("max_connections must be greater than zero".into());
+        }
         for listener in &self.listeners {
             let zero = |field: &str| {
                 invalid(format!(
@@ -132,8 +140,8 @@ impl ServerOptions {
             if listener.socket_send_buffer_size == Some(0) {
                 return zero("socket_send_buffer_size");
             }
+            #[cfg(feature = "tls")]
             if let Some(tls) = &listener.tls {
-                #[cfg(feature = "tls")]
                 if tls.config.is_some()
                     && (tls.client_ca.is_some()
                         || tls.client_auth_optional
@@ -146,12 +154,6 @@ impl ServerOptions {
                         listener.address
                     ));
                 }
-                if tls.handshake_timeout.is_zero() {
-                    return invalid(format!(
-                        "listener {}: handshake_timeout must be greater than zero",
-                        listener.address
-                    ));
-                }
             }
         }
         Ok(())
@@ -161,6 +163,7 @@ impl ServerOptions {
 /// How the packages of one session are handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PackageHandling {
     /// One package at a time, in the order received. Reading pauses while a package is handled.
     #[default]
@@ -244,7 +247,8 @@ fn default_no_delay() -> bool {
 }
 
 /// TLS settings of a listener. The certificate chain, the private key and the client certificate
-/// authorities are PEM files.
+/// authorities are PEM files. The handshake is limited by
+/// [`ServerOptions::handshake_timeout`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsOptions {
@@ -268,10 +272,6 @@ pub struct TlsOptions {
     #[serde(default, deserialize_with = "lenient::bool")]
     pub client_auth_optional: bool,
 
-    /// How long a client may take to complete the handshake. Default: 10 seconds.
-    #[serde(default = "default_handshake_timeout", with = "lenient::duration")]
-    pub handshake_timeout: Duration,
-
     /// A complete rustls configuration to use instead of one built from the files above, for
     /// what they cannot express, such as ALPN, a certificate per server name or a custom client
     /// certificate verifier. Not read from config files.
@@ -288,7 +288,6 @@ impl TlsOptions {
             key: key.into(),
             client_ca: None,
             client_auth_optional: false,
-            handshake_timeout: default_handshake_timeout(),
             #[cfg(feature = "tls")]
             config: None,
         }
@@ -318,10 +317,5 @@ impl PartialEq for TlsOptions {
             && self.key == other.key
             && self.client_ca == other.client_ca
             && self.client_auth_optional == other.client_auth_optional
-            && self.handshake_timeout == other.handshake_timeout
     }
-}
-
-fn default_handshake_timeout() -> Duration {
-    Duration::from_secs(10)
 }

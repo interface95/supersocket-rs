@@ -88,8 +88,9 @@ impl WebSocketClientBuilder {
     /// Connects and performs the handshake.
     pub async fn connect(self) -> io::Result<WebSocketClient> {
         let url = Url::parse(&self.url)?;
-        let filter = HeadFilter::new(Role::Client, self.options.max_package_length);
-        let mut builder = EasyClient::builder(filter).options(self.options.clone());
+        let max_size = self.options.max_package_length;
+        let mut builder = EasyClient::builder(move || HeadFilter::new(Role::Client, max_size))
+            .options(self.options.clone());
         for deferred in self.deferred {
             builder = deferred(builder);
         }
@@ -182,7 +183,7 @@ impl fmt::Debug for WebSocketClientBuilder {
 /// if let Some(reply) = client.receive().await? {
 ///     println!("{:?}", reply.as_text());
 /// }
-/// client.close(CloseCode::NORMAL, "done").await;
+/// client.close(CloseCode::NORMAL, "done").await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -299,14 +300,15 @@ impl WebSocketClient {
 
     /// Performs the closing handshake: sends a close frame, waits up to the close timeout for the
     /// server to answer, skipping messages that arrive meanwhile, then closes the connection.
-    pub async fn close(mut self, code: CloseCode, reason: &str) {
-        self.sender.close(code, reason).await;
+    pub async fn close(mut self, code: CloseCode, reason: &str) -> io::Result<()> {
+        let sent = self.sender.close(code, reason);
         let limit = self.close_timeout;
         let _ = tokio::time::timeout(limit, async {
             while let Ok(Some(_)) = self.receive().await {}
         })
         .await;
         self.client.close().await;
+        sent
     }
 }
 
@@ -361,16 +363,19 @@ impl WebSocketSender {
 
     /// Starts the closing handshake by sending a close frame; the receiving side then returns
     /// `Ok(None)` once the server answers. A code that may not be sent is replaced by 1000.
-    pub async fn close(&self, code: CloseCode, reason: &str) {
+    pub fn close(&self, code: CloseCode, reason: &str) -> io::Result<()> {
         if self.close_sent.swap(true, Ordering::AcqRel) {
-            return;
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the WebSocket connection is closing",
+            ));
         }
         let code = if code.is_allowed() {
             code
         } else {
             CloseCode::NORMAL
         };
-        let _ = self.send_close(Some(code), reason);
+        self.send_close(Some(code), reason)
     }
 
     /// Whether the connection is closed or closing.

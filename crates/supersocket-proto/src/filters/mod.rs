@@ -1,17 +1,21 @@
 mod begin_end_mark;
+#[cfg(feature = "codec")]
+mod codec;
 mod fixed_header;
 mod fixed_size;
 mod terminator;
 mod transparent;
 
 pub use begin_end_mark::BeginEndMarkFilter;
+#[cfg(feature = "codec")]
+pub use codec::CodecFilter;
 pub use fixed_header::{FixedHeaderFilter, FixedHeaderProtocol};
 pub use fixed_size::FixedSizeFilter;
 pub use terminator::{CommandLineFilter, LineFilter, TerminatorFilter};
 pub use transparent::TransparentFilter;
 
 /// A function that decodes the bytes of one package, used by the built-in filters.
-pub type Decoder<P> = fn(bytes::Bytes) -> Result<P, crate::ProtocolError>;
+pub type Decoder<P> = Box<dyn FnMut(bytes::Bytes) -> Result<P, crate::ProtocolError> + Send>;
 
 pub(crate) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack

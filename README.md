@@ -62,7 +62,7 @@ Until the first release, depend on the repository:
 
 ```toml
 [dependencies]
-supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # optional features: "tls", "config", "client", "proxy", "websocket", "gzip"
+supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # optional features: "tls", "config", "client", "proxy", "websocket", "gzip", "codec"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -121,6 +121,10 @@ Server::builder(FixedHeaderFilter::<MessageProtocol>::default)
 Anything else implements `PipelineFilter` directly. Returning a filter from `next_filter`
 switches the connection to it, which is how a protocol upgrade works.
 
+The decoders of the built-in filters may be closures with state, such as a text encoding. With
+the `codec` feature, `CodecFilter` runs any `tokio_util::codec::Decoder`, such as
+`LengthDelimitedCodec`, as a pipeline filter.
+
 ### Commands and filters
 
 ```rust
@@ -133,7 +137,7 @@ impl AsyncCommand<CommandPackage> for Add {
 
     async fn execute(&self, session: &Session, package: CommandPackage) -> HandlerResult {
         let mut sum = 0i64;
-        for arg in &package.args {
+        for arg in package.args() {
             sum += arg.parse::<i64>()?;
         }
         session.send(format!("{sum}\r\n")).await?;
@@ -183,6 +187,18 @@ Server::builder(CommandLineFilter::default)
 with `.service(value)` are reachable through `session.server().service::<T>()`. A task spawned
 for a session can wait for `session.closed()` to stop with it.
 
+Broadcasts should not wait for the slowest client: `try_send` queues data when there is room and
+fails with `WouldBlock` otherwise, and `for_each` visits the sessions without taking a snapshot:
+
+```rust
+session.server().sessions().for_each(|other| {
+    let _ = other.try_send(&line); // a client that stopped reading is skipped
+});
+```
+
+Session state is created with `Default` by `.session::<S>()`, or from the connection, such as
+its address or TLS client certificate, by `.session_with(|connection| S { .. })`.
+
 ### Package handling, errors and timeouts
 
 ```rust
@@ -203,13 +219,30 @@ Server::builder(LineFilter::default)
 By default the packages of a session are handled one at a time, in order. In concurrent mode up
 to `max_in_flight` packages of a session run at the same time on the runtime's worker threads.
 
+### Accepting connections, limits and shutdown
+
+```rust
+Server::builder(LineFilter::default)
+    .on_accept(|connection| !banned(connection.remote_addr().ip())) // before TLS, costs nothing
+    .configure(|options| {
+        options.max_connections = Some(10_000); // accepting pauses at the limit
+        options.handshake_timeout = Duration::from_secs(10); // from accept to connected
+    })
+```
+
+`handshake_timeout` covers everything between accepting a connection and its session being
+connected: the PROXY protocol header, the TLS handshake, stream layers and a protocol
+handshake. For a rolling restart, `stop_accepting()` closes the listeners while the existing
+sessions finish, and `run_until(signal)` runs the server until a future of your own completes
+instead of Ctrl+C or SIGTERM. `Server` is `Clone`, so other tasks can hold a handle for this.
+
 ### Client
 
 Enable the `client` feature. An `EasyClient` cuts what the server sends into packages with a
 pipeline filter, the same ones the server uses:
 
 ```rust
-let mut client = EasyClient::builder(LineFilter::default())
+let mut client = EasyClient::builder(LineFilter::default)
     .connect("127.0.0.1:4040")
     .await?;
 client.send("hello\r\n").await?;
@@ -233,7 +266,7 @@ The connection is built by a chain of connectors, like SuperSocket's `IConnector
 one opens it, later ones wrap it.
 
 ```rust
-EasyClient::builder(LineFilter::default())
+EasyClient::builder(LineFilter::default)
     .proxy(Socks5Proxy::new("127.0.0.1:1080").credentials("user", "secret")) // feature "proxy"
     .tls(TlsConnector::new()) // feature "tls"; Mozilla roots by default
     .connect("example.com:443")
@@ -243,6 +276,9 @@ EasyClient::builder(LineFilter::default())
 `HttpProxy` (CONNECT) and `Socks4Proxy` (with SOCKS4a for host names) work the same way, and
 anything implementing `Connector` can be added with `.connector(...)`.
 
+A `ClientBuilder` can be kept and cloned to connect again, for reconnecting or a pool; the
+pipeline filter is created for each connection.
+
 ### WebSocket
 
 Enable the `websocket` feature. The WebSocket server runs on the same core: its first pipeline
@@ -251,17 +287,17 @@ connected once its handshake is complete, so broadcasts never reach a connection
 upgrading. Listeners with TLS give `wss://`.
 
 ```rust
-use supersocket::websocket::{Rejection, WebSocketServer};
+use supersocket::websocket::{Accept, Rejection, WebSocketServer};
 
 WebSocketServer::builder()
     .subprotocols(["chat.v1"])
     .on_handshake(async |session| match session.request().query() {
-        Some("token=secret") => Ok(()),
+        Some("token=secret") => Ok(Accept::new()),
         _ => Err(Rejection::new(401, "log in first")),
     })
     .on_message(async |session, message| {
         for other in session.sessions() {
-            let _ = other.send(&message).await; // broadcast
+            let _ = other.try_send(&message); // broadcast; slow clients are skipped
         }
         Ok(())
     })
@@ -273,7 +309,14 @@ WebSocketServer::builder()
 
 `session.close(CloseCode::NORMAL, "bye")` starts the closing handshake, and shutting the server
 down sends 1001 (going away) to every client. `max_package_length` limits both frames and
-messages joined from fragments.
+messages joined from fragments. `ping_interval` pings every client and `pong_timeout` closes
+those that stay silent, so connections whose peer vanished are noticed:
+
+```rust
+WebSocketServer::builder()
+    .ping_interval(Duration::from_secs(30))
+    .pong_timeout(Duration::from_secs(90))
+```
 
 With the `client` feature as well, `WebSocketClient` connects through the same connectors as
 `EasyClient`, so proxies and `wss://` work the same way:
@@ -282,7 +325,7 @@ With the `client` feature as well, `WebSocketClient` connects through the same c
 let mut client = WebSocketClient::connect("wss://example.com/chat").await?;
 client.send_text("hello").await?;
 let reply = client.receive().await?; // Some(Message), or None once closed
-client.close(CloseCode::NORMAL, "done").await;
+client.close(CloseCode::NORMAL, "done").await?;
 ```
 
 The server uses two core features that serve other protocols too: a `PackageHandler` type,
@@ -330,7 +373,8 @@ Enable the `tls` feature and give a listener a PEM certificate chain and private
 })
 ```
 
-The handshake runs in the connection's own task, so slow clients never hold up accepting.
+The handshake runs in the connection's own task, so slow clients never hold up accepting, and
+it is limited by `handshake_timeout` together with the other steps of setting up a connection.
 
 To require client certificates, add the authorities they must chain to; the session then
 tells which certificate a client sent:
@@ -386,7 +430,7 @@ both directions, and `GzipConnector` does the same on the client:
 
 ```rust
 Server::builder(LineFilter::default).stream_layer(GzipLayer)
-EasyClient::builder(LineFilter::default()).connector(GzipConnector)
+EasyClient::builder(LineFilter::default).connector(GzipConnector)
 ```
 
 Implement `StreamLayer` for your own layers, such as accounting or another encryption.
@@ -439,6 +483,8 @@ These numbers come from a prototype of the same core. Since then idle sessions s
 read and write buffers, which halved the memory per idle connection again (6.4 KB to about
 3 KB in a local measurement). Echo measures framework overhead only; real applications spend most of
 their time elsewhere.
+
+The load generator is in [`tools/bench`](tools/bench), with the steps to reproduce the numbers.
 
 ## Roadmap
 

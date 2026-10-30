@@ -10,7 +10,7 @@
 //! use supersocket_proto::LineFilter;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let mut client = EasyClient::builder(LineFilter::default()).connect("127.0.0.1:4040").await?;
+//! let mut client = EasyClient::builder(LineFilter::default).connect("127.0.0.1:4040").await?;
 //! client.send("hello\r\n").await?;
 //! if let Some(reply) = client.receive().await? {
 //!     println!("{}", reply.text);

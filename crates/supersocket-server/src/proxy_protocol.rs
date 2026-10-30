@@ -57,6 +57,7 @@ impl ProxyInfo {
 
 /// Whether a connection carries a client's traffic or was opened by the proxy itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ProxyCommand {
     /// The proxy relays a client's connection.
     Proxy,

@@ -22,7 +22,7 @@ fn compressed_echo() -> ServerBuilder<TextPackage> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compressed_connections_carry_packages_both_ways() {
     let (server, address) = start(compressed_echo());
-    let mut client = EasyClient::builder(LineFilter::default())
+    let mut client = EasyClient::builder(LineFilter::default)
         .connector(GzipConnector)
         .connect(address)
         .await

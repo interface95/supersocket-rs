@@ -81,7 +81,7 @@ impl PipelineFilter for HeadFilter {
                 parse_head(&buf.split_to(length))
             }
             // A larger head would fail the read buffer's limit without an HTTP answer.
-            None if buf.len() > MAX_HEAD_SIZE.min(self.max_size) => Err(HeadError::TooLarge),
+            None if buf.len() >= MAX_HEAD_SIZE.min(self.max_size) => Err(HeadError::TooLarge),
             None => {
                 self.searched = buf.len();
                 return Ok(None);

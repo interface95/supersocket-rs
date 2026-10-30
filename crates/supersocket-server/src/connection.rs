@@ -11,6 +11,7 @@ use supersocket_connection::{
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
+    sync::OwnedSemaphorePermit,
     task::JoinSet,
     time::Instant,
 };
@@ -28,21 +29,35 @@ pub(crate) async fn serve<P: Send + 'static, S: SessionState>(
     server: Arc<ServerInner<P, S>>,
     stream: TcpStream,
     listener: Arc<Listener>,
+    permit: Option<OwnedSemaphorePermit>,
 ) {
-    let Some((id, span, connection)) = accept(&server, &stream, &listener) else {
+    let Some((id, span, connection, deadline)) = accept(&server, &stream, &listener) else {
         return;
     };
     async move {
+        // Counts against the connection limit until the session is over.
+        let _permit = permit;
         // Set up in a block of its own, so that nothing of it is kept while the session runs.
         let Some(session) = ({
             let (mut stream, mut connection) = (stream, connection);
             let Some(buffered) =
-                read_proxy_header(&server, &listener, &mut stream, &mut connection).await
+                read_proxy_header(&listener, &mut stream, &mut connection, deadline).await
             else {
                 return;
             };
+            if !admit(&server, &connection) {
+                return;
+            }
             let (reader, writer) = stream.into_split();
-            start(&server, id, connection, reader, Box::new(writer), buffered)
+            start(
+                &server,
+                id,
+                connection,
+                reader,
+                Box::new(writer),
+                buffered,
+                deadline,
+            )
         }) else {
             return;
         };
@@ -60,23 +75,28 @@ pub(crate) async fn serve_tls<P: Send + 'static, S: SessionState>(
     server: Arc<ServerInner<P, S>>,
     stream: TcpStream,
     listener: Arc<Listener>,
+    permit: Option<OwnedSemaphorePermit>,
 ) {
-    let Some((id, span, connection)) = accept(&server, &stream, &listener) else {
+    let Some((id, span, connection, deadline)) = accept(&server, &stream, &listener) else {
         return;
     };
     async move {
+        let _permit = permit;
         let Some(session) = ({
             let (mut stream, mut connection) = (stream, connection);
             let Some(buffered) =
-                read_proxy_header(&server, &listener, &mut stream, &mut connection).await
+                read_proxy_header(&listener, &mut stream, &mut connection, deadline).await
             else {
                 return;
             };
+            if !admit(&server, &connection) {
+                return;
+            }
             let tls = listener.tls.as_ref().expect("a TLS listener");
             // Bytes that arrived with a PROXY protocol header are the start of the handshake.
             // Boxed, so that the session does not keep the handshake's state.
             let stream = Rewind::new(buffered.freeze(), stream);
-            let stream = match Box::pin(tls.accept(stream)).await {
+            let stream = match Box::pin(tls.accept(stream, deadline)).await {
                 Ok(stream) => stream,
                 Err(error) => {
                     tracing::debug!(%error, "TLS handshake failed");
@@ -93,6 +113,7 @@ pub(crate) async fn serve_tls<P: Send + 'static, S: SessionState>(
                 reader,
                 Box::new(writer),
                 BytesMut::new(),
+                deadline,
             )
         }) else {
             return;
@@ -109,21 +130,26 @@ pub(crate) async fn serve_layered_tcp<P: Send + 'static, S: SessionState>(
     server: Arc<ServerInner<P, S>>,
     stream: TcpStream,
     listener: Arc<Listener>,
+    permit: Option<OwnedSemaphorePermit>,
 ) {
-    let Some((id, span, connection)) = accept(&server, &stream, &listener) else {
+    let Some((id, span, connection, deadline)) = accept(&server, &stream, &listener) else {
         return;
     };
     async move {
+        let _permit = permit;
         let (mut stream, mut connection) = (stream, connection);
         let Some(buffered) =
-            read_proxy_header(&server, &listener, &mut stream, &mut connection).await
+            read_proxy_header(&listener, &mut stream, &mut connection, deadline).await
         else {
             return;
         };
+        if !admit(&server, &connection) {
+            return;
+        }
         let stream = Rewind::new(buffered.freeze(), stream);
         #[cfg(feature = "tls")]
         if let Some(tls) = &listener.tls {
-            let stream = match Box::pin(tls.accept(stream)).await {
+            let stream = match Box::pin(tls.accept(stream, deadline)).await {
                 Ok(stream) => stream,
                 Err(error) => {
                     tracing::debug!(%error, "TLS handshake failed");
@@ -132,9 +158,9 @@ pub(crate) async fn serve_layered_tcp<P: Send + 'static, S: SessionState>(
             };
             connection.secure = true;
             connection.tls = Some(Box::new(crate::TlsInfo::new(stream.get_ref().1)));
-            return serve_layered(&server, id, Box::new(stream), connection).await;
+            return serve_layered(&server, id, Box::new(stream), connection, deadline).await;
         }
-        serve_layered(&server, id, Box::new(stream), connection).await;
+        serve_layered(&server, id, Box::new(stream), connection, deadline).await;
     }
     .instrument(span)
     .await
@@ -145,12 +171,38 @@ pub(crate) async fn serve_stream<P: Send + 'static, S: SessionState>(
     server: Arc<ServerInner<P, S>>,
     stream: BoxStream,
     connection: ConnectionInfo,
+    permit: Option<OwnedSemaphorePermit>,
 ) {
     let id = server.next_session_id.fetch_add(1, Ordering::Relaxed);
     let span = tracing::debug_span!("session", id, remote = %connection.remote_addr);
-    serve_layered(&server, id, stream, connection)
-        .instrument(span)
-        .await
+    let deadline = Instant::now() + server.info.options().handshake_timeout;
+    async {
+        let _permit = permit;
+        if !admit(&server, &connection) {
+            return;
+        }
+        serve_layered(&server, id, stream, connection, deadline).await;
+    }
+    .instrument(span)
+    .await
+}
+
+/// Runs the accept hook; `false` means the connection is dropped.
+fn admit<P, S>(server: &ServerInner<P, S>, connection: &ConnectionInfo) -> bool {
+    let Some(on_accept) = &server.on_accept else {
+        return true;
+    };
+    match catch_panic_sync(|| on_accept(connection)) {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::debug!("connection refused by the accept hook");
+            false
+        }
+        Err(panic) => {
+            tracing::error!(%panic, "accept hook panicked");
+            false
+        }
+    }
 }
 
 /// Wraps `stream` with the stream layers, in the order they were added, then runs the session.
@@ -159,6 +211,7 @@ async fn serve_layered<P: Send + 'static, S: SessionState>(
     id: u64,
     stream: BoxStream,
     connection: ConnectionInfo,
+    deadline: Instant,
 ) {
     let wrapping = async {
         let mut stream = stream;
@@ -167,8 +220,7 @@ async fn serve_layered<P: Send + 'static, S: SessionState>(
         }
         Ok::<_, std::io::Error>(stream)
     };
-    let limit = server.info.options().handshake_timeout;
-    let stream = match tokio::time::timeout(limit, wrapping).await {
+    let stream = match tokio::time::timeout_at(deadline, wrapping).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
             tracing::debug!(%error, "a stream layer refused the connection");
@@ -181,19 +233,20 @@ async fn serve_layered<P: Send + 'static, S: SessionState>(
     };
     let (reader, writer) = tokio::io::split(stream);
     let writer = Box::new(writer);
-    let Some(session) = start(server, id, connection, reader, writer, BytesMut::new()) else {
+    let buffered = BytesMut::new();
+    let Some(session) = start(server, id, connection, reader, writer, buffered, deadline) else {
         return;
     };
     session.await;
 }
 
-/// Applies the socket settings to an accepted connection and gives it an id and a span. `None`
-/// when the connection is already gone.
+/// Applies the socket settings to an accepted connection and gives it an id, a span and the
+/// deadline for becoming a session. `None` when the connection is already gone.
 fn accept<P, S>(
     server: &ServerInner<P, S>,
     stream: &TcpStream,
     listener: &Listener,
-) -> Option<(u64, tracing::Span, ConnectionInfo)> {
+) -> Option<(u64, tracing::Span, ConnectionInfo, Instant)> {
     let (Ok(remote_addr), Ok(local_addr)) = (stream.peer_addr(), stream.local_addr()) else {
         return None;
     };
@@ -206,23 +259,28 @@ fn accept<P, S>(
     }
     let id = server.next_session_id.fetch_add(1, Ordering::Relaxed);
     let span = tracing::debug_span!("session", id, remote = %remote_addr);
-    Some((id, span, ConnectionInfo::new(remote_addr, local_addr)))
+    let deadline = Instant::now() + server.info.options().handshake_timeout;
+    Some((
+        id,
+        span,
+        ConnectionInfo::new(remote_addr, local_addr),
+        deadline,
+    ))
 }
 
 /// Reads the PROXY protocol header where the listener expects one, and records what it says.
 /// Returns the bytes read past it, or `None` when the connection must be dropped.
-async fn read_proxy_header<P, S>(
-    server: &ServerInner<P, S>,
+async fn read_proxy_header(
     listener: &Listener,
     stream: &mut TcpStream,
     connection: &mut ConnectionInfo,
+    deadline: Instant,
 ) -> Option<BytesMut> {
     if !listener.options.proxy_protocol {
         return Some(BytesMut::new());
     }
-    let limit = server.info.options().handshake_timeout;
     let header = proxy_protocol::read_header(stream, connection.remote_addr);
-    match tokio::time::timeout(limit, header).await {
+    match tokio::time::timeout_at(deadline, header).await {
         Ok(Ok((info, rest))) => {
             connection.set_proxy(info);
             tracing::Span::current()
@@ -249,6 +307,7 @@ fn start<P, S, R>(
     reader: R,
     writer: Box<dyn AsyncWrite + Send + Unpin>,
     buffered: BytesMut,
+    deadline: Instant,
 ) -> Option<impl Future<Output = ()> + use<P, S, R>>
 where
     P: Send + 'static,
@@ -268,14 +327,28 @@ where
         receive_buffer_size: options.receive_buffer_size,
     };
     let packages = PackageReader::with_buffered(reader, filter, read_options, buffered);
+    let state = match catch_panic_sync(|| (server.session_factory)(&connection)) {
+        Ok(state) => state,
+        Err(panic) => {
+            tracing::error!(%panic, "creating the session state panicked");
+            return None;
+        }
+    };
     let session = Session::new(
         id,
         connection,
+        state,
         !server.handshake_required,
         server.shutdown.child_token(),
         server.info.clone(),
     );
-    Some(run_session(server.clone(), session, packages, writer))
+    Some(run_session(
+        server.clone(),
+        session,
+        packages,
+        writer,
+        deadline,
+    ))
 }
 
 /// Makes sure a session never outlives its connection task, even if the task unwinds: the writer
@@ -298,6 +371,7 @@ async fn run_session<P, S, R>(
     session: Session<S>,
     mut packages: PackageReader<R, P>,
     writer: Box<dyn AsyncWrite + Send + Unpin>,
+    deadline: Instant,
 ) where
     P: Send + 'static,
     S: SessionState,
@@ -323,7 +397,7 @@ async fn run_session<P, S, R>(
         connected = true;
     }
 
-    let reason = read_loop(&server, &session, &mut packages, &mut connected).await;
+    let reason = read_loop(&server, &session, &mut packages, &mut connected, deadline).await;
     session.close(reason);
     let reason = session.close_reason();
 
@@ -417,6 +491,7 @@ async fn read_loop<P, S, R>(
     session: &Session<S>,
     packages: &mut PackageReader<R, P>,
     connected: &mut bool,
+    deadline: Instant,
 ) -> CloseReason
 where
     P: Send + 'static,
@@ -427,7 +502,7 @@ where
     let close_token = session.close_token().clone();
     if !*connected {
         // Boxed, so that the read loop of every session does not carry the handshake's state.
-        if let Err(reason) = Box::pin(handshake(server, session, packages)).await {
+        if let Err(reason) = Box::pin(handshake(server, session, packages, deadline)).await {
             return reason;
         }
         connect(server, session).await;
@@ -474,11 +549,12 @@ where
 }
 
 /// Handles packages one at a time until the session completes its handshake. Fails with the
-/// reason to close the session when it ends first or the handshake timeout passes.
+/// reason to close the session when it ends first or `deadline` passes.
 async fn handshake<P, S, R>(
     server: &ServerInner<P, S>,
     session: &Session<S>,
     packages: &mut PackageReader<R, P>,
+    deadline: Instant,
 ) -> Result<(), CloseReason>
 where
     P: Send + 'static,
@@ -486,7 +562,7 @@ where
     R: AsyncRead + Unpin,
 {
     let close_token = session.close_token();
-    let mut timeout = pin!(tokio::time::sleep(server.info.options().handshake_timeout));
+    let mut timeout = pin!(tokio::time::sleep_until(deadline));
     loop {
         if session.is_handshake_complete() {
             return Ok(());

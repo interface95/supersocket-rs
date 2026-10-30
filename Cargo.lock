@@ -797,6 +797,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "supersocket-bench"
+version = "0.1.0"
+dependencies = [
+ "socket2",
+ "tokio",
+]
+
+[[package]]
 name = "supersocket-client"
 version = "0.1.0"
 dependencies = [
@@ -827,6 +835,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "thiserror",
+ "tokio-util",
 ]
 
 [[package]]
@@ -854,9 +863,11 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "supersocket-client",
+ "supersocket-connection",
  "supersocket-proto",
  "supersocket-server",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1012,6 +1023,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "futures-util",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]

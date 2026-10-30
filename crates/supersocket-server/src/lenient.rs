@@ -84,6 +84,17 @@ pub(crate) fn u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::
     u32::try_from(value).map_err(|_| D::Error::custom(format!("{value} is too large")))
 }
 
+pub(crate) fn option_usize<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error> {
+    Option::<Scalar>::deserialize(deserializer)?
+        .map(|scalar| {
+            let value = unsigned_from(scalar)?;
+            usize::try_from(value).map_err(|_| D::Error::custom(format!("{value} is too large")))
+        })
+        .transpose()
+}
+
 pub(crate) fn option_u32<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<u32>, D::Error> {

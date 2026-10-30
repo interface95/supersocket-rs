@@ -28,6 +28,8 @@ pub use error::ProtocolError;
 pub use filter::{
     BoxFilter, PackageEncoder, PipelineFilter, PipelineFilterExt, SwitchAfterPackage,
 };
+#[cfg(feature = "codec")]
+pub use filters::CodecFilter;
 pub use filters::{
     BeginEndMarkFilter, CommandLineFilter, Decoder, FixedHeaderFilter, FixedHeaderProtocol,
     FixedSizeFilter, LineFilter, TerminatorFilter, TransparentFilter,

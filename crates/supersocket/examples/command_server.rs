@@ -20,7 +20,7 @@ impl AsyncCommand<CommandPackage> for Add {
 
     async fn execute(&self, session: &Session, package: CommandPackage) -> HandlerResult {
         let mut sum = 0i64;
-        for arg in &package.args {
+        for arg in package.args() {
             sum += arg.parse::<i64>()?;
         }
         session.send(format!("{sum}\r\n")).await?;
@@ -37,7 +37,7 @@ impl AsyncCommand<CommandPackage> for Mult {
 
     async fn execute(&self, session: &Session, package: CommandPackage) -> HandlerResult {
         let mut product = 1i64;
-        for arg in &package.args {
+        for arg in package.args() {
             product *= arg.parse::<i64>()?;
         }
         session.send(format!("{product}\r\n")).await?;

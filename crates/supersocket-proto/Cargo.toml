@@ -9,9 +9,17 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+## `CodecFilter`, which runs a `tokio_util::codec::Decoder` as a pipeline filter.
+codec = ["dep:tokio-util"]
+
 [dependencies]
 bytes.workspace = true
 thiserror.workspace = true
+tokio-util = { workspace = true, features = ["codec"], optional = true }
 
 [lints]
 workspace = true

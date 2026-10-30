@@ -65,7 +65,9 @@ impl fmt::Display for CloseReason {
     }
 }
 
-/// Per-session state, created with `Default` for every new session.
+/// Per-session state, created for every new session: with `Default` by
+/// [`ServerBuilder::session`](crate::ServerBuilder::session), or from the connection by
+/// [`ServerBuilder::session_with`](crate::ServerBuilder::session_with).
 ///
 /// Its fields are reachable directly on [`Session`], which dereferences to it. Fields are shared
 /// between tasks, so use interior mutability such as `Mutex` or atomics. The hooks run when the
@@ -86,7 +88,7 @@ impl fmt::Display for CloseReason {
 ///     }
 /// }
 /// ```
-pub trait SessionState: Default + Send + Sync + 'static {
+pub trait SessionState: Sized + Send + Sync + 'static {
     /// Called after the session is registered, before its first package is handled. On a server
     /// that requires a handshake, called once the handshake is complete instead.
     fn on_connected(_session: &Session<Self>) -> impl Future<Output = ()> + Send {
@@ -217,6 +219,16 @@ impl<S> Deref for Session<S> {
     }
 }
 
+/// Sessions are equal when they are the same session. To keep sessions in a set or a map, such
+/// as the members of a room, key them by [`id`](Session::id).
+impl<S> PartialEq for Session<S> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl<S> Eq for Session<S> {}
+
 impl<S> fmt::Debug for Session<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Session")
@@ -231,6 +243,7 @@ impl<S: SessionState> Session<S> {
     pub(crate) fn new(
         id: u64,
         connection: ConnectionInfo,
+        state: S,
         handshake_complete: bool,
         close_token: CancellationToken,
         server: Arc<ServerInfo<S>>,
@@ -249,7 +262,7 @@ impl<S: SessionState> Session<S> {
                 close_reason: OnceLock::new(),
                 extensions: Extensions::default(),
                 server,
-                state: S::default(),
+                state,
             }),
         }
     }
@@ -259,6 +272,11 @@ impl<S> Session<S> {
     /// Unique id of the session within its server.
     pub fn id(&self) -> u64 {
         self.inner.id
+    }
+
+    /// The per-session state, which the session also dereferences to.
+    pub fn state(&self) -> &S {
+        &self.inner.state
     }
 
     /// Address of the peer. On a listener that reads PROXY protocol headers it is the client's
@@ -323,9 +341,22 @@ impl<S> Session<S> {
 
     /// Queues `data` to be sent. Data from concurrent calls is never interleaved. When more than
     /// [`send_buffer_limit`](crate::ServerOptions::send_buffer_limit) bytes are already waiting,
-    /// this waits until the writer has taken them. Fails once the session is closing.
+    /// this waits until the writer has taken them. Fails once the session has stopped sending,
+    /// which happens after it closed and its last data was queued.
     pub async fn send(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
         self.inner.send_queue.send(data.as_ref()).await
+    }
+
+    /// Queues `data` without waiting: fails with [`ErrorKind::WouldBlock`](io::ErrorKind::WouldBlock)
+    /// while the send buffer limit is reached. For broadcasts, where a session that reads slowly
+    /// should be skipped rather than hold up the others.
+    pub fn try_send(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
+        self.inner.send_queue.try_send(data.as_ref())
+    }
+
+    /// Queues `parts` back to back as one piece without waiting, like [`try_send`](Self::try_send).
+    pub fn try_send_vectored(&self, parts: &[&[u8]]) -> io::Result<()> {
+        self.inner.send_queue.try_send_vectored(parts)
     }
 
     /// Queues `parts` back to back as one piece, like [`send`](Self::send) with the parts joined,
@@ -454,6 +485,19 @@ impl<S> SessionContainer<S> {
     /// A snapshot of all sessions.
     pub fn all(&self) -> Vec<Session<S>> {
         self.sessions.read().unwrap().values().cloned().collect()
+    }
+
+    /// Runs `f` on every session without taking a snapshot. `f` runs while the container is
+    /// locked, so it must be quick, must not wait, and must not call back into the container
+    /// (such as [`get`](Self::get), [`find`](Self::find) or [`all`](Self::all)), which would
+    /// deadlock. Sending through a session is fine: for broadcasts, pair it with
+    /// [`Session::try_send`], which skips sessions whose send buffer is full. For anything that
+    /// needs to look sessions up, take a snapshot with [`all`](Self::all) or [`find`](Self::find)
+    /// first.
+    pub fn for_each(&self, mut f: impl FnMut(&Session<S>)) {
+        for session in self.sessions.read().unwrap().values() {
+            f(session);
+        }
     }
 
     pub(crate) fn add(&self, session: Session<S>) {

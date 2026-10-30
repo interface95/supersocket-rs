@@ -29,6 +29,9 @@
 mod client;
 mod filter;
 mod frame;
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing;
 mod handshake;
 mod message;
 mod server;
@@ -37,7 +40,7 @@ mod session;
 #[cfg(feature = "client")]
 pub use client::{WebSocketClient, WebSocketClientBuilder, WebSocketSender};
 pub use filter::WebSocketPackage;
-pub use handshake::{HandshakeRequest, Rejection};
+pub use handshake::{Accept, HandshakeRequest, Rejection};
 pub use message::{CloseCode, CloseFrame, Message};
 pub use server::{WebSocketBuilder, WebSocketServer, WebSocketState};
 pub use session::WebSocketSession;

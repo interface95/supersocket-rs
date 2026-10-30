@@ -18,7 +18,11 @@ impl<P> BeginEndMarkFilter<P> {
     /// # Panics
     ///
     /// Panics if either mark is empty.
-    pub fn new(begin: impl Into<Bytes>, end: impl Into<Bytes>, decoder: Decoder<P>) -> Self {
+    pub fn new(
+        begin: impl Into<Bytes>,
+        end: impl Into<Bytes>,
+        decoder: impl FnMut(Bytes) -> Result<P, ProtocolError> + Send + 'static,
+    ) -> Self {
         let (begin, end) = (begin.into(), end.into());
         assert!(
             !begin.is_empty() && !end.is_empty(),
@@ -27,7 +31,7 @@ impl<P> BeginEndMarkFilter<P> {
         Self {
             begin,
             end,
-            decoder,
+            decoder: Box::new(decoder),
             searched: 0,
         }
     }

@@ -157,6 +157,26 @@ impl HandshakeRequest {
     }
 }
 
+/// The acceptance of a WebSocket handshake, optionally with header fields for the response,
+/// such as a cookie that binds the connection to a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Accept {
+    pub(crate) headers: Vec<(String, String)>,
+}
+
+impl Accept {
+    /// Accepts without extra header fields.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a header field to the response.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+}
+
 /// An HTTP error response that refuses a WebSocket handshake.
 ///
 /// ```
@@ -313,7 +333,7 @@ fn is_valid_key(key: &str) -> bool {
 }
 
 /// The server's answer accepting a handshake.
-pub(crate) fn accept_response(key: &str, protocol: Option<&str>) -> String {
+pub(crate) fn accept_response(key: &str, protocol: Option<&str>, extra: &Accept) -> String {
     let mut response = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Accept: {}\r\n",
@@ -321,6 +341,9 @@ pub(crate) fn accept_response(key: &str, protocol: Option<&str>) -> String {
     );
     if let Some(protocol) = protocol {
         push_header(&mut response, "Sec-WebSocket-Protocol", protocol);
+    }
+    for (name, value) in &extra.headers {
+        push_header(&mut response, name, value);
     }
     response.push_str("\r\n");
     response

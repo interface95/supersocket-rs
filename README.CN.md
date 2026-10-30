@@ -53,7 +53,7 @@ async fn main() -> Result<(), supersocket::Error> {
 
 ```toml
 [dependencies]
-supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # 可选 feature："tls"、"config"、"client"、"proxy"、"websocket"、"gzip"
+supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # 可选 feature："tls"、"config"、"client"、"proxy"、"websocket"、"gzip"、"codec"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -111,6 +111,9 @@ Server::builder(FixedHeaderFilter::<MessageProtocol>::default)
 
 其他协议直接实现 `PipelineFilter`。在 `next_filter` 里返回另一个过滤器，连接就会切换过去，协议升级就是这么做的。
 
+内置过滤器的解码函数可以是带状态的闭包，比如带一个文本编码。启用 `codec` feature 后，`CodecFilter` 能把任何
+`tokio_util::codec::Decoder`（比如 `LengthDelimitedCodec`）当协议过滤器用。
+
 ### 命令和命令过滤器
 
 ```rust
@@ -123,7 +126,7 @@ impl AsyncCommand<CommandPackage> for Add {
 
     async fn execute(&self, session: &Session, package: CommandPackage) -> HandlerResult {
         let mut sum = 0i64;
-        for arg in &package.args {
+        for arg in package.args() {
             sum += arg.parse::<i64>()?;
         }
         session.send(format!("{sum}\r\n")).await?;
@@ -170,6 +173,17 @@ Server::builder(CommandLineFilter::default)
 用 `.service(value)` 注册的共享服务，可以通过 `session.server().service::<T>()` 取到。为会话 spawn 的任务可以等待
 `session.closed()`，在会话关闭时一起结束。
 
+广播不该等最慢的那个客户端：`try_send` 有空间就入队，没有就返回 `WouldBlock`；`for_each` 遍历会话时不做快照：
+
+```rust
+session.server().sessions().for_each(|other| {
+    let _ = other.try_send(&line); // 不再读数据的客户端会被跳过
+});
+```
+
+会话状态可以用 `.session::<S>()` 按 `Default` 创建，也可以用 `.session_with(|connection| S { .. })`
+根据连接信息（地址、TLS 客户端证书等）创建。
+
 ### 包处理、错误和超时
 
 ```rust
@@ -189,12 +203,27 @@ Server::builder(LineFilter::default)
 
 默认每个会话的包按顺序一个一个处理。并发模式下，一个会话最多同时有 `max_in_flight` 个包在运行时的工作线程上处理。
 
+### 接受连接、上限和关闭
+
+```rust
+Server::builder(LineFilter::default)
+    .on_accept(|connection| !banned(connection.remote_addr().ip())) // 在 TLS 之前，几乎不花代价
+    .configure(|options| {
+        options.max_connections = Some(10_000); // 到上限后暂停接受新连接
+        options.handshake_timeout = Duration::from_secs(10); // 从接受到连上的总时限
+    })
+```
+
+`handshake_timeout` 覆盖从接受连接到会话连上之间的全部步骤：PROXY protocol 头、TLS 握手、流包装层和协议握手。
+滚动重启时，`stop_accepting()` 先关掉监听器、让已有会话继续跑完；`run_until(signal)` 让服务端运行到你自己的
+future 完成为止，而不是只能等 Ctrl+C 或 SIGTERM。`Server` 实现了 `Clone`，别的任务可以拿着句柄做这些事。
+
 ### 客户端
 
 开启 `client` feature。`EasyClient` 用协议过滤器把服务端发来的数据切成包，和服务端用的是同一套过滤器：
 
 ```rust
-let mut client = EasyClient::builder(LineFilter::default())
+let mut client = EasyClient::builder(LineFilter::default)
     .connect("127.0.0.1:4040")
     .await?;
 client.send("hello\r\n").await?;
@@ -215,7 +244,7 @@ sender.close().await; // 先把队列里的数据发完，最多等 close_timeou
 连接由一串连接器建立，对应 SuperSocket 的 `IConnector`：第一个负责打开连接，后面的依次往外包一层。
 
 ```rust
-EasyClient::builder(LineFilter::default())
+EasyClient::builder(LineFilter::default)
     .proxy(Socks5Proxy::new("127.0.0.1:1080").credentials("user", "secret")) // 需要 "proxy" feature
     .tls(TlsConnector::new()) // 需要 "tls" feature，默认用 Mozilla 根证书校验
     .connect("example.com:443")
@@ -225,23 +254,25 @@ EasyClient::builder(LineFilter::default())
 `HttpProxy`（CONNECT 方法）和 `Socks4Proxy`（主机名用 SOCKS4a）用法一样；任何实现了 `Connector` 的类型都可以通过
 `.connector(...)` 加进来。
 
+`ClientBuilder` 可以留着、也可以克隆，用来重连或者做连接池；协议过滤器每次连接单独创建。
+
 ### WebSocket
 
 启用 `websocket` feature。WebSocket 服务端跑在同一个核心上：第一个协议过滤器读 HTTP 升级请求，读完切换到帧过滤器；
 握手完成后会话才算连上，所以广播不会发到还在升级的连接上。监听器配了 TLS 就是 `wss://`。
 
 ```rust
-use supersocket::websocket::{Rejection, WebSocketServer};
+use supersocket::websocket::{Accept, Rejection, WebSocketServer};
 
 WebSocketServer::builder()
     .subprotocols(["chat.v1"])
     .on_handshake(async |session| match session.request().query() {
-        Some("token=secret") => Ok(()),
+        Some("token=secret") => Ok(Accept::new()),
         _ => Err(Rejection::new(401, "log in first")),
     })
     .on_message(async |session, message| {
         for other in session.sessions() {
-            let _ = other.send(&message).await; // 广播
+            let _ = other.try_send(&message); // 广播，读得慢的客户端会被跳过
         }
         Ok(())
     })
@@ -252,7 +283,14 @@ WebSocketServer::builder()
 ```
 
 `session.close(CloseCode::NORMAL, "bye")` 发起关闭握手；服务端关闭时会给每个客户端发 1001（going away）。
-`max_package_length` 同时限制单帧大小和分片拼接后的消息大小。
+`max_package_length` 同时限制单帧大小和分片拼接后的消息大小。`ping_interval` 定时给每个客户端发 ping，
+`pong_timeout` 关掉一直没有回应的连接，这样对端消失了也能及时发现：
+
+```rust
+WebSocketServer::builder()
+    .ping_interval(Duration::from_secs(30))
+    .pong_timeout(Duration::from_secs(90))
+```
 
 再启用 `client` feature，就可以用 `WebSocketClient`。它和 `EasyClient` 用同一套连接器，所以代理和 `wss://` 的用法也一样：
 
@@ -260,7 +298,7 @@ WebSocketServer::builder()
 let mut client = WebSocketClient::connect("wss://example.com/chat").await?;
 client.send_text("hello").await?;
 let reply = client.receive().await?; // Some(Message)，连接关闭后返回 None
-client.close(CloseCode::NORMAL, "done").await;
+client.close(CloseCode::NORMAL, "done").await?;
 ```
 
 WebSocket 服务端用到的两个核心功能，别的协议也能用：一是 `PackageHandler` 类型，它的 `closing` 钩子可以在关闭前排一条告别消息；
@@ -305,7 +343,7 @@ impl<S: SessionState> Middleware<S> for ConnectionLimit {
 })
 ```
 
-TLS 握手在每个连接自己的任务里进行，慢客户端不会拖住接受新连接。
+TLS 握手在每个连接自己的任务里进行，慢客户端不会拖住接受新连接；它和建立连接的其他步骤一起受 `handshake_timeout` 限制。
 
 要求客户端出示证书时，配上签发客户端证书的 CA；会话里可以拿到客户端发来的证书：
 
@@ -355,7 +393,7 @@ while let Ok((stream, _)) = listener.accept().await {
 
 ```rust
 Server::builder(LineFilter::default).stream_layer(GzipLayer)
-EasyClient::builder(LineFilter::default()).connector(GzipConnector)
+EasyClient::builder(LineFilter::default).connector(GzipConnector)
 ```
 
 自己的包装层（比如流量统计、其他加密）实现 `StreamLayer` 即可。
@@ -402,6 +440,8 @@ Server::builder(LineFilter::default).options(options)
 
 这组数据来自同一核心的原型。之后空闲会话不再保留读写缓冲区，每个空闲连接的内存又降了一半多（本机实测从 6.4 KB 降到
 约 3 KB）。回显只衡量框架本身的开销，实际应用的大部分时间花在别处。
+
+压测工具在 [`tools/bench`](tools/bench)，里面有复现这些数字的步骤。
 
 ## 路线图
 

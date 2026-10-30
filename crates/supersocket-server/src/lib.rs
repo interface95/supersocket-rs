@@ -28,6 +28,9 @@ mod config;
 mod connection;
 mod error;
 mod extensions;
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing;
 mod layer;
 mod lenient;
 mod middleware;
@@ -49,7 +52,9 @@ pub use layer::StreamLayer;
 pub use middleware::Middleware;
 pub use options::{ListenOptions, PackageHandling, ServerOptions, TlsOptions};
 pub use proxy_protocol::{ProxyCommand, ProxyInfo};
-pub use server::{ErrorAction, PackageError, PackageHandler, Server, ServerBuilder, ServerInfo};
+pub use server::{
+    ErrorAction, PackageError, PackageHandler, Server, ServerBuilder, ServerInfo, shutdown_signal,
+};
 pub use session::{CloseReason, ConnectionInfo, Session, SessionContainer, SessionState};
 pub use supersocket_connection::{BoxStream, Stream};
 #[cfg(feature = "tls")]

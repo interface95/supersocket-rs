@@ -42,7 +42,7 @@ impl KeyedPackage for CommandPackage {
 ///
 ///     async fn execute(&self, session: &Session, package: CommandPackage) -> HandlerResult {
 ///         let mut sum = 0i64;
-///         for arg in &package.args {
+///         for arg in package.args() {
 ///             sum += arg.parse::<i64>()?;
 ///         }
 ///         session.send(format!("{sum}\r\n")).await?;
@@ -91,8 +91,9 @@ pub trait CommandFilter<P: KeyedPackage, S = ()>: Send + Sync + 'static {
 /// Extension methods for [`AsyncCommand`].
 pub trait AsyncCommandExt<P: KeyedPackage, S>: AsyncCommand<P, S> + Sized {
     /// Runs `filter` around this command only.
-    fn with_filter<F: CommandFilter<P, S>>(self, filter: F) -> Filtered<Self, F> {
+    fn with_filter<F: CommandFilter<P, S>>(self, filter: F) -> Filtered<Self, F, P::Key> {
         Filtered {
+            key: self.key(),
             command: self,
             filter,
         }
@@ -102,12 +103,14 @@ pub trait AsyncCommandExt<P: KeyedPackage, S>: AsyncCommand<P, S> + Sized {
 impl<P: KeyedPackage, S, C: AsyncCommand<P, S>> AsyncCommandExt<P, S> for C {}
 
 /// A command with a filter of its own, created by [`AsyncCommandExt::with_filter`].
-pub struct Filtered<C, F> {
+pub struct Filtered<C, F, K> {
     command: C,
     filter: F,
+    /// The command's key, asked for once instead of for every package.
+    key: K,
 }
 
-impl<P, S, C, F> AsyncCommand<P, S> for Filtered<C, F>
+impl<P, S, C, F> AsyncCommand<P, S> for Filtered<C, F, P::Key>
 where
     P: KeyedPackage,
     S: SessionState,
@@ -115,16 +118,15 @@ where
     F: CommandFilter<P, S>,
 {
     fn key(&self) -> P::Key {
-        self.command.key()
+        self.key.clone()
     }
 
     async fn execute(&self, session: &Session<S>, package: P) -> HandlerResult {
         if !self.filter.on_executing(session, &package).await {
             return Ok(());
         }
-        let key = self.command.key();
         let result = self.command.execute(session, package).await;
-        self.filter.on_executed(session, &key, &result).await;
+        self.filter.on_executed(session, &self.key, &result).await;
         result
     }
 }
@@ -212,7 +214,7 @@ impl<P: KeyedPackage, S: SessionState> Commands<P, S> {
     }
 
     async fn dispatch(&self, session: Session<S>, package: P) -> HandlerResult {
-        let Some(command) = self.commands.get(package.key()) else {
+        let Some((key, command)) = self.commands.get_key_value(package.key()) else {
             return match &self.unknown {
                 Some(handler) => handler(session, package).await,
                 None => {
@@ -229,10 +231,9 @@ impl<P: KeyedPackage, S: SessionState> Commands<P, S> {
                 return Ok(());
             }
         }
-        let key = package.key().clone();
         let result = command.execute(&session, package).await;
         for filter in self.filters.iter().rev() {
-            filter.on_executed(&session, &key, &result).await;
+            filter.on_executed(&session, key, &result).await;
         }
         result
     }

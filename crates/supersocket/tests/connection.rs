@@ -3,7 +3,7 @@
 mod common;
 
 use std::{
-    net::{Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     time::{Duration, Instant},
 };
 
@@ -142,10 +142,15 @@ async fn listener_socket_settings_reach_accepted_connections() {
     let (settings, mut observed) = mpsc::unbounded_channel();
     let builder = address_echo().configure_socket(move |stream| {
         let socket = socket2::SockRef::from(stream);
+        // Windows has no way to read the keepalive time back.
+        #[cfg(not(windows))]
+        let keepalive_time = Some(socket.tcp_keepalive_time().unwrap());
+        #[cfg(windows)]
+        let keepalive_time: Option<Duration> = None;
         let _ = settings.send((
             stream.nodelay().unwrap(),
             socket.keepalive().unwrap(),
-            socket.tcp_keepalive_time().unwrap(),
+            keepalive_time,
             socket.recv_buffer_size().unwrap(),
         ));
     });
@@ -161,8 +166,37 @@ async fn listener_socket_settings_reach_accepted_connections() {
         timeout(WAIT, observed.recv()).await.unwrap().unwrap();
     assert!(no_delay);
     assert!(keepalive);
-    assert_eq!(keepalive_time, Duration::from_secs(42));
+    assert!(keepalive_time.is_none_or(|time| time == Duration::from_secs(42)));
     // Smaller than the systems' defaults; Linux reports twice the size it was given.
     assert!(receive_buffer <= 2 * 32 * 1024, "{receive_buffer}");
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_accept_hook_sees_the_client_behind_the_proxy() {
+    let banned: IpAddr = "203.0.113.9".parse().unwrap();
+    let (seen, mut accepted) = mpsc::unbounded_channel();
+    let (server, address) = start_on(
+        address_echo().on_accept(move |connection| {
+            let _ = seen.send(connection.remote_addr());
+            connection.remote_addr().ip() != banned
+        }),
+        behind_proxy(),
+    );
+    let mut refused = Client::connect(address).await;
+    refused
+        .send(b"PROXY TCP4 203.0.113.9 192.0.2.1 51000 4040\r\nhello\r\n")
+        .await;
+    refused.expect_closed().await;
+    assert_eq!(
+        timeout(WAIT, accepted.recv()).await.unwrap().unwrap(),
+        "203.0.113.9:51000".parse().unwrap()
+    );
+
+    let mut welcome = Client::connect(address).await;
+    welcome
+        .send(b"PROXY TCP4 203.0.113.7 192.0.2.1 51001 4040\r\nhello\r\n")
+        .await;
+    assert_eq!(welcome.line().await, "203.0.113.7:51001 v1 hello");
     server.shutdown().await;
 }

@@ -2,14 +2,19 @@
 
 mod common;
 
-use std::{net::SocketAddr, sync::atomic::AtomicUsize, sync::atomic::Ordering, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
+};
 
 use common::WAIT;
 use futures_util::{SinkExt, StreamExt};
 use supersocket::{
     CloseReason,
     websocket::{
-        CloseCode, CloseFrame, Rejection, WebSocketBuilder, WebSocketServer, WebSocketSession,
+        Accept, CloseCode, CloseFrame, Rejection, WebSocketBuilder, WebSocketServer,
+        WebSocketSession,
     },
 };
 use tokio::{
@@ -29,7 +34,7 @@ use tokio_tungstenite::{
 
 type Tungstenite = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-fn start<S: Default + Send + Sync + 'static>(
+fn start<S: Send + Sync + 'static>(
     builder: WebSocketBuilder<S>,
 ) -> (WebSocketServer<S>, SocketAddr) {
     let server = builder.listen("127.0.0.1:0").build().unwrap();
@@ -158,7 +163,7 @@ async fn server_initiated_close_waits_for_the_answer() {
     let (builder, mut closes) = track_closes(WebSocketServer::builder().on_message(
         async |session, message| {
             if message.as_text() == Some("close") {
-                session.close(CloseCode::new(4000), "done").await;
+                session.close(CloseCode::new(4000), "done")?;
                 // Nothing may follow the close frame.
                 assert!(session.send_text("late").await.is_err());
             }
@@ -196,7 +201,7 @@ async fn handshakes_can_be_rejected_and_connected_sessions_greeted() {
     let (server, address) = start(
         echo()
             .on_handshake(async |session| match session.request().query() {
-                Some("token=secret") => Ok(()),
+                Some("token=secret") => Ok(Accept::new()),
                 _ => Err(Rejection::new(403, "wrong token")),
             })
             .on_connected(move |session| {
@@ -278,8 +283,9 @@ async fn sessions_carry_their_own_state() {
 async fn broadcasts_skip_connections_still_upgrading() {
     let (server, address) = start(WebSocketServer::builder().on_message(
         async |session, message| {
+            // Non-blocking: a client that reads slowly does not hold up the others.
             for other in session.sessions() {
-                let _ = other.send(&message).await;
+                let _ = other.try_send(&message);
             }
             Ok(())
         },
@@ -485,5 +491,101 @@ async fn handshakes_beyond_the_maximum_size_get_an_http_error() {
     stream.write_all(request.as_bytes()).await.unwrap();
     let response = read_head(&mut stream).await;
     assert!(response.starts_with("HTTP/1.1 431 "), "{response}");
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn silent_clients_are_pinged_then_closed() {
+    let (server, address) = start(
+        echo()
+            .ping_interval(Duration::from_millis(100))
+            .pong_timeout(Duration::from_millis(400)),
+    );
+
+    // A client that never answers is pinged and then closed with 1001. Reading until the close
+    // frame tolerates however the pings and the close interleave under load.
+    let mut silent = RawClient::connect(address).await;
+    let mut pinged = false;
+    let code = timeout(WAIT, async {
+        loop {
+            let (first, payload) = silent.receive().await;
+            match first {
+                0x89 => pinged = true,
+                0x88 => return u16::from_be_bytes([payload[0], payload[1]]),
+                other => panic!("unexpected frame 0x{other:02x}"),
+            }
+        }
+    })
+    .await
+    .expect("the silent client was not closed");
+    assert!(pinged, "the server never pinged the client");
+    assert_eq!(code, 1001);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clients_that_answer_pings_stay_connected() {
+    let pong_timeout = Duration::from_millis(300);
+    let (server, address) = start(
+        echo()
+            .ping_interval(Duration::from_millis(50))
+            .pong_timeout(pong_timeout),
+    );
+    let mut client = RawClient::connect(address).await;
+
+    // Answer every ping with a pong for well over the pong timeout.
+    let until = Instant::now() + pong_timeout * 3;
+    while Instant::now() < until {
+        let (first, payload) = client.receive().await;
+        if first == 0x89 {
+            client.send(0x8a, &payload, true).await; // a masked pong
+        }
+    }
+
+    // Still connected: a message is echoed.
+    client.send(0x81, b"alive", true).await; // a masked text frame
+    let (first, payload) = client.receive().await;
+    assert_eq!(first, 0x81, "a text frame");
+    assert_eq!(payload, b"alive");
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accepted_handshakes_can_add_response_headers() {
+    let (server, address) =
+        start(echo().on_handshake(async |_session| {
+            Ok(Accept::new().header("Set-Cookie", "sid=1; HttpOnly"))
+        }));
+    let (mut ws, response) = connect_async(format!("ws://{address}/")).await.unwrap();
+    assert_eq!(response.headers()["set-cookie"], "sid=1; HttpOnly");
+    ws.close(None).await.unwrap();
+    server.shutdown().await;
+}
+
+struct Origin {
+    from: SocketAddr,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_state_can_come_from_the_connection() {
+    let (server, address) = start(
+        WebSocketServer::builder()
+            .session_with(|connection| Origin {
+                from: connection.remote_addr(),
+            })
+            .on_message(async |session: WebSocketSession<Origin>, _message| {
+                session.send_text(&session.from.to_string()).await?;
+                Ok(())
+            }),
+    );
+    let mut ws = connect(address).await;
+    ws.send(tungstenite::Message::text("who am I"))
+        .await
+        .unwrap();
+    let reply = next(&mut ws).await;
+    assert!(
+        reply.to_text().unwrap().starts_with("127.0.0.1:"),
+        "{reply}"
+    );
     server.shutdown().await;
 }

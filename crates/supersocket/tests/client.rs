@@ -25,7 +25,7 @@ fn echo_lines() -> ServerBuilder<TextPackage> {
 }
 
 async fn connect(address: SocketAddr) -> EasyClient<TextPackage> {
-    EasyClient::builder(LineFilter::default())
+    EasyClient::builder(LineFilter::default)
         .connect(address)
         .await
         .unwrap()
@@ -119,7 +119,7 @@ async fn close_gives_up_on_a_server_that_stops_reading() {
     let accepting = tokio::spawn(async move { listener.accept().await.unwrap() });
 
     let close_timeout = Duration::from_millis(200);
-    let client = EasyClient::builder(LineFilter::default())
+    let client = EasyClient::builder(LineFilter::default)
         .configure(|options| options.close_timeout = close_timeout)
         .connect(address)
         .await
@@ -151,7 +151,7 @@ async fn receive_ends_after_an_error() {
     let (server, address) = start(echo_lines().on_connected(async |session| {
         let _ = session.send("a line longer than the client allows").await;
     }));
-    let mut client = EasyClient::builder(LineFilter::default())
+    let mut client = EasyClient::builder(LineFilter::default)
         .configure(|options| options.max_package_length = 8)
         .connect(address)
         .await
@@ -296,7 +296,7 @@ async fn client_and_server_share_protocol_code() {
             },
         ),
     );
-    let mut client = EasyClient::builder(FixedHeaderFilter::<LengthPrefixed>::default())
+    let mut client = EasyClient::builder(FixedHeaderFilter::<LengthPrefixed>::default)
         .connect(address)
         .await
         .unwrap();
@@ -342,13 +342,13 @@ async fn connecting_fails_for_closed_ports_and_bad_endpoints() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
-    let error = EasyClient::builder(LineFilter::default())
+    let error = EasyClient::builder(LineFilter::default)
         .connect(address)
         .await
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
 
-    let error = EasyClient::builder(LineFilter::default())
+    let error = EasyClient::builder(LineFilter::default)
         .connect("missing-port")
         .await
         .unwrap_err();
