@@ -9,6 +9,7 @@ pub struct BeginEndMarkFilter<P> {
     begin: Bytes,
     end: Bytes,
     decoder: Decoder<P>,
+    searched: usize,
 }
 
 impl<P> BeginEndMarkFilter<P> {
@@ -27,6 +28,7 @@ impl<P> BeginEndMarkFilter<P> {
             begin,
             end,
             decoder,
+            searched: 0,
         }
     }
 }
@@ -44,13 +46,26 @@ impl<P: Send + 'static> PipelineFilter for BeginEndMarkFilter<P> {
         if buf.len() < self.begin.len() {
             return Ok(None);
         }
-        let Some(position) = find(&buf[self.begin.len()..], &self.end) else {
+        // Skip the part of the body earlier calls already searched, minus enough bytes to catch an
+        // end mark split across two reads, so a package arriving slowly is searched only once.
+        let body = &buf[self.begin.len()..];
+        let start = self
+            .searched
+            .saturating_sub(self.end.len() - 1)
+            .min(body.len());
+        let Some(position) = find(&body[start..], &self.end).map(|found| start + found) else {
+            self.searched = body.len();
             return Ok(None);
         };
+        self.searched = 0;
         let mut package = buf.split_to(self.begin.len() + position + self.end.len());
         package.advance(self.begin.len());
         package.truncate(position);
         (self.decoder)(package.freeze()).map(Some)
+    }
+
+    fn reset(&mut self) {
+        self.searched = 0;
     }
 }
 
@@ -67,6 +82,16 @@ mod tests {
     fn decodes_marked_packages() {
         let packages = feed(&mut filter(), &[b"<<ab>><", b"<c", b"d>>"]);
         assert_eq!(packages, [b"ab".to_vec(), b"cd".to_vec()]);
+    }
+
+    #[test]
+    fn finds_end_marks_split_across_reads_of_a_long_body() {
+        let body = vec![b'x'; 10_000];
+        let mut chunks: Vec<&[u8]> = vec![b"<<"];
+        chunks.extend(body.chunks(1000));
+        chunks.extend([&b">"[..], b">", b"<<y>", b">"]);
+        let packages = feed(&mut filter(), &chunks);
+        assert_eq!(packages, [body, b"y".to_vec()]);
     }
 
     #[test]

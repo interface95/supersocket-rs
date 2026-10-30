@@ -70,7 +70,11 @@ impl<T: FixedHeaderProtocol> PipelineFilter for FixedHeaderFilter<T> {
                     return Ok(None);
                 }
                 let body_length = self.protocol.body_length(&buf[..T::HEADER_SIZE])?;
-                *self.total_size.insert(T::HEADER_SIZE + body_length)
+                // The length comes from the peer, so it must not be trusted to fit.
+                let total_size = T::HEADER_SIZE
+                    .checked_add(body_length)
+                    .ok_or_else(|| ProtocolError::new("package length overflows"))?;
+                *self.total_size.insert(total_size)
             }
         };
         if buf.len() < total_size {
@@ -114,5 +118,28 @@ mod tests {
         let chunks: Vec<&[u8]> = wire.chunks(1).collect();
         let packages = feed(&mut FixedHeaderFilter::<LengthPrefixed>::default(), &chunks);
         assert_eq!(packages, [b"abc".to_vec(), Vec::new(), b"z".to_vec()]);
+    }
+
+    #[derive(Default)]
+    struct HugeLength;
+
+    impl FixedHeaderProtocol for HugeLength {
+        type Package = ();
+        const HEADER_SIZE: usize = 1;
+
+        fn body_length(&self, _header: &[u8]) -> Result<usize, ProtocolError> {
+            Ok(usize::MAX)
+        }
+
+        fn decode(&mut self, _package: Bytes) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn overflowing_lengths_are_protocol_errors() {
+        let mut buf = BytesMut::from(&b"\x01payload"[..]);
+        let result = FixedHeaderFilter::<HugeLength>::default().filter(&mut buf);
+        assert!(result.is_err());
     }
 }
