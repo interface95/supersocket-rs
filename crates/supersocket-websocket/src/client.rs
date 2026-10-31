@@ -148,7 +148,7 @@ impl WebSocketClientBuilder {
             close_sent: Arc::new(AtomicBool::new(false)),
         };
         Ok(WebSocketClient {
-            client,
+            client: Some(client),
             sender,
             protocol,
             close_frame: None,
@@ -188,7 +188,7 @@ impl fmt::Debug for WebSocketClientBuilder {
 /// # }
 /// ```
 pub struct WebSocketClient {
-    client: EasyClient<WebSocketPackage>,
+    client: Option<EasyClient<WebSocketPackage>>,
     sender: WebSocketSender,
     protocol: Option<String>,
     close_frame: Option<CloseFrame>,
@@ -220,8 +220,16 @@ impl WebSocketClient {
     /// an error, after which the connection is closed.
     pub async fn receive(&mut self) -> Result<Option<Message>, ReadError> {
         while !self.finished {
-            let Some(package) = self.client.receive().await? else {
+            let Some(client) = &mut self.client else {
                 break;
+            };
+            let package = match client.receive().await {
+                Ok(Some(package)) => package,
+                Ok(None) => break,
+                Err(error) => {
+                    self.close_transport().await;
+                    return Err(error);
+                }
             };
             match package.0 {
                 Package::Message(message) => return Ok(Some(message)),
@@ -240,17 +248,29 @@ impl WebSocketClient {
                     break;
                 }
                 Package::Violation(code, why) => {
-                    self.finished = true;
                     if !self.sender.close_sent.swap(true, Ordering::AcqRel) {
                         let _ = self.sender.send_close(Some(code), why);
                     }
+                    self.close_transport().await;
                     return Err(ReadError::Protocol(ProtocolError::new(why)));
                 }
                 Package::Pong | Package::Handshake(_) => {}
             }
         }
-        self.finished = true;
+        self.close_transport().await;
         Ok(None)
+    }
+
+    async fn close_transport(&mut self) {
+        self.finished = true;
+        if let Some(client) = self.client.take() {
+            // Closing starts before waiting for the writer. Taking ownership also releases the
+            // read half if this future is cancelled, or once the writer's close timeout expires.
+            client.close().await;
+        } else {
+            // An earlier receive may have been cancelled while waiting for the writer.
+            self.sender.sender.close().await;
+        }
     }
 
     /// A handle for sending from other tasks.
@@ -290,12 +310,12 @@ impl WebSocketClient {
 
     /// Local address of the socket.
     pub fn local_addr(&self) -> Option<SocketAddr> {
-        self.client.local_addr()
+        self.sender.sender.local_addr()
     }
 
     /// Address the socket is connected to: the proxy when connecting through one.
     pub fn peer_addr(&self) -> Option<SocketAddr> {
-        self.client.peer_addr()
+        self.sender.sender.peer_addr()
     }
 
     /// Performs the closing handshake: sends a close frame, waits up to the close timeout for the
@@ -307,7 +327,7 @@ impl WebSocketClient {
             while let Ok(Some(_)) = self.receive().await {}
         })
         .await;
-        self.client.close().await;
+        self.close_transport().await;
         sent
     }
 }
@@ -573,6 +593,10 @@ impl Url {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "client_close_tests.rs"]
+mod close_tests;
 
 #[cfg(test)]
 mod tests {

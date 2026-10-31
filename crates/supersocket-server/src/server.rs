@@ -812,17 +812,6 @@ async fn accept_loop<P: Send + 'static, S: SessionState>(
     listener: Arc<Listener>,
 ) {
     loop {
-        // At the connection limit, wait for a session to end before accepting the next one.
-        let permit = match &server.connection_limit {
-            Some(limit) => tokio::select! {
-                _ = server.shutdown.cancelled() => return,
-                _ = server.accepting.cancelled() => return,
-                permit = limit.clone().acquire_owned() => {
-                    Some(permit.expect("the connection limit is never closed"))
-                }
-            },
-            None => None,
-        };
         tokio::select! {
             _ = server.shutdown.cancelled() => return,
             _ = server.accepting.cancelled() => return,
@@ -830,6 +819,20 @@ async fn accept_loop<P: Send + 'static, S: SessionState>(
                 // The TLS handshake and session setup run in the connection's own task, so a slow
                 // client never holds up the accept loop.
                 Ok((stream, _)) => {
+                    // Idle listeners must not reserve connection capacity. Each listener holds
+                    // at most this one accepted socket while waiting, and accepts no more until
+                    // a session ends. Cancelling the wait drops the socket too.
+                    let permit = match &server.connection_limit {
+                        Some(limit) => tokio::select! {
+                            biased;
+                            _ = server.shutdown.cancelled() => return,
+                            _ = server.accepting.cancelled() => return,
+                            permit = limit.clone().acquire_owned() => {
+                                Some(permit.expect("the connection limit is never closed"))
+                            }
+                        },
+                        None => None,
+                    };
                     if !server.layers.is_empty() {
                         server.tracker.spawn(connection::serve_layered_tcp(server.clone(), stream, listener.clone(), permit));
                         continue;

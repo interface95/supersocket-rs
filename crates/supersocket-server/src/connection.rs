@@ -386,7 +386,12 @@ async fn run_session<P, S, R>(
         tracing::debug!("session rejected by middleware");
         session.close(CloseReason::Rejected);
         session.close_send_queue();
-        let _ = writer_task.await;
+        if tokio::time::timeout(server.info.options().close_timeout, &mut writer_task)
+            .await
+            .is_err()
+        {
+            writer_task.abort();
+        }
         return;
     }
 

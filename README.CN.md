@@ -209,12 +209,13 @@ Server::builder(LineFilter::default)
 Server::builder(LineFilter::default)
     .on_accept(|connection| !banned(connection.remote_addr().ip())) // 在 TLS 之前，几乎不花代价
     .configure(|options| {
-        options.max_connections = Some(10_000); // 到上限后暂停接受新连接
-        options.handshake_timeout = Duration::from_secs(10); // 从接受到连上的总时限
+        options.max_connections = Some(10_000); // 限制正在服务的连接数
+        options.handshake_timeout = Duration::from_secs(10); // 从开始处理到连上的总时限
     })
 ```
 
-`handshake_timeout` 覆盖从接受连接到会话连上之间的全部步骤：PROXY protocol 头、TLS 握手、流包装层和协议握手。
+达到连接上限时，每个监听器最多暂存一个已接受、等待空位的连接，其余连接留在监听队列中。
+获得空位后，`handshake_timeout` 覆盖 PROXY protocol 头、TLS 握手、流包装层和协议握手；等待空位不计入这个时限。
 滚动重启时，`stop_accepting()` 先关掉监听器、让已有会话继续跑完；`run_until(signal)` 让服务端运行到你自己的
 future 完成为止，而不是只能等 Ctrl+C 或 SIGTERM。`Server` 实现了 `Clone`，别的任务可以拿着句柄做这些事。
 

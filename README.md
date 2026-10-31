@@ -225,14 +225,15 @@ to `max_in_flight` packages of a session run at the same time on the runtime's w
 Server::builder(LineFilter::default)
     .on_accept(|connection| !banned(connection.remote_addr().ip())) // before TLS, costs nothing
     .configure(|options| {
-        options.max_connections = Some(10_000); // accepting pauses at the limit
-        options.handshake_timeout = Duration::from_secs(10); // from accept to connected
+        options.max_connections = Some(10_000); // limits connections being served
+        options.handshake_timeout = Duration::from_secs(10); // from admission to connected
     })
 ```
 
-`handshake_timeout` covers everything between accepting a connection and its session being
-connected: the PROXY protocol header, the TLS handshake, stream layers and a protocol
-handshake. For a rolling restart, `stop_accepting()` closes the listeners while the existing
+At the connection limit, each listener holds at most one accepted socket waiting for a slot;
+further connections wait in the listen backlog. Once a slot is available, `handshake_timeout`
+covers the PROXY protocol header, the TLS handshake, stream layers and a protocol handshake.
+For a rolling restart, `stop_accepting()` closes the listeners while the existing
 sessions finish, and `run_until(signal)` runs the server until a future of your own completes
 instead of Ctrl+C or SIGTERM. `Server` is `Clone`, so other tasks can hold a handle for this.
 

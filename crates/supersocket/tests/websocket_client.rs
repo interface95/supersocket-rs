@@ -307,3 +307,47 @@ async fn masked_frames_from_the_server_break_the_protocol() {
     );
     assert_eq!(receive(&mut client).await, None);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_and_protocol_errors_close_the_transport_while_handles_live() {
+    for protocol_error in [false, true] {
+        let (ended, mut closed) = mpsc::unbounded_channel();
+        let address = fake_server(move |mut stream: TcpStream, key: String| async move {
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {}\r\n\r\n",
+                derive_accept_key(key.as_bytes())
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            let frame: &[u8] = if protocol_error {
+                &[0x81, 0x81, 1, 2, 3, 4, b'a' ^ 1]
+            } else {
+                &[0x88, 0x02, 0x03, 0xe8]
+            };
+            stream.write_all(frame).await.unwrap();
+            let mut header = [0; 6];
+            stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0], 0x88);
+            assert_ne!(header[1] & 0x80, 0);
+            let mut payload = vec![0; usize::from(header[1] & 0x7f)];
+            stream.read_exact(&mut payload).await.unwrap();
+            // Keep the server's socket open: the client must finish closing its side itself.
+            let read = stream.read(&mut [0; 1]).await.unwrap();
+            ended.send(read).unwrap();
+        })
+        .await;
+        let mut client = WebSocketClient::connect(format!("ws://{address}/"))
+            .await
+            .unwrap();
+        let sender = client.sender();
+        let received = timeout(WAIT, client.receive()).await.unwrap();
+        if protocol_error {
+            assert!(matches!(received, Err(ReadError::Protocol(_))));
+        } else {
+            assert!(matches!(received, Ok(None)));
+        }
+        assert_eq!(timeout(WAIT, closed.recv()).await.unwrap(), Some(0));
+        assert!(sender.is_closed());
+        assert_eq!(receive(&mut client).await, None);
+    }
+}

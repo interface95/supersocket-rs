@@ -20,8 +20,8 @@ const STACK_READ_SIZE: usize = 8 * 1024;
 /// Limits of a [`PackageReader`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadOptions {
-    /// Largest package, framing included. Never more than this is buffered, so a longer package
-    /// is an error as soon as this much has arrived without completing it. Default: 1 MiB.
+    /// Largest package, framing included. A filter sees at most this many buffered bytes, so a
+    /// longer package is an error once this much arrives without completing it. Default: 1 MiB.
     pub max_package_length: usize,
     /// How much to read at a time while a package is incomplete. Default: 4 KiB.
     pub receive_buffer_size: usize,
@@ -157,19 +157,32 @@ where
     /// Returns the next package if it has already been received, without reading. `Ok(None)`
     /// means more data is needed.
     pub fn try_next(&mut self) -> Result<Option<P>, ReadError> {
+        let limit = self.options.max_package_length;
         while !self.buf.is_empty() {
-            let step = catch_panic_sync(|| decode_step(&mut self.filter, &mut self.buf))
-                .map_err(ReadError::FilterPanicked)??;
+            if limit == 0 {
+                return Err(ReadError::TooLarge { limit });
+            }
+            // Pre-read data may contain many packages. Give the filter the same bounded view
+            // as fill(), keeping the rest out of reach until earlier bytes are consumed.
+            let tail = (self.buf.len() > limit).then(|| self.buf.split_off(limit));
+            let step = catch_panic_sync(|| decode_step(&mut self.filter, &mut self.buf));
+            let remaining = self.buf.len();
+            let more_buffered = tail.is_some();
+            if let Some(tail) = tail {
+                // Restore unread bytes even if the filter failed or panicked.
+                self.buf.unsplit(tail);
+            }
+            let step = step.map_err(ReadError::FilterPanicked)??;
             match step {
                 Step::Package(package) => return Ok(Some(package)),
                 Step::Switched => {}
                 Step::NeedMore => {
-                    if self.buf.len() >= self.options.max_package_length {
-                        return Err(ReadError::TooLarge {
-                            limit: self.options.max_package_length,
-                        });
+                    if remaining >= limit {
+                        return Err(ReadError::TooLarge { limit });
                     }
-                    break;
+                    if !more_buffered {
+                        break;
+                    }
                 }
             }
         }
@@ -249,7 +262,15 @@ async fn read_some<R: AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use supersocket_proto::{LineFilter, PipelineFilter, TextPackage};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use supersocket_proto::{
+        FixedSizeFilter, LineFilter, PipelineFilter, PipelineFilterExt, TerminatorFilter,
+        TextPackage,
+    };
     use tokio::io::AsyncWriteExt;
 
     use super::*;
@@ -349,6 +370,73 @@ mod tests {
             BytesMut::from(&b"hel"[..]),
         );
         assert_eq!(reader.next().await.unwrap().unwrap().text, "hello");
+    }
+
+    #[test]
+    fn buffered_packages_respect_the_limit_before_decoding() {
+        let decoded = Arc::new(AtomicUsize::new(0));
+        let filter = TerminatorFilter::new(&b"\r\n"[..], {
+            let decoded = decoded.clone();
+            move |bytes| {
+                decoded.fetch_add(1, Ordering::SeqCst);
+                TextPackage::decode(bytes)
+            }
+        });
+        let mut reader = PackageReader::with_buffered(
+            &b""[..],
+            Box::new(filter),
+            ReadOptions {
+                max_package_length: 8,
+                ..ReadOptions::default()
+            },
+            BytesMut::from(&b"a\r\n0123456789ABCDEF\r\n"[..]),
+        );
+        assert_eq!(reader.try_next().unwrap().unwrap().text, "a");
+        assert!(matches!(
+            reader.try_next(),
+            Err(ReadError::TooLarge { limit: 8 })
+        ));
+        assert_eq!(decoded.load(Ordering::SeqCst), 1);
+        let (_, rest) = reader.into_parts();
+        assert_eq!(&rest[..], b"0123456789ABCDEF\r\n");
+    }
+
+    #[tokio::test]
+    async fn buffered_small_packages_and_a_partial_tail_stay_in_order() {
+        let mut reader = PackageReader::with_buffered(
+            &b"ree\r\n"[..],
+            Box::new(LineFilter::default()),
+            ReadOptions {
+                max_package_length: 8,
+                ..ReadOptions::default()
+            },
+            BytesMut::from(&b"one\r\n123456\r\nth"[..]),
+        );
+        assert_eq!(reader.try_next().unwrap().unwrap().text, "one");
+        assert_eq!(reader.try_next().unwrap().unwrap().text, "123456");
+        assert!(reader.try_next().unwrap().is_none());
+        assert_eq!(reader.next().await.unwrap().unwrap().text, "three");
+        assert!(reader.next().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn buffered_tail_survives_filter_switches_and_into_parts() {
+        let filter = LineFilter::default()
+            .then_switch_to(|| Box::new(FixedSizeFilter::new(4, TextPackage::decode)));
+        let mut reader = PackageReader::with_buffered(
+            &b""[..],
+            Box::new(filter),
+            ReadOptions {
+                max_package_length: 8,
+                ..ReadOptions::default()
+            },
+            BytesMut::from(&b"go\r\n12345678tail"[..]),
+        );
+        assert_eq!(reader.try_next().unwrap().unwrap().text, "go");
+        assert_eq!(reader.try_next().unwrap().unwrap().text, "1234");
+        assert_eq!(reader.try_next().unwrap().unwrap().text, "5678");
+        let (_, rest) = reader.into_parts();
+        assert_eq!(&rest[..], b"tail");
     }
 
     #[tokio::test]

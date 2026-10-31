@@ -71,6 +71,36 @@ async fn proxy_protocol_v1_gives_the_client_address() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn packages_received_with_a_proxy_header_obey_the_length_limit() {
+    let (server, address) = start_on(
+        address_echo().configure(|options| options.max_package_length = 8),
+        behind_proxy(),
+    );
+    let mut client = Client::connect(address).await;
+    client
+        .send(b"PROXY TCP4 203.0.113.7 192.0.2.1 51000 4040\r\n0123456789ABCDEF\r\n")
+        .await;
+    client.expect_closed().await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiple_small_packages_can_arrive_with_a_proxy_header() {
+    let (server, address) = start_on(
+        address_echo().configure(|options| options.max_package_length = 8),
+        behind_proxy(),
+    );
+    let mut client = Client::connect(address).await;
+    client
+        .send(b"PROXY TCP4 203.0.113.7 192.0.2.1 51000 4040\r\na\r\n123456\r\nlast\r\n")
+        .await;
+    for text in ["a", "123456", "last"] {
+        assert_eq!(client.line().await, format!("203.0.113.7:51000 v1 {text}"));
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proxy_protocol_v2_gives_the_client_address() {
     let (sessions, mut connected) = mpsc::unbounded_channel();
     let (server, address) = start_on(

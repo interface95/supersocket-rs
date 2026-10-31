@@ -203,6 +203,20 @@ fn parse_v2(buf: &[u8]) -> Result<Option<(Header, usize)>, &'static str> {
     let Some(body) = buf.get(16..length) else {
         return Ok(None);
     };
+    // LOCAL carries no forwarded connection: consume its declared length, but ignore the
+    // family and the entire protocol block, which need not contain addresses or valid TLVs.
+    if command == ProxyCommand::Local {
+        return Ok(Some((
+            Header {
+                version: 2,
+                command,
+                source: None,
+                destination: None,
+                tlvs: Vec::new(),
+            },
+            length,
+        )));
+    }
     let (addresses, tlvs) = match family_protocol >> 4 {
         0 => (None, body),
         1 => {
@@ -373,6 +387,27 @@ mod tests {
         assert_eq!(header.source, None);
         let (header, length) = parse_complete(&v2(0, 0, &[]));
         assert_eq!((header.source, length), (None, 16));
+    }
+
+    #[test]
+    fn local_connections_ignore_address_family_and_payload() {
+        for family_protocol in [0x00, 0x11, 0x21, 0x31, 0xff] {
+            for body in [&[][..], &[0xaa][..], &[0x05, 0, 9, b'x'][..]] {
+                let mut data = V2_SIGNATURE.to_vec();
+                data.extend([0x20, family_protocol]);
+                data.extend((body.len() as u16).to_be_bytes());
+                data.extend(body);
+                let header_length = data.len();
+                assert!(parse(&data[..header_length - 1]).unwrap().is_none());
+                data.extend(b"application data");
+
+                let (header, length) = parse_complete(&data);
+                assert_eq!(length, header_length);
+                assert_eq!(header.command, ProxyCommand::Local);
+                assert_eq!((header.source, header.destination), (None, None));
+                assert!(header.tlvs.is_empty());
+            }
+        }
     }
 
     #[test]

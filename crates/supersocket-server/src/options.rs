@@ -54,15 +54,18 @@ pub struct ServerOptions {
     #[serde(with = "lenient::duration")]
     pub close_timeout: Duration,
 
-    /// How long a connection may take from being accepted to being connected: reading the PROXY
-    /// protocol header, the TLS handshake, the stream layers and the protocol handshake of a
-    /// server that [requires one](crate::ServerBuilder::require_handshake), all together. A
-    /// connection that takes longer is dropped. Default: 10 seconds.
+    /// How long a connection may take to become connected once admitted for processing: reading
+    /// the PROXY protocol header, the TLS handshake, the stream layers and the protocol handshake
+    /// of a server that [requires one](crate::ServerBuilder::require_handshake), all together.
+    /// Waiting for a connection slot does not count. A connection that takes longer is dropped.
+    /// Default: 10 seconds.
     #[serde(with = "lenient::duration")]
     pub handshake_timeout: Duration,
 
-    /// How many connections the server serves at a time. At the limit, accepting pauses until a
-    /// session ends, so new connections wait in the listen backlog. Default: no limit.
+    /// How many connections the server serves at a time, including handshakes. At the limit,
+    /// each listener holds at most one accepted socket waiting for a session to end; further
+    /// connections wait in the listen backlog. Idle listeners do not consume capacity.
+    /// Default: no limit.
     #[serde(deserialize_with = "lenient::option_usize")]
     pub max_connections: Option<usize>,
 }

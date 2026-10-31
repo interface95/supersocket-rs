@@ -76,6 +76,7 @@ impl PipelineFilter for HeadFilter {
             return Ok(None);
         }
         let head = match head_length(buf, self.searched) {
+            Some(length) if length > MAX_HEAD_SIZE.min(self.max_size) => Err(HeadError::TooLarge),
             Some(length) => {
                 self.searched = 0;
                 parse_head(&buf.split_to(length))
@@ -139,6 +140,11 @@ impl FrameFilter {
 
     fn check(&self, header: &Header) -> Result<(), Violation> {
         let protocol_error = |why| Err((CloseCode::PROTOCOL_ERROR, why));
+        if (header.length_code == 126 && header.length < 126)
+            || (header.length_code == 127 && header.length < 65536)
+        {
+            return protocol_error("nonminimal payload length");
+        }
         if header.rsv != 0 {
             return protocol_error("reserved bits are set");
         }
@@ -317,6 +323,7 @@ struct Header {
     rsv: u8,
     opcode: u8,
     mask: Option<[u8; 4]>,
+    length_code: u8,
     length: u64,
     /// Length of the header itself.
     size: usize,
@@ -328,7 +335,8 @@ impl Header {
         let [first, second, ..] = *buf else {
             return None;
         };
-        let (length, mut size) = match second & 0x7F {
+        let length_code = second & 0x7F;
+        let (length, mut size) = match length_code {
             126 => (
                 u64::from(u16::from_be_bytes(buf.get(2..4)?.try_into().ok()?)),
                 4,
@@ -348,6 +356,7 @@ impl Header {
             rsv: first & 0x70,
             opcode: first & 0x0F,
             mask,
+            length_code,
             length,
             size,
         })
@@ -453,6 +462,62 @@ mod tests {
     }
 
     #[test]
+    fn rejects_nonminimal_frame_lengths() {
+        for role in [Role::Server, Role::Client] {
+            for (code, lengths) in [(126, &[0u64, 125][..]), (127, &[0, 125, 126, 65535][..])] {
+                for &length in lengths {
+                    let masked = role == Role::Server;
+                    let mut buf = BytesMut::from(&[0x82, code | if masked { 0x80 } else { 0 }][..]);
+                    if code == 126 {
+                        buf.extend_from_slice(&(length as u16).to_be_bytes());
+                    } else {
+                        buf.extend_from_slice(&length.to_be_bytes());
+                    }
+                    if masked {
+                        buf.extend_from_slice(&MASK);
+                    }
+                    let mut filter = FrameFilter::new(role, 1024 * 1024);
+                    let package = filter.filter(&mut buf).unwrap();
+                    assert!(
+                        matches!(
+                            package,
+                            Some(WebSocketPackage(Package::Violation(
+                                CloseCode::PROTOCOL_ERROR,
+                                _
+                            )))
+                        ),
+                        "{role:?}: length {length} encoded with {code} must fail before its payload arrives"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_minimal_frame_length_boundaries() {
+        for role in [Role::Server, Role::Client] {
+            for length in [0, 125, 126, 65535, 65536] {
+                let payload = vec![42; length];
+                let frame = match role {
+                    Role::Server => client_frame(0x82, &payload),
+                    Role::Client => {
+                        let mut header = [0; MAX_HEADER_SIZE];
+                        let size = encode_header(OP_BINARY, length, None, &mut header);
+                        [header[..size].to_vec(), payload.clone()].concat()
+                    }
+                };
+                let mut filter = FrameFilter::new(role, 1024 * 1024);
+                let mut buf = BytesMut::from(frame.as_slice());
+                let package = filter.filter(&mut buf).unwrap().unwrap();
+                assert!(
+                    matches!(package.0, Package::Message(Message::Binary(data)) if data == payload)
+                );
+                assert!(buf.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn invalid_text_fails_as_soon_as_it_arrives() {
         // The first fragment already holds a byte that can never start a character.
         let packages = read(&[client_frame(0x01, &[b'a', 0xFF])], 1024);
@@ -547,5 +612,53 @@ mod tests {
             package.0,
             Package::Handshake(Err(HeadError::TooLarge))
         ));
+    }
+
+    #[test]
+    fn head_filter_limits_complete_heads_for_both_roles() {
+        for role in [Role::Server, Role::Client] {
+            for max_size in [1024, 1024 * 1024] {
+                let limit = MAX_HEAD_SIZE.min(max_size);
+                let start = match role {
+                    Role::Server => "GET / HTTP/1.1\r\nX-Pad: ",
+                    Role::Client => "HTTP/1.1 101 Switching Protocols\r\nX-Pad: ",
+                };
+                for split in [false, true] {
+                    let head =
+                        format!("{start}{}\r\n\r\n", "a".repeat(limit + 1 - start.len() - 4));
+                    let mut filter = HeadFilter::new(role, max_size);
+                    let mut buf = BytesMut::new();
+                    if split {
+                        buf.extend_from_slice(&head.as_bytes()[..limit - 1]);
+                        assert!(filter.filter(&mut buf).unwrap().is_none());
+                        buf.extend_from_slice(&head.as_bytes()[limit - 1..]);
+                    } else {
+                        buf.extend_from_slice(head.as_bytes());
+                    }
+                    let package = filter.filter(&mut buf).unwrap().unwrap();
+                    assert!(matches!(
+                        package.0,
+                        Package::Handshake(Err(HeadError::TooLarge))
+                    ));
+                    assert!(filter.next_filter().is_none());
+                }
+
+                // Exactly the limit is valid; following frame bytes do not count as head bytes.
+                let head = format!("{start}{}\r\n\r\n", "a".repeat(limit - start.len() - 4));
+                let following = match role {
+                    Role::Server => client_frame(0x81, b"hello"),
+                    Role::Client => b"\x81\x05hello".to_vec(),
+                };
+                let mut buf = BytesMut::from(head.as_bytes());
+                buf.extend_from_slice(&following);
+                let mut filter = HeadFilter::new(role, max_size);
+                let package = filter.filter(&mut buf).unwrap().unwrap();
+                assert!(matches!(package.0, Package::Handshake(Ok(_))));
+                assert_eq!(&buf[..], following);
+                let mut frames = filter.next_filter().unwrap();
+                let package = frames.filter(&mut buf).unwrap().unwrap();
+                assert_eq!(text(&package.0), "hello");
+            }
+        }
     }
 }

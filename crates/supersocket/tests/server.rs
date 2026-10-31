@@ -1071,6 +1071,35 @@ async fn the_connection_limit_pauses_accepting() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn stopping_acceptance_or_shutting_down_closes_connections_waiting_for_capacity() {
+    for shutdown in [false, true] {
+        let (server, address) =
+            start(echo_lines().configure(|options| options.max_connections = Some(1)));
+        let mut active = Client::connect(address).await;
+        active.send(b"active\r\n").await;
+        assert_eq!(active.line().await, "active");
+
+        let mut waiting = Client::connect(address).await;
+        waiting.send(b"waiting\r\n").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(server.info().session_count(), 1);
+
+        if shutdown {
+            tokio::time::timeout(common::WAIT, server.shutdown())
+                .await
+                .expect("shutdown must cancel waiting for connection capacity");
+            active.expect_closed().await;
+        } else {
+            server.stop_accepting();
+            active.send(b"still active\r\n").await;
+            assert_eq!(active.line().await, "still active");
+        }
+        waiting.expect_closed().await;
+        server.shutdown().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_accept_hook_refuses_connections_before_they_become_sessions() {
     let allow = Arc::new(AtomicBool::new(false));

@@ -184,6 +184,68 @@ async fn connections_are_refused_unless_the_server_runs() {
     assert!(refused(&server));
 }
 
+#[tokio::test]
+async fn idle_tcp_listeners_do_not_consume_connection_capacity() {
+    let server = echo_with_address()
+        .listen("127.0.0.1:0")
+        .listen("127.0.0.1:0")
+        .configure(|options| options.max_connections = Some(1))
+        .build()
+        .unwrap();
+    server.start().unwrap();
+    // Let both listener tasks start waiting for incoming TCP connections.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(server.info().session_count(), 0);
+
+    let (client, connection) = tokio::io::duplex(1024);
+    server
+        .serve_connection(connection, ConnectionInfo::default())
+        .expect("idle listeners must leave the connection capacity available");
+    let (reader, writer) = tokio::io::split(client);
+    let mut client = Client::new(reader, writer);
+    client.send(b"hello\r\n").await;
+    assert_eq!(client.line().await, "hello 0.0.0.0:0");
+
+    let (_peer, extra) = tokio::io::duplex(64);
+    assert!(matches!(
+        server.serve_connection(extra, ConnectionInfo::default()),
+        Err(supersocket::Error::ConnectionLimit)
+    ));
+    server.shutdown().await;
+}
+
+struct RefuseWithReply(mpsc::UnboundedSender<()>);
+
+impl Middleware for RefuseWithReply {
+    async fn register_session(&self, session: &Session) -> bool {
+        session.send(b"access denied\r\n").await.unwrap();
+        self.0.send(()).unwrap();
+        false
+    }
+}
+
+#[tokio::test]
+async fn rejected_connections_obey_the_close_timeout() {
+    let (refused, mut refusals) = mpsc::unbounded_channel();
+    let server = echo_with_address()
+        .middleware(RefuseWithReply(refused))
+        .configure(|options| options.close_timeout = Duration::from_millis(50))
+        .build()
+        .unwrap();
+    server.start().unwrap();
+    server
+        .serve_connection(common::Stall, ConnectionInfo::default())
+        .unwrap();
+    tokio::time::timeout(common::WAIT, refusals.recv())
+        .await
+        .expect("middleware did not reject the connection")
+        .unwrap();
+
+    tokio::time::timeout(common::WAIT, server.shutdown())
+        .await
+        .expect("a rejected connection that stops reading must not block shutdown");
+}
+
 /// Waits for a preamble that never comes.
 struct WaitForever;
 
