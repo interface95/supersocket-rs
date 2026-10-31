@@ -177,6 +177,17 @@ pub struct Commands<P: KeyedPackage, S = ()> {
 }
 
 impl<P: KeyedPackage, S: SessionState> Commands<P, S> {
+    /// An empty set of commands, to dispatch packages to yourself with
+    /// [`dispatch`](Self::dispatch); [`ServerBuilder::commands`] sets one up as a server's
+    /// package handler.
+    pub fn new() -> Self {
+        Self {
+            commands: HashMap::new(),
+            filters: Vec::new(),
+            unknown: None,
+        }
+    }
+
     /// Adds a command.
     ///
     /// # Panics
@@ -213,7 +224,9 @@ impl<P: KeyedPackage, S: SessionState> Commands<P, S> {
         self
     }
 
-    async fn dispatch(&self, session: Session<S>, package: P) -> HandlerResult {
+    /// Runs the command registered for the package's key, with the filters around it, or the
+    /// unknown handler if there is no such command.
+    pub async fn dispatch(&self, session: Session<S>, package: P) -> HandlerResult {
         let Some((key, command)) = self.commands.get_key_value(package.key()) else {
             return match &self.unknown {
                 Some(handler) => handler(session, package).await,
@@ -243,13 +256,15 @@ impl<P: KeyedPackage, S: SessionState> ServerBuilder<P, S> {
     /// Dispatches each package to the command registered for its key. This becomes the package
     /// handler, replacing one set with [`on_package`](Self::on_package).
     pub fn commands(self, configure: impl FnOnce(&mut Commands<P, S>)) -> Self {
-        let mut commands = Commands {
-            commands: HashMap::new(),
-            filters: Vec::new(),
-            unknown: None,
-        };
+        let mut commands = Commands::new();
         configure(&mut commands);
         self.set_package_handler(Box::new(commands))
+    }
+}
+
+impl<P: KeyedPackage, S: SessionState> Default for Commands<P, S> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

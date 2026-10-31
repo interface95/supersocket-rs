@@ -20,7 +20,7 @@ impl Connector for InMemory {
 }
 
 async fn client_on(stream: impl Stream) -> WebSocketClient {
-    let client = EasyClient::builder(|| crate::filter::FrameFilter::new(Role::Client, 1024))
+    let client = EasyClient::builder(|| crate::filter::FrameFilter::new(Role::Client, 1024, None))
         .proxy(InMemory(Mutex::new(Some(Connection::new(stream)))))
         .configure(|options| options.close_timeout = Duration::from_millis(25))
         .connect(("localhost", 80))
@@ -29,6 +29,7 @@ async fn client_on(stream: impl Stream) -> WebSocketClient {
     let sender = WebSocketSender {
         sender: client.sender(),
         close_sent: Arc::new(AtomicBool::new(false)),
+        compression: None,
     };
     WebSocketClient {
         client: Some(client),

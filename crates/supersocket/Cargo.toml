@@ -28,6 +28,8 @@ websocket = ["dep:supersocket-websocket"]
 gzip = ["supersocket-server/gzip", "supersocket-client?/gzip"]
 ## `CodecFilter`, which runs a `tokio_util::codec::Decoder` as a pipeline filter.
 codec = ["supersocket-proto/codec"]
+## WebSocket per-message compression (`permessage-deflate`), with `websocket`.
+deflate = ["websocket", "supersocket-websocket/deflate"]
 
 [dependencies]
 supersocket-connection.workspace = true

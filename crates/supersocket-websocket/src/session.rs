@@ -4,7 +4,7 @@ use supersocket_server::{CloseReason, Extensions, ServerInfo, Session};
 
 use crate::{
     CloseCode, CloseFrame, HandshakeRequest, Message, WebSocketState,
-    frame::{MAX_CONTROL_PAYLOAD, OP_BINARY, OP_PING, OP_TEXT},
+    frame::{FIN, MAX_CONTROL_PAYLOAD, OP_BINARY, OP_PING, OP_TEXT, RSV1},
     handshake::NO_REQUEST,
     server::{send_close, send_frame, try_send_frame},
 };
@@ -105,7 +105,8 @@ impl<S> WebSocketSession<S> {
     /// Queues `message` without waiting: fails with
     /// [`ErrorKind::WouldBlock`](io::ErrorKind::WouldBlock) while the send buffer limit is
     /// reached. For broadcasts, where a client that reads slowly should be skipped rather than
-    /// hold up the others.
+    /// hold up the others. With compression that shares a window between messages, the message
+    /// is sent uncompressed, since waiting for the window is not an option.
     pub fn try_send(&self, message: &Message) -> io::Result<()> {
         if self.session.close_sent.load(Ordering::Acquire) {
             return Err(io::Error::new(
@@ -117,7 +118,12 @@ impl<S> WebSocketSession<S> {
             Message::Text(text) => (OP_TEXT, text.as_bytes()),
             Message::Binary(data) => (OP_BINARY, &data[..]),
         };
-        try_send_frame(&self.session, opcode, payload)
+        if let Some(encoder) = self.session.compression.get() {
+            if let Some(compressed) = encoder.encode_now(payload) {
+                return try_send_frame(&self.session, FIN | RSV1 | opcode, &compressed);
+            }
+        }
+        try_send_frame(&self.session, FIN | opcode, payload)
     }
 
     /// Sends a ping with up to 125 bytes of `payload`; the client answers with a pong.
@@ -128,7 +134,7 @@ impl<S> WebSocketSession<S> {
                 "a ping payload is at most 125 bytes",
             ));
         }
-        send_frame(&self.session, OP_PING, payload).await
+        send_frame(&self.session, FIN | OP_PING, payload).await
     }
 
     async fn send_data(&self, opcode: u8, payload: &[u8]) -> io::Result<()> {
@@ -138,7 +144,18 @@ impl<S> WebSocketSession<S> {
                 "the WebSocket connection is closing",
             ));
         }
-        send_frame(&self.session, opcode, payload).await
+        if let Some(encoder) = self.session.compression.get() {
+            // With a shared window, a frame that a cancelled send left behind goes first.
+            loop {
+                let encoded = encoder.encode(opcode, payload).await;
+                let (first, data) = encoded.frame(opcode, payload);
+                send_frame(&self.session, first, data).await?;
+                if encoded.finish() {
+                    return Ok(());
+                }
+            }
+        }
+        send_frame(&self.session, FIN | opcode, payload).await
     }
 }
 

@@ -9,6 +9,11 @@ pub(crate) const OP_CLOSE: u8 = 0x8;
 pub(crate) const OP_PING: u8 = 0x9;
 pub(crate) const OP_PONG: u8 = 0xA;
 
+/// The FIN bit of the first byte: the frame ends its message.
+pub(crate) const FIN: u8 = 0x80;
+/// The RSV1 bit of the first byte: the message is compressed (RFC 7692).
+pub(crate) const RSV1: u8 = 0x40;
+
 /// The largest frame header: two bytes, an eight-byte length and a four-byte masking key.
 pub(crate) const MAX_HEADER_SIZE: usize = 14;
 /// The largest payload of a control frame.
@@ -16,15 +21,16 @@ pub(crate) const MAX_CONTROL_PAYLOAD: usize = 125;
 /// The largest close frame: two bytes of header, a masking key and the payload.
 pub(crate) const MAX_CLOSE_FRAME: usize = 2 + 4 + MAX_CONTROL_PAYLOAD;
 
-/// Writes the header of an unfragmented frame into `header` and returns its length. The payload is
-/// masked with `mask` when one is given, as a client's must be.
+/// Writes a frame header into `header` and returns its length. `first` is the first byte: the
+/// opcode with [`FIN`] and, for a compressed message, [`RSV1`]. The payload is masked with `mask`
+/// when one is given, as a client's must be.
 pub(crate) fn encode_header(
-    opcode: u8,
+    first: u8,
     length: usize,
     mask: Option<[u8; 4]>,
     header: &mut [u8; MAX_HEADER_SIZE],
 ) -> usize {
-    header[0] = 0x80 | opcode;
+    header[0] = first;
     let mask_bit = if mask.is_some() { 0x80 } else { 0 };
     let mut size = match length {
         0..=125 => {
@@ -76,7 +82,7 @@ pub(crate) fn close_frame(
     let mut payload = [0; MAX_CONTROL_PAYLOAD];
     let length = close_payload(code, reason, &mut payload);
     let mut header = [0; MAX_HEADER_SIZE];
-    let size = encode_header(OP_CLOSE, length, mask, &mut header);
+    let size = encode_header(FIN | OP_CLOSE, length, mask, &mut header);
     frame[..size].copy_from_slice(&header[..size]);
     frame[size..size + length].copy_from_slice(&payload[..length]);
     if let Some(mask) = mask {
@@ -120,15 +126,20 @@ mod tests {
     #[test]
     fn encodes_every_length_form() {
         let mut header = [0; MAX_HEADER_SIZE];
-        assert_eq!(encode_header(OP_TEXT, 5, None, &mut header), 2);
+        assert_eq!(encode_header(FIN | OP_TEXT, 5, None, &mut header), 2);
         assert_eq!(header[..2], [0x81, 5]);
-        assert_eq!(encode_header(OP_BINARY, 126, None, &mut header), 4);
+        assert_eq!(encode_header(FIN | OP_BINARY, 126, None, &mut header), 4);
         assert_eq!(header[..4], [0x82, 126, 0, 126]);
-        assert_eq!(encode_header(OP_BINARY, 70_000, None, &mut header), 10);
+        assert_eq!(
+            encode_header(FIN | OP_BINARY, 70_000, None, &mut header),
+            10
+        );
         assert_eq!(header[..10], [0x82, 127, 0, 0, 0, 0, 0, 1, 0x11, 0x70]);
         let mask = Some([1, 2, 3, 4]);
-        assert_eq!(encode_header(OP_PING, 0, mask, &mut header), 6);
+        assert_eq!(encode_header(FIN | OP_PING, 0, mask, &mut header), 6);
         assert_eq!(header[..6], [0x89, 0x80, 1, 2, 3, 4]);
+        assert_eq!(encode_header(FIN | RSV1 | OP_TEXT, 5, None, &mut header), 2);
+        assert_eq!(header[..2], [0xC1, 5]);
     }
 
     #[test]

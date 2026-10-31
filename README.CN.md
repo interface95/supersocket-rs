@@ -293,6 +293,23 @@ WebSocketServer::builder()
     .pong_timeout(Duration::from_secs(90))
 ```
 
+文本消息可以分发给命令，对应 SuperSocket WebSocket 的 `UseCommand`：消息的第一个词是 key，其余是参数。
+子协议可以有自己的处理器，对应 `UseWebSocketMessageHandler(protocol, ..)`；客户端也提供的第一个子协议会被选中：
+
+```rust
+WebSocketServer::builder()
+    .commands(|commands| {
+        commands.add(Add); // 一个 `WebSocketCommand<CommandPackage>`："ADD 1 2" 回 "3"
+    })
+    .subprotocol("chat", |chat| chat.on_message(broadcast))
+    .subprotocol("calc", |calc| calc.commands(|commands| { commands.add(Add); }))
+```
+
+启用 `deflate` feature 后，`compression(CompressionOptions::default())` 向客户端提供逐消息压缩（RFC 7692
+`permessage-deflate`），浏览器和多数库都接受。默认两边都不在消息之间保留压缩窗口，所以空闲连接不占压缩状态，
+压缩器从池子里取、压完归还。短于 `threshold`（1 KiB）的消息和压了也不会变小的消息按原样发送；
+`max_package_length` 对解压后的消息同样生效。
+
 再启用 `client` feature，就可以用 `WebSocketClient`。它和 `EasyClient` 用同一套连接器，所以代理和 `wss://` 的用法也一样：
 
 ```rust
@@ -429,24 +446,25 @@ Server::builder(LineFilter::default).options(options)
 ## 性能
 
 在 Linux 下的 Ryzen 9 9950X 上做回显压测，服务端和压测客户端各绑 4 个物理核（8 个线程），supersocket-rs
-的核心和 .NET 11 RC2 上开了 runtime async 与服务器 GC 的 SuperSocket 对比如下：
+和 .NET 11 RC2 上开了 runtime async 与服务器 GC 的 SuperSocket 同机、同时段各跑 3 轮，平均如下：
 
 | | supersocket-rs | SuperSocket（.NET 11） |
 |---|---|---|
-| 100 连接，一问一答 | 202 万/秒，p99 89 µs | 150 万/秒，p99 211 µs |
-| 1000 连接 | 282 万/秒，p99 0.71 ms | 151 万/秒，p99 1.26 ms |
-| 每个连接连发 16 个请求 | 1420 万/秒 | 1060 万/秒 |
-| 每 CPU 秒处理的请求数（100 连接） | 33.1 万 | 20.5 万 |
-| 1 万个空闲连接的内存 | 63 MB | 186 MB |
+| 1 个连接，一问一答 | 21.7 万/秒，p99 5 µs | 11.4 万/秒，p99 49 µs |
+| 100 连接，一问一答 | 194 万/秒，p99 92 µs | 153 万/秒，p99 187 µs |
+| 1000 连接 | 257 万/秒，p99 0.76 ms | 153 万/秒，p99 1.26 ms |
+| 每个连接连发 16 个请求 | 1310 万/秒 | 1060 万/秒 |
+| 每 CPU 秒处理的请求数（100 连接） | 30.6 万 | 20.6 万 |
+| 压测期间的内存 | 24–30 MB | 112–264 MB |
+| 1 万个空闲连接的内存 | 31 MB | 185 MB |
 
-这组数据来自同一核心的原型。之后空闲会话不再保留读写缓冲区，每个空闲连接的内存又降了一半多（本机实测从 6.4 KB 降到
-约 3 KB）。回显只衡量框架本身的开销，实际应用的大部分时间花在别处。
+空闲会话不保留读写缓冲区，所以每个空闲连接只占约 2.8 KB。回显只衡量框架本身的开销，实际应用的大部分时间花在别处。
 
 压测工具在 [`tools/bench`](tools/bench)，里面有复现这些数字的步骤。
 
 ## 路线图
 
-- WebSocket 压缩（permessage-deflate），并跑一遍 Autobahn 测试套件
+- 跑一遍 Autobahn 测试套件
 - 用派生宏注册命令
 - UDP 会话（有需求再做）
 

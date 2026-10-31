@@ -12,18 +12,21 @@ use std::{
     time::Duration,
 };
 
+use supersocket_proto::{CommandPackage, ProtocolError};
 use supersocket_server::{
-    CloseReason, ConnectionInfo, Error, ErrorAction, HandlerResult, ListenOptions, Middleware,
-    PackageError, PackageHandler, Server, ServerBuilder, ServerInfo, ServerOptions, Session,
-    SessionState, StreamLayer,
+    CloseReason, ConnectionInfo, Error, ErrorAction, HandlerResult, KeyedPackage, ListenOptions,
+    Middleware, PackageError, PackageHandler, Server, ServerBuilder, ServerInfo, ServerOptions,
+    Session, SessionState, StreamLayer,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     Accept, CloseCode, CloseFrame, HandshakeRequest, Message, Rejection, WebSocketSession,
-    filter::{HeadFilter, Package, Role, WebSocketPackage},
-    frame::{MAX_CLOSE_FRAME, MAX_HEADER_SIZE, OP_PING, OP_PONG, close_frame, encode_header},
-    handshake::{Head, HeadError, accept_response, read_request},
+    commands::{MessageHandler, SubprotocolBuilder, WebSocketCommands, text_command},
+    deflate::{Accepted, Encoder, Setup},
+    filter::{Handshake, HeadFilter, Package, Role, WebSocketPackage},
+    frame::{FIN, MAX_CLOSE_FRAME, MAX_HEADER_SIZE, OP_PING, OP_PONG, close_frame, encode_header},
+    handshake::{HeadError, accept_response, read_request},
 };
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -39,6 +42,10 @@ type StateFactory<S> = Arc<dyn Fn(&ConnectionInfo) -> S + Send + Sync>;
 pub struct WebSocketState<S = ()> {
     pub(crate) request: OnceLock<HandshakeRequest>,
     pub(crate) protocol: OnceLock<String>,
+    /// The handler of the chosen subprotocol, when it has one of its own.
+    pub(crate) handler: OnceLock<MessageHandler<S>>,
+    /// Compresses outgoing messages, when the extension was negotiated.
+    pub(crate) compression: OnceLock<Encoder>,
     /// Whether a close frame has been sent; nothing but control frames may follow it.
     pub(crate) close_sent: AtomicBool,
     pub(crate) close_frame: OnceLock<CloseFrame>,
@@ -50,6 +57,8 @@ impl<S> WebSocketState<S> {
         Self {
             request: OnceLock::new(),
             protocol: OnceLock::new(),
+            handler: OnceLock::new(),
+            compression: OnceLock::new(),
             close_sent: AtomicBool::new(false),
             close_frame: OnceLock::new(),
             user,
@@ -98,7 +107,8 @@ impl WebSocketServer {
     pub fn builder() -> WebSocketBuilder {
         WebSocketBuilder {
             options: ServerOptions::default(),
-            subprotocols: Vec::new(),
+            protocols: Vec::new(),
+            deflate: None,
             on_handshake: None,
             install: None,
             deferred: Vec::new(),
@@ -196,7 +206,9 @@ pub(crate) fn sessions<S>(info: &ServerInfo<WebSocketState<S>>) -> Vec<WebSocket
 /// included, and a message joined from fragments.
 pub struct WebSocketBuilder<S = ()> {
     options: ServerOptions,
-    subprotocols: Vec<String>,
+    /// The subprotocols in order of preference, each with its own handler or none.
+    protocols: Vec<(String, Option<MessageHandler<S>>)>,
+    deflate: Option<Setup>,
     on_handshake: Option<HandshakeHandler<S>>,
     install: Option<InstallHandler<S>>,
     // Applied to the server builder at the end, once the options, which the filter needs, are
@@ -231,12 +243,20 @@ impl WebSocketBuilder {
         factory: impl Fn(&ConnectionInfo) -> S + Send + Sync + 'static,
     ) -> WebSocketBuilder<S> {
         assert!(
-            self.on_handshake.is_none() && self.install.is_none() && self.deferred.is_empty(),
+            self.on_handshake.is_none()
+                && self.install.is_none()
+                && self.deferred.is_empty()
+                && self.protocols.iter().all(|(_, handler)| handler.is_none()),
             "the session state must be chosen before registering handlers or middleware"
         );
         WebSocketBuilder {
             options: self.options,
-            subprotocols: self.subprotocols,
+            protocols: self
+                .protocols
+                .into_iter()
+                .map(|(name, _)| (name, None))
+                .collect(),
+            deflate: self.deflate,
             on_handshake: None,
             install: None,
             deferred: Vec::new(),
@@ -305,10 +325,86 @@ impl<S: Send + Sync + 'static> WebSocketBuilder<S> {
         self
     }
 
-    /// The subprotocols the server speaks, in order of preference. The first one the client also
-    /// offers is chosen; see [`WebSocketSession::protocol`].
+    /// Dispatches text messages to commands like command lines: the first word of a message is
+    /// the key, the rest the arguments, as [`CommandPackage::decode`] reads them; see
+    /// [`WebSocketCommands`] and [`WebSocketCommand`](crate::WebSocketCommand). Binary messages
+    /// are ignored. This replaces [`on_message`](Self::on_message) as the default handler.
+    pub fn commands(
+        self,
+        configure: impl FnOnce(&mut WebSocketCommands<CommandPackage, S>),
+    ) -> Self {
+        self.commands_with(text_command, configure)
+    }
+
+    /// Dispatches messages to commands, with `mapper` turning each message into a package of
+    /// your own type, such as one decoded from JSON. `Ok(None)` skips a message; an error is
+    /// handled like one from a handler. This replaces [`on_message`](Self::on_message).
+    pub fn commands_with<P, M>(
+        self,
+        mapper: M,
+        configure: impl FnOnce(&mut WebSocketCommands<P, S>),
+    ) -> Self
+    where
+        P: KeyedPackage,
+        M: Fn(Message) -> Result<Option<P>, ProtocolError> + Send + Sync + 'static,
+    {
+        let mut commands = WebSocketCommands::new();
+        configure(&mut commands);
+        let handler = commands.into_handler(mapper);
+        self.on_message(move |session, message| handler(session, message))
+    }
+
+    /// Speaks the subprotocol `name`, with handlers of its own: `configure` sets up how its
+    /// messages are handled, like SuperSocket's `UseWebSocketMessageHandler(protocol, ..)` and
+    /// `UseCommand(protocol, ..)`. Subprotocols are preferred in the order they are added, with
+    /// those from [`subprotocols`](Self::subprotocols); the first one a client also offers is
+    /// chosen for its connection. A subprotocol without a handler of its own uses the default one.
+    ///
+    /// ```
+    /// use supersocket_websocket::WebSocketServer;
+    ///
+    /// let builder = WebSocketServer::builder()
+    ///     .subprotocol("chat", |chat| {
+    ///         chat.on_message(async |session, message| {
+    ///             session.send(&message).await?;
+    ///             Ok(())
+    ///         })
+    ///     })
+    ///     .subprotocol("calc", |calc| calc.commands(|_commands| {}));
+    /// ```
+    pub fn subprotocol(
+        mut self,
+        name: impl Into<String>,
+        configure: impl FnOnce(SubprotocolBuilder<S>) -> SubprotocolBuilder<S>,
+    ) -> Self {
+        let name = name.into();
+        let handler = configure(SubprotocolBuilder::new()).handler;
+        match self.protocols.iter_mut().find(|(ours, _)| *ours == name) {
+            Some((_, existing)) => *existing = handler,
+            None => self.protocols.push((name, handler)),
+        }
+        self
+    }
+
+    /// Speaks these subprotocols, in order of preference after those added before, handling
+    /// their messages with the default handler. The first subprotocol a client also offers is
+    /// chosen; see [`WebSocketSession::protocol`].
     pub fn subprotocols(mut self, protocols: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.subprotocols = protocols.into_iter().map(Into::into).collect();
+        for protocol in protocols {
+            let name = protocol.into();
+            if !self.protocols.iter().any(|(ours, _)| *ours == name) {
+                self.protocols.push((name, None));
+            }
+        }
+        self
+    }
+
+    /// Offers per-message compression (RFC 7692 `permessage-deflate`) to clients, which browsers
+    /// and most libraries accept; see [`CompressionOptions`](crate::CompressionOptions) for what
+    /// is negotiated and what it costs. Default: no compression.
+    #[cfg(feature = "deflate")]
+    pub fn compression(mut self, options: crate::CompressionOptions) -> Self {
+        self.deflate = Some(options);
         self
     }
 
@@ -403,12 +499,13 @@ impl<S: Send + Sync + 'static> WebSocketBuilder<S> {
     /// Checks the options and builds the server.
     pub fn build(self) -> Result<WebSocketServer<S>, Error> {
         let max_size = self.options.max_package_length;
+        let deflate = self.deflate;
         let settings = Settings {
-            subprotocols: self.subprotocols,
+            protocols: self.protocols,
             on_handshake: self.on_handshake,
         };
         let state_factory = self.state_factory;
-        let builder = Server::builder(move || HeadFilter::new(Role::Server, max_size))
+        let builder = Server::builder(move || HeadFilter::new(Role::Server, max_size, deflate))
             .session_with(move |connection| WebSocketState::new(state_factory(connection)))
             .options(self.options)
             .require_handshake();
@@ -443,7 +540,14 @@ impl<S> fmt::Debug for WebSocketBuilder<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WebSocketBuilder")
             .field("options", &self.options)
-            .field("subprotocols", &self.subprotocols)
+            .field(
+                "subprotocols",
+                &self
+                    .protocols
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -453,7 +557,7 @@ fn ignore_message<S>(_: WebSocketSession<S>, _: Message) -> std::future::Ready<H
 }
 
 struct Settings<S> {
-    subprotocols: Vec<String>,
+    protocols: Vec<(String, Option<MessageHandler<S>>)>,
     on_handshake: Option<HandshakeHandler<S>>,
 }
 
@@ -485,11 +589,15 @@ where
         }
         match package {
             Package::Message(message) => {
-                return (self.on_message)(WebSocketSession::from(session.clone()), message).await;
+                let websocket = WebSocketSession::from(session.clone());
+                return match session.handler.get() {
+                    Some(handler) => handler(websocket, message).await,
+                    None => (self.on_message)(websocket, message).await,
+                };
             }
             Package::Ping(payload) => {
                 if !session.close_sent.load(Ordering::Acquire) {
-                    let _ = send_frame(session, OP_PONG, &payload).await;
+                    let _ = send_frame(session, FIN | OP_PONG, &payload).await;
                 }
             }
             Package::Close(frame) => {
@@ -534,18 +642,32 @@ where
 }
 
 impl<S: Send + Sync + 'static, F> Handler<S, F> {
-    async fn handshake(&self, session: &Session<WebSocketState<S>>, head: Result<Head, HeadError>) {
-        let (request, key) = match head.map_err(Rejection::from).and_then(read_request) {
+    async fn handshake(
+        &self,
+        session: &Session<WebSocketState<S>>,
+        handshake: Result<Handshake, HeadError>,
+    ) {
+        let read = handshake.map_err(Rejection::from).and_then(|handshake| {
+            let (request, key) = read_request(handshake.head)?;
+            Ok((request, key, handshake.deflate))
+        });
+        let (request, key, deflate) = match read {
             Ok(accepted) => accepted,
             Err(rejection) => return reject(session, &rejection).await,
         };
-        let protocol = self.settings.subprotocols.iter().find(|ours| {
+        let chosen = self.settings.protocols.iter().find(|(ours, _)| {
             request
                 .subprotocols()
                 .any(|offered| offered == ours.as_str())
         });
-        if let Some(protocol) = protocol {
+        if let Some((protocol, handler)) = chosen {
             let _ = session.protocol.set(protocol.clone());
+            if let Some(handler) = handler {
+                let _ = session.handler.set(handler.clone());
+            }
+        }
+        if let Some(accepted) = &deflate {
+            let _ = session.compression.set(accepted.encoder());
         }
         let _ = session.request.set(request);
         let accept = match &self.settings.on_handshake {
@@ -555,7 +677,12 @@ impl<S: Send + Sync + 'static, F> Handler<S, F> {
             },
             None => Accept::new(),
         };
-        let response = accept_response(&key, protocol.map(String::as_str), &accept);
+        let response = accept_response(
+            &key,
+            chosen.map(|(protocol, _)| protocol.as_str()),
+            deflate.as_ref().map(Accepted::response),
+            &accept,
+        );
         if session.send(response).await.is_ok() {
             session.complete_handshake();
         }
@@ -603,30 +730,27 @@ async fn run_keepalive<S: Send + Sync + 'static>(
                 return;
             }
             // A session whose send buffer is full is busy anyway; skip it this time.
-            let _ = try_send_frame(session, OP_PING, b"");
+            let _ = try_send_frame(session, FIN | OP_PING, b"");
         });
     }
 }
 
-/// Queues an unfragmented frame without waiting; see [`Session::try_send_vectored`].
-pub(crate) fn try_send_frame<S>(
-    session: &Session<S>,
-    opcode: u8,
-    payload: &[u8],
-) -> io::Result<()> {
+/// Queues a frame with the first byte `first` without waiting; see
+/// [`Session::try_send_vectored`].
+pub(crate) fn try_send_frame<S>(session: &Session<S>, first: u8, payload: &[u8]) -> io::Result<()> {
     let mut header = [0; MAX_HEADER_SIZE];
-    let size = encode_header(opcode, payload.len(), None, &mut header);
+    let size = encode_header(first, payload.len(), None, &mut header);
     session.try_send_vectored(&[&header[..size], payload])
 }
 
-/// Sends an unfragmented frame without copying the payload into a buffer first.
+/// Sends a frame with the first byte `first` without copying the payload into a buffer first.
 pub(crate) async fn send_frame<S>(
     session: &Session<S>,
-    opcode: u8,
+    first: u8,
     payload: &[u8],
 ) -> io::Result<()> {
     let mut header = [0; MAX_HEADER_SIZE];
-    let size = encode_header(opcode, payload.len(), None, &mut header);
+    let size = encode_header(first, payload.len(), None, &mut header);
     session.send_vectored(&[&header[..size], payload]).await
 }
 

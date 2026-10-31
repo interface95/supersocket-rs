@@ -25,6 +25,12 @@ impl Head {
     pub(crate) fn has_token(&self, name: &str, token: &str) -> bool {
         values(&self.headers, name).any(|value| value.eq_ignore_ascii_case(token))
     }
+
+    /// The comma-separated values of every header field called `name`.
+    #[cfg_attr(not(feature = "deflate"), allow(dead_code))]
+    pub(crate) fn values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
+        values(&self.headers, name)
+    }
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -332,8 +338,14 @@ fn is_valid_key(key: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/')
 }
 
-/// The server's answer accepting a handshake.
-pub(crate) fn accept_response(key: &str, protocol: Option<&str>, extra: &Accept) -> String {
+/// The server's answer accepting a handshake, with the chosen subprotocol and the accepted
+/// `Sec-WebSocket-Extensions` value, if any.
+pub(crate) fn accept_response(
+    key: &str,
+    protocol: Option<&str>,
+    extensions: Option<&str>,
+    extra: &Accept,
+) -> String {
     let mut response = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Accept: {}\r\n",
@@ -341,6 +353,9 @@ pub(crate) fn accept_response(key: &str, protocol: Option<&str>, extra: &Accept)
     );
     if let Some(protocol) = protocol {
         push_header(&mut response, "Sec-WebSocket-Protocol", protocol);
+    }
+    if let Some(extensions) = extensions {
+        push_header(&mut response, "Sec-WebSocket-Extensions", extensions);
     }
     for (name, value) in &extra.headers {
         push_header(&mut response, name, value);

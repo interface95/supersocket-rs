@@ -319,6 +319,27 @@ WebSocketServer::builder()
     .pong_timeout(Duration::from_secs(90))
 ```
 
+Text messages can be dispatched to commands, like SuperSocket's `UseCommand` for WebSocket: the
+first word of a message is the key and the rest are the arguments. A subprotocol can have handlers
+of its own, like `UseWebSocketMessageHandler(protocol, ..)`; the first subprotocol a client also
+offers is chosen for its connection:
+
+```rust
+WebSocketServer::builder()
+    .commands(|commands| {
+        commands.add(Add); // a `WebSocketCommand<CommandPackage>`: "ADD 1 2" is answered with "3"
+    })
+    .subprotocol("chat", |chat| chat.on_message(broadcast))
+    .subprotocol("calc", |calc| calc.commands(|commands| { commands.add(Add); }))
+```
+
+With the `deflate` feature, `compression(CompressionOptions::default())` offers per-message
+compression (RFC 7692 `permessage-deflate`), which browsers and most libraries accept. By
+default neither side keeps a compression window between messages, so an idle connection holds
+no compression state and compressors come from a pool while a message is compressed. Messages
+below `threshold` (1 KiB) and ones that would not shrink are sent as they are, and
+`max_package_length` applies to a message after decompression too.
+
 With the `client` feature as well, `WebSocketClient` connects through the same connectors as
 `EasyClient`, so proxies and `wss://` work the same way:
 
@@ -469,27 +490,27 @@ Server::builder(LineFilter::default).options(options)
 ## Performance
 
 In an echo benchmark on a Ryzen 9 9950X running Linux, with server and load generator pinned to
-separate cores (4 cores, 8 threads each), the core of supersocket-rs compared with SuperSocket on
-.NET 11 RC2 with runtime async and server GC as follows:
+separate cores (4 cores, 8 threads each), supersocket-rs and SuperSocket on .NET 11 RC2 with
+runtime async and server GC ran three rounds each on the same machine at the same time, averaged:
 
 | | supersocket-rs | SuperSocket (.NET 11) |
 |---|---|---|
-| 100 connections, request/response | 2.02 M req/s, p99 89 µs | 1.50 M req/s, p99 211 µs |
-| 1,000 connections | 2.82 M req/s, p99 0.71 ms | 1.51 M req/s, p99 1.26 ms |
-| 16 pipelined requests per connection | 14.2 M req/s | 10.6 M req/s |
-| Requests per CPU-second, 100 connections | 331 K | 205 K |
-| Memory with 10,000 idle connections | 63 MB | 186 MB |
+| 1 connection, request/response | 217 K req/s, p99 5 µs | 114 K req/s, p99 49 µs |
+| 100 connections, request/response | 1.94 M req/s, p99 92 µs | 1.53 M req/s, p99 187 µs |
+| 1,000 connections | 2.57 M req/s, p99 0.76 ms | 1.53 M req/s, p99 1.26 ms |
+| 16 pipelined requests per connection | 13.1 M req/s | 10.6 M req/s |
+| Requests per CPU-second, 100 connections | 306 K | 206 K |
+| Memory under load | 24–30 MB | 112–264 MB |
+| Memory with 10,000 idle connections | 31 MB | 185 MB |
 
-These numbers come from a prototype of the same core. Since then idle sessions stopped holding
-read and write buffers, which halved the memory per idle connection again (6.4 KB to about
-3 KB in a local measurement). Echo measures framework overhead only; real applications spend most of
-their time elsewhere.
+Idle sessions hold no read or write buffers, so an idle connection takes about 2.8 KB. Echo
+measures framework overhead only; real applications spend most of their time elsewhere.
 
 The load generator is in [`tools/bench`](tools/bench), with the steps to reproduce the numbers.
 
 ## Roadmap
 
-- WebSocket compression (permessage-deflate) and a run of the Autobahn test suite
+- A run of the Autobahn test suite
 - Derive-style command registration
 - UDP sessions, if there is demand
 

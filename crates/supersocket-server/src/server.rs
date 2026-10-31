@@ -172,7 +172,24 @@ pub(crate) async fn handle_with_limit<Fut>(
 where
     Fut: Future<Output = HandlerResult>,
 {
-    match catch_panic(async { tokio::time::timeout(limit, start()).await }).await {
+    let handled = catch_panic(async {
+        // Most handlers finish without ever waiting. Setting up a timer costs about as much as
+        // handling a small package, so one is set up only once the handler does wait. Keep the
+        // original deadline so synchronous work in the first poll counts against the limit.
+        let deadline = tokio::time::Instant::now() + limit;
+        let mut future = std::pin::pin!(start());
+        match std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await {
+            std::task::Poll::Ready(result) => Ok(result),
+            // timeout_at polls the handler first; an already-expired handler must not get a
+            // second poll in which it could finish before the timer is checked.
+            std::task::Poll::Pending if tokio::time::Instant::now() >= deadline => Err(()),
+            std::task::Poll::Pending => tokio::time::timeout_at(deadline, future)
+                .await
+                .map_err(|_| ()),
+        }
+    })
+    .await;
+    match handled {
         Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(error))) => Err(PackageError::Handler(error)),
         // Dropping the handler's future cancels it at its current await point.

@@ -8,8 +8,9 @@ use supersocket_proto::{BoxFilter, PipelineFilter, ProtocolError};
 
 use crate::{
     CloseCode, CloseFrame, Message,
+    deflate::{self, Accepted, DecodeError, Decoder, Setup},
     frame::{
-        MAX_CONTROL_PAYLOAD, OP_BINARY, OP_CLOSE, OP_CONTINUATION, OP_PING, OP_PONG, OP_TEXT,
+        MAX_CONTROL_PAYLOAD, OP_BINARY, OP_CLOSE, OP_CONTINUATION, OP_PING, OP_PONG, OP_TEXT, RSV1,
         apply_mask,
     },
     handshake::{Head, HeadError, MAX_HEAD_SIZE, head_length, parse_head},
@@ -26,8 +27,9 @@ impl fmt::Debug for WebSocketPackage {
 }
 
 pub(crate) enum Package {
-    /// The HTTP head that opens the connection: the client's request or the server's response.
-    Handshake(Result<Head, HeadError>),
+    /// The HTTP head that opens the connection: the client's request or the server's response,
+    /// with what was negotiated from it.
+    Handshake(Result<Handshake, HeadError>),
     Message(Message),
     Ping(Bytes),
     Pong,
@@ -35,6 +37,12 @@ pub(crate) enum Package {
     Close(Option<CloseFrame>),
     /// The peer broke the protocol, so the connection must be closed with this code.
     Violation(CloseCode, &'static str),
+}
+
+/// A handshake head that was read, and the extension negotiated from it, if any.
+pub(crate) struct Handshake {
+    pub(crate) head: Head,
+    pub(crate) deflate: Option<Accepted>,
 }
 
 /// Which end of the connection reads the frames: clients mask their frames and servers do not.
@@ -49,17 +57,21 @@ pub(crate) enum Role {
 pub(crate) struct HeadFilter {
     role: Role,
     max_size: usize,
+    /// Settings for negotiating per-message compression, if it is offered at all.
+    deflate: Option<Setup>,
     searched: usize,
     next: Option<FrameFilter>,
     failed: bool,
 }
 
 impl HeadFilter {
-    /// A filter for `role` whose frames and messages may be at most `max_size` bytes.
-    pub(crate) fn new(role: Role, max_size: usize) -> Self {
+    /// A filter for `role` whose frames and messages may be at most `max_size` bytes, and which
+    /// negotiates per-message compression with `deflate`.
+    pub(crate) fn new(role: Role, max_size: usize, deflate: Option<Setup>) -> Self {
         Self {
             role,
             max_size,
+            deflate,
             searched: 0,
             next: None,
             failed: false,
@@ -88,12 +100,24 @@ impl PipelineFilter for HeadFilter {
                 return Ok(None);
             }
         };
-        match head {
-            Ok(_) => self.next = Some(FrameFilter::new(self.role, self.max_size)),
+        let handshake = head.and_then(|head| {
+            let deflate = match self.deflate {
+                Some(setup) => {
+                    deflate::negotiate(self.role, &head, setup).map_err(HeadError::Malformed)?
+                }
+                None => None,
+            };
+            Ok(Handshake { head, deflate })
+        });
+        match &handshake {
+            Ok(handshake) => {
+                let decoder = handshake.deflate.as_ref().map(Accepted::decoder);
+                self.next = Some(FrameFilter::new(self.role, self.max_size, decoder));
+            }
             // The connection is about to be closed; ignore whatever follows.
             Err(_) => self.failed = true,
         }
-        Ok(Some(WebSocketPackage(Package::Handshake(head))))
+        Ok(Some(WebSocketPackage(Package::Handshake(handshake))))
     }
 
     fn next_filter(&mut self) -> Option<BoxFilter<WebSocketPackage>> {
@@ -116,6 +140,8 @@ const INVALID_TEXT: Violation = (CloseCode::INVALID_PAYLOAD, "text is not valid 
 pub(crate) struct FrameFilter {
     role: Role,
     max_size: usize,
+    /// Decompresses messages, when per-message compression was negotiated.
+    deflate: Option<Decoder>,
     /// The fragmented message being received.
     partial: Option<Partial>,
     done: bool,
@@ -126,13 +152,16 @@ struct Partial {
     payload: BytesMut,
     /// How many bytes of a text message are known to be valid UTF-8.
     valid: usize,
+    /// Whether the message is compressed, so that its text is checked once decompressed.
+    compressed: bool,
 }
 
 impl FrameFilter {
-    pub(crate) fn new(role: Role, max_size: usize) -> Self {
+    pub(crate) fn new(role: Role, max_size: usize, deflate: Option<Decoder>) -> Self {
         Self {
             role,
             max_size,
+            deflate,
             partial: None,
             done: false,
         }
@@ -145,7 +174,11 @@ impl FrameFilter {
         {
             return protocol_error("nonminimal payload length");
         }
-        if header.rsv != 0 {
+        // RSV1 marks a compressed message, on its first frame only.
+        let compressed = header.rsv == RSV1
+            && self.deflate.is_some()
+            && matches!(header.opcode, OP_TEXT | OP_BINARY);
+        if header.rsv != 0 && !compressed {
             return protocol_error("reserved bits are set");
         }
         match header.opcode {
@@ -190,6 +223,7 @@ impl FrameFilter {
         fin: bool,
         opcode: u8,
         payload: BytesMut,
+        compressed: bool,
     ) -> Result<Option<Package>, Violation> {
         let package = match opcode {
             OP_PING => Package::Ping(payload.freeze()),
@@ -199,12 +233,15 @@ impl FrameFilter {
                 self.done = true;
                 Package::Close(frame)
             }
-            OP_TEXT | OP_BINARY if fin => Package::Message(message(opcode, payload)?),
+            OP_TEXT | OP_BINARY if fin => {
+                Package::Message(self.finish(opcode, payload, compressed)?)
+            }
             OP_TEXT | OP_BINARY => {
                 let mut partial = Partial {
                     opcode,
                     payload,
                     valid: 0,
+                    compressed,
                 };
                 partial.check_text()?;
                 self.partial = Some(partial);
@@ -218,10 +255,35 @@ impl FrameFilter {
                     return Ok(None);
                 }
                 let partial = self.partial.take().expect("checked by `check`");
-                Package::Message(message(partial.opcode, partial.payload)?)
+                Package::Message(self.finish(
+                    partial.opcode,
+                    partial.payload,
+                    partial.compressed,
+                )?)
             }
         };
         Ok(Some(package))
+    }
+
+    /// Turns the complete payload of a message into the message, decompressing it first when it
+    /// is compressed.
+    fn finish(
+        &mut self,
+        opcode: u8,
+        payload: BytesMut,
+        compressed: bool,
+    ) -> Result<Message, Violation> {
+        if !compressed {
+            return message(opcode, payload);
+        }
+        let decoder = self.deflate.as_mut().expect("checked by `check`");
+        match decoder.decode(&payload, self.max_size) {
+            Ok(data) => decoded_message(opcode, data),
+            Err(DecodeError::TooBig) => Err((CloseCode::MESSAGE_TOO_BIG, "message too big")),
+            Err(DecodeError::Corrupt) => {
+                Err((CloseCode::INVALID_PAYLOAD, "invalid compressed data"))
+            }
+        }
     }
 
     fn fail(&mut self, (code, why): Violation) -> WebSocketPackage {
@@ -254,7 +316,7 @@ impl PipelineFilter for FrameFilter {
             if let Some(mask) = header.mask {
                 apply_mask(&mut payload, mask);
             }
-            match self.frame(header.fin, header.opcode, payload) {
+            match self.frame(header.fin, header.opcode, payload, header.rsv == RSV1) {
                 Ok(Some(package)) => return Ok(Some(WebSocketPackage(package))),
                 Ok(None) => {}
                 Err(violation) => return Ok(Some(self.fail(violation))),
@@ -269,7 +331,7 @@ impl Partial {
     /// Checks the text received so far, so that invalid UTF-8 fails as soon as it arrives rather
     /// than when the message ends.
     fn check_text(&mut self) -> Result<(), Violation> {
-        if self.opcode != OP_TEXT {
+        if self.opcode != OP_TEXT || self.compressed {
             return Ok(());
         }
         match std::str::from_utf8(&self.payload[self.valid..]) {
@@ -288,6 +350,16 @@ fn message(opcode: u8, payload: BytesMut) -> Result<Message, Violation> {
     }
     // A message joined from fragments owns its buffer, which then becomes the string's.
     String::from_utf8(Vec::from(payload))
+        .map(Message::Text)
+        .map_err(|_| INVALID_TEXT)
+}
+
+/// Like [`message`], for a decompressed payload.
+fn decoded_message(opcode: u8, data: Vec<u8>) -> Result<Message, Violation> {
+    if opcode == OP_BINARY {
+        return Ok(Message::Binary(Bytes::from(data)));
+    }
+    String::from_utf8(data)
         .map(Message::Text)
         .map_err(|_| INVALID_TEXT)
 }
@@ -366,15 +438,14 @@ impl Header {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{MAX_HEADER_SIZE, encode_header};
+    use crate::frame::{FIN, MAX_HEADER_SIZE, encode_header};
 
     const MASK: [u8; 4] = [0x37, 0xfa, 0x21, 0x3d];
 
     /// A frame as a client sends it: masked.
     fn client_frame(first: u8, payload: &[u8]) -> Vec<u8> {
         let mut header = [0; MAX_HEADER_SIZE];
-        let size = encode_header(first & 0x0F, payload.len(), Some(MASK), &mut header);
-        header[0] = first;
+        let size = encode_header(first, payload.len(), Some(MASK), &mut header);
         let mut frame = header[..size].to_vec();
         let start = frame.len();
         frame.extend_from_slice(payload);
@@ -384,7 +455,7 @@ mod tests {
 
     /// Runs `frames` through a server's frame filter and returns the packages it produced.
     fn read(frames: &[Vec<u8>], max_size: usize) -> Vec<Package> {
-        let mut filter = FrameFilter::new(Role::Server, max_size);
+        let mut filter = FrameFilter::new(Role::Server, max_size, None);
         let mut buf = BytesMut::new();
         let mut packages = Vec::new();
         for frame in frames {
@@ -413,7 +484,7 @@ mod tests {
     #[test]
     fn unmasks_messages_and_waits_for_whole_frames() {
         let frame = client_frame(0x81, b"Hello");
-        let mut filter = FrameFilter::new(Role::Server, 1024);
+        let mut filter = FrameFilter::new(Role::Server, 1024, None);
         let mut buf = BytesMut::from(&frame[..4]);
         assert!(filter.filter(&mut buf).unwrap().is_none());
         buf.extend_from_slice(&frame[4..]);
@@ -476,7 +547,7 @@ mod tests {
                     if masked {
                         buf.extend_from_slice(&MASK);
                     }
-                    let mut filter = FrameFilter::new(role, 1024 * 1024);
+                    let mut filter = FrameFilter::new(role, 1024 * 1024, None);
                     let package = filter.filter(&mut buf).unwrap();
                     assert!(
                         matches!(
@@ -502,11 +573,11 @@ mod tests {
                     Role::Server => client_frame(0x82, &payload),
                     Role::Client => {
                         let mut header = [0; MAX_HEADER_SIZE];
-                        let size = encode_header(OP_BINARY, length, None, &mut header);
+                        let size = encode_header(FIN | OP_BINARY, length, None, &mut header);
                         [header[..size].to_vec(), payload.clone()].concat()
                     }
                 };
-                let mut filter = FrameFilter::new(role, 1024 * 1024);
+                let mut filter = FrameFilter::new(role, 1024 * 1024, None);
                 let mut buf = BytesMut::from(frame.as_slice());
                 let package = filter.filter(&mut buf).unwrap().unwrap();
                 assert!(
@@ -583,7 +654,8 @@ mod tests {
 
     #[test]
     fn head_filter_switches_to_frames() {
-        let mut filter: BoxFilter<WebSocketPackage> = Box::new(HeadFilter::new(Role::Server, 1024));
+        let mut filter: BoxFilter<WebSocketPackage> =
+            Box::new(HeadFilter::new(Role::Server, 1024, None));
         let mut buf = BytesMut::from(&b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"[..]);
         buf.extend_from_slice(&client_frame(0x81, b"early"));
         let head = filter.filter(&mut buf).unwrap().unwrap();
@@ -595,7 +667,7 @@ mod tests {
 
     #[test]
     fn head_filter_limits_the_head() {
-        let mut filter = HeadFilter::new(Role::Server, 1024 * 1024);
+        let mut filter = HeadFilter::new(Role::Server, 1024 * 1024, None);
         let mut buf = BytesMut::from(&[b'x'; MAX_HEAD_SIZE + 1][..]);
         let package = filter.filter(&mut buf).unwrap().unwrap();
         assert!(matches!(
@@ -605,7 +677,7 @@ mod tests {
         assert!(filter.next_filter().is_none());
 
         // A smaller maximum size limits the head too.
-        let mut filter = HeadFilter::new(Role::Server, 1024);
+        let mut filter = HeadFilter::new(Role::Server, 1024, None);
         let mut buf = BytesMut::from(&[b'x'; 1025][..]);
         let package = filter.filter(&mut buf).unwrap().unwrap();
         assert!(matches!(
@@ -626,7 +698,7 @@ mod tests {
                 for split in [false, true] {
                     let head =
                         format!("{start}{}\r\n\r\n", "a".repeat(limit + 1 - start.len() - 4));
-                    let mut filter = HeadFilter::new(role, max_size);
+                    let mut filter = HeadFilter::new(role, max_size, None);
                     let mut buf = BytesMut::new();
                     if split {
                         buf.extend_from_slice(&head.as_bytes()[..limit - 1]);
@@ -651,13 +723,163 @@ mod tests {
                 };
                 let mut buf = BytesMut::from(head.as_bytes());
                 buf.extend_from_slice(&following);
-                let mut filter = HeadFilter::new(role, max_size);
+                let mut filter = HeadFilter::new(role, max_size, None);
                 let package = filter.filter(&mut buf).unwrap().unwrap();
                 assert!(matches!(package.0, Package::Handshake(Ok(_))));
                 assert_eq!(&buf[..], following);
                 let mut frames = filter.next_filter().unwrap();
                 let package = frames.filter(&mut buf).unwrap().unwrap();
                 assert_eq!(text(&package.0), "hello");
+            }
+        }
+    }
+
+    #[cfg(feature = "deflate")]
+    mod compressed {
+        use flate2::{Compress, Compression, FlushCompress};
+
+        use super::*;
+        use crate::{deflate::CompressionOptions, handshake::parse_head};
+
+        /// "Hello", compressed as in RFC 7692 section 7.2.3.1.
+        const HELLO: [u8; 7] = [0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00];
+
+        /// A server's frame filter that negotiated compression with a client.
+        fn negotiated_filter(max_size: usize) -> FrameFilter {
+            let head = parse_head(
+                b"GET / HTTP/1.1\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+            )
+            .unwrap();
+            let accepted = deflate::negotiate(Role::Server, &head, CompressionOptions::default())
+                .unwrap()
+                .unwrap();
+            FrameFilter::new(Role::Server, max_size, Some(accepted.decoder()))
+        }
+
+        fn compress(data: &[u8]) -> Vec<u8> {
+            let mut compressor = Compress::new(Compression::default(), false);
+            let mut out = Vec::with_capacity(data.len() + 64);
+            compressor
+                .compress_vec(data, &mut out, FlushCompress::Sync)
+                .unwrap();
+            assert!(out.ends_with(&[0, 0, 0xff, 0xff]));
+            out.truncate(out.len() - 4);
+            out
+        }
+
+        fn read_with(filter: &mut FrameFilter, frames: &[Vec<u8>]) -> Vec<Package> {
+            let mut buf = BytesMut::new();
+            let mut packages = Vec::new();
+            for frame in frames {
+                buf.extend_from_slice(frame);
+                while let Some(package) = filter.filter(&mut buf).unwrap() {
+                    packages.push(package.0);
+                }
+            }
+            packages
+        }
+
+        #[test]
+        fn compressed_messages_are_decompressed_whole_or_in_fragments() {
+            let mut filter = negotiated_filter(1024);
+            let packages = read_with(
+                &mut filter,
+                &[
+                    client_frame(FIN | RSV1 | OP_TEXT, &HELLO),
+                    client_frame(FIN | RSV1 | OP_BINARY, &HELLO),
+                    client_frame(RSV1 | OP_TEXT, &HELLO[..3]),
+                    client_frame(OP_CONTINUATION, &HELLO[3..5]),
+                    client_frame(FIN | OP_CONTINUATION, &HELLO[5..]),
+                    client_frame(FIN | OP_TEXT, b"plain"),
+                ],
+            );
+            assert_eq!(packages.len(), 4, "{}", packages.len());
+            assert_eq!(text(&packages[0]), "Hello");
+            assert!(
+                matches!(&packages[1], Package::Message(Message::Binary(data)) if &data[..] == b"Hello")
+            );
+            assert_eq!(text(&packages[2]), "Hello");
+            assert_eq!(text(&packages[3]), "plain");
+        }
+
+        #[test]
+        fn rsv1_is_only_allowed_where_compression_was_negotiated() {
+            let violation = |filter: &mut FrameFilter, frame: Vec<u8>| match read_with(
+                filter,
+                &[frame],
+            )
+            .pop()
+            {
+                Some(Package::Violation(code, _)) => code,
+                other => panic!("no violation: {:?}", other.map(|_| ())),
+            };
+            // Without the extension.
+            let mut plain = FrameFilter::new(Role::Server, 1024, None);
+            assert_eq!(
+                violation(&mut plain, client_frame(FIN | RSV1 | OP_TEXT, &HELLO)),
+                CloseCode::PROTOCOL_ERROR
+            );
+            // On a continuation frame.
+            let mut filter = negotiated_filter(1024);
+            assert!(
+                read_with(&mut filter, &[client_frame(RSV1 | OP_TEXT, &HELLO[..3])]).is_empty()
+            );
+            assert_eq!(
+                violation(
+                    &mut filter,
+                    client_frame(FIN | RSV1 | OP_CONTINUATION, &HELLO[3..])
+                ),
+                CloseCode::PROTOCOL_ERROR
+            );
+            // On a control frame.
+            assert_eq!(
+                violation(
+                    &mut negotiated_filter(1024),
+                    client_frame(FIN | RSV1 | OP_PING, b"")
+                ),
+                CloseCode::PROTOCOL_ERROR
+            );
+            // RSV2 and RSV3 stay reserved.
+            assert_eq!(
+                violation(
+                    &mut negotiated_filter(1024),
+                    client_frame(FIN | 0x20 | OP_TEXT, &HELLO)
+                ),
+                CloseCode::PROTOCOL_ERROR
+            );
+        }
+
+        #[test]
+        fn decompressed_messages_are_checked_like_plain_ones() {
+            let mut filter = negotiated_filter(1024);
+            let invalid = compress(&[0x80, 0xff]);
+            match read_with(&mut filter, &[client_frame(FIN | RSV1 | OP_TEXT, &invalid)]).pop() {
+                Some(Package::Violation(code, _)) => assert_eq!(code, CloseCode::INVALID_PAYLOAD),
+                _ => panic!("invalid text was accepted"),
+            }
+            let mut filter = negotiated_filter(1024);
+            match read_with(
+                &mut filter,
+                &[client_frame(FIN | RSV1 | OP_BINARY, &[0xff; 8])],
+            )
+            .pop()
+            {
+                Some(Package::Violation(code, _)) => assert_eq!(code, CloseCode::INVALID_PAYLOAD),
+                _ => panic!("garbage was accepted"),
+            }
+            // A small frame that inflates beyond the limit.
+            let mut filter = negotiated_filter(1024);
+            let bomb = compress(&[0; 4096]);
+            assert!(bomb.len() < 128);
+            match read_with(&mut filter, &[client_frame(FIN | RSV1 | OP_BINARY, &bomb)]).pop() {
+                Some(Package::Violation(code, _)) => assert_eq!(code, CloseCode::MESSAGE_TOO_BIG),
+                _ => panic!("an oversized message was accepted"),
+            }
+            // Exactly the limit is fine.
+            let mut filter = negotiated_filter(4096);
+            match read_with(&mut filter, &[client_frame(FIN | RSV1 | OP_BINARY, &bomb)]).pop() {
+                Some(Package::Message(Message::Binary(data))) => assert_eq!(data.len(), 4096),
+                _ => panic!("a message at the limit was refused"),
             }
         }
     }

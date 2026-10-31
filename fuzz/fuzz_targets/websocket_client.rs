@@ -8,5 +8,12 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let max_size = 1usize << (size % 16 + 4);
-    supersocket_websocket::fuzzing::pipeline(false, max_size, usize::from(*chunk) + 1, stream);
+    let deflate = size & 0x80 != 0;
+    supersocket_websocket::fuzzing::pipeline(
+        false,
+        max_size,
+        usize::from(*chunk) + 1,
+        deflate,
+        stream,
+    );
 });

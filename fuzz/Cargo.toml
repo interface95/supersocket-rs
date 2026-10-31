@@ -12,7 +12,7 @@ libfuzzer-sys = "0.4"
 supersocket-connection = { path = "../crates/supersocket-connection" }
 supersocket-proto = { path = "../crates/supersocket-proto", features = ["codec"] }
 supersocket-server = { path = "../crates/supersocket-server" }
-supersocket-websocket = { path = "../crates/supersocket-websocket" }
+supersocket-websocket = { path = "../crates/supersocket-websocket", features = ["deflate"] }
 bytes = "1"
 tokio = { version = "1", default-features = false, features = ["rt"] }
 tokio-util = { version = "0.7", default-features = false, features = ["codec"] }

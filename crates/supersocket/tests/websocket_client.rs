@@ -351,3 +351,106 @@ async fn close_and_protocol_errors_close_the_transport_while_handles_live() {
         assert_eq!(receive(&mut client).await, None);
     }
 }
+
+#[cfg(feature = "deflate")]
+mod compression {
+    use super::*;
+    use supersocket::websocket::CompressionOptions;
+
+    fn options(shared_windows: bool) -> CompressionOptions {
+        CompressionOptions {
+            threshold: 0,
+            server_no_context_takeover: !shared_windows,
+            client_no_context_takeover: !shared_windows,
+            ..CompressionOptions::default()
+        }
+    }
+
+    fn echo() -> WebSocketBuilder {
+        WebSocketServer::builder().on_message(async |session, message| {
+            session.send(&message).await?;
+            Ok(())
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn messages_are_compressed_both_ways_with_or_without_shared_windows() {
+        let long_text = "lorem ipsum ".repeat(20_000);
+        let pattern: Vec<u8> = (0..150_000u32).map(|i| (i % 97) as u8).collect();
+        let messages = [
+            Message::from("hello"),
+            Message::from(long_text.as_str()),
+            Message::from(pattern),
+            Message::from(""),
+            Message::from("hello"),
+            Message::from(vec![0u8; 100_000]),
+        ];
+        for (server_shares, client_shares) in
+            [(false, false), (true, true), (true, false), (false, true)]
+        {
+            let (server, address) = start(echo().compression(options(server_shares)));
+            let mut client = WebSocketClient::builder(format!("ws://{address}/"))
+                .compression(options(client_shares))
+                .connect()
+                .await
+                .unwrap();
+            for message in &messages {
+                client.send(message).await.unwrap();
+                assert_eq!(
+                    receive(&mut client).await.as_ref(),
+                    Some(message),
+                    "server shares windows: {server_shares}, client: {client_shares}"
+                );
+            }
+            client.close(CloseCode::NORMAL, "").await.unwrap();
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_client_without_compression_talks_to_a_compressing_server() {
+        let (server, address) = start(echo().compression(options(false)));
+        let mut client = WebSocketClient::connect(format!("ws://{address}/"))
+            .await
+            .unwrap();
+        let text = "x".repeat(5000);
+        client.send_text(&text).await.unwrap();
+        assert_eq!(
+            receive(&mut client).await,
+            Some(Message::from(text.as_str()))
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn servers_that_answer_with_an_invalid_extension_are_refused() {
+        for (offered, answer) in [
+            (true, "permessage-deflate"),
+            (true, "permessage-deflate; client_max_window_bits=10"),
+            (true, "x-custom"),
+            (false, "permessage-deflate"),
+        ] {
+            let address = fake_server(move |mut stream: TcpStream, key: String| async move {
+                let response = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                     Connection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\
+                     Sec-WebSocket-Extensions: {answer}\r\n\r\n",
+                    derive_accept_key(key.as_bytes())
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                let _ = stream.read(&mut [0; 64]).await;
+            })
+            .await;
+            let mut builder = WebSocketClient::builder(format!("ws://{address}/"));
+            if offered {
+                builder = builder.compression(CompressionOptions::default());
+            }
+            let error = builder.connect().await.unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "offered: {offered}, answer: {answer}: {error}"
+            );
+        }
+    }
+}

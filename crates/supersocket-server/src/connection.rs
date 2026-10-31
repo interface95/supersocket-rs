@@ -514,9 +514,13 @@ where
         *connected = true;
     }
     let mut in_flight = JoinSet::new();
+    let concurrent = matches!(options.package_handling, PackageHandling::Concurrent { .. });
 
     let reason = loop {
-        while in_flight.try_join_next().is_some() {}
+        // Reaping finished tasks takes a lock; only concurrent handling has any.
+        if concurrent {
+            while in_flight.try_join_next().is_some() {}
+        }
         // Packages already received are handled without waiting; only wait for more data (and
         // watch for the session closing) when none is complete.
         let package = match packages.try_next() {

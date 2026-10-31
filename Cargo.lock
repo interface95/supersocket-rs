@@ -862,6 +862,7 @@ name = "supersocket-websocket"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "flate2",
  "supersocket-client",
  "supersocket-connection",
  "supersocket-proto",

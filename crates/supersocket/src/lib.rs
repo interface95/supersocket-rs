@@ -28,6 +28,7 @@
 //! - `proxy`: HTTP CONNECT, SOCKS4 and SOCKS5 proxy connectors for the client.
 //! - `websocket`: the WebSocket server in the `websocket` module, and with `client` the WebSocket
 //!   client.
+//! - `deflate`: WebSocket per-message compression (`permessage-deflate`), with `websocket`.
 //! - `gzip`: gzip compression of connections, `GzipLayer` for the server and, with `client`,
 //!   `GzipConnector` for the client.
 //! - `codec`: `CodecFilter`, which runs a `tokio_util::codec::Decoder` as a pipeline filter.

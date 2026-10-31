@@ -36,8 +36,20 @@ impl AsyncRead for Chunked<'_> {
 
 /// Runs `data` through the handshake and frame filters of a server (or a client), as they would
 /// see it arriving in pieces of `chunk` bytes, with `max_size` as the maximum package length.
-pub fn pipeline(server: bool, max_size: usize, chunk: usize, data: &[u8]) {
+/// With `deflate`, per-message compression is offered, so that frames with RSV1 are decompressed
+/// when the handshake negotiates it.
+pub fn pipeline(server: bool, max_size: usize, chunk: usize, deflate: bool, data: &[u8]) {
     let role = if server { Role::Server } else { Role::Client };
+    #[cfg(feature = "deflate")]
+    let deflate = deflate.then(|| crate::CompressionOptions {
+        threshold: 0,
+        ..crate::CompressionOptions::default()
+    });
+    #[cfg(not(feature = "deflate"))]
+    let deflate = {
+        let _ = deflate;
+        None
+    };
     let options = ReadOptions {
         max_package_length: max_size.max(16),
         receive_buffer_size: 64,
@@ -46,7 +58,7 @@ pub fn pipeline(server: bool, max_size: usize, chunk: usize, data: &[u8]) {
         data,
         chunk: chunk.max(1),
     };
-    let filter = Box::new(HeadFilter::new(role, options.max_package_length));
+    let filter = Box::new(HeadFilter::new(role, options.max_package_length, deflate));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("a runtime");

@@ -621,6 +621,45 @@ async fn error_handler_decides_after_failures_and_timeouts() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn package_handling_timeout_includes_work_before_the_first_await() {
+    let (server, address) = start(
+        Server::builder(LineFilter::default)
+            .configure(|options| options.package_handling_timeout = Duration::from_millis(50))
+            .on_package(async |session, package| {
+                if matches!(package.text.as_str(), "slow" | "yield" | "split") {
+                    // Simulate synchronous decoding or validation in the first poll. "split"
+                    // spends part of its budget here and the rest awaiting I/O; the other two
+                    // have already exceeded their deadline by the time they yield.
+                    let synchronous = if package.text == "split" { 30 } else { 80 };
+                    let started = Instant::now();
+                    while started.elapsed() < Duration::from_millis(synchronous) {
+                        std::hint::spin_loop();
+                    }
+                    if package.text == "yield" {
+                        tokio::task::yield_now().await;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                    }
+                }
+                session.send(format!("{}\r\n", package.text)).await?;
+                Ok(())
+            })
+            .on_error(async |session, error| {
+                assert!(matches!(error, PackageError::Timeout(_)), "{error}");
+                session.send("timed out\r\n").await.unwrap();
+                ErrorAction::Continue
+            }),
+    );
+    let mut client = Client::connect(address).await;
+    client.send(b"slow\r\nyield\r\nsplit\r\nfast\r\n").await;
+    assert_eq!(client.line().await, "timed out");
+    assert_eq!(client.line().await, "timed out");
+    assert_eq!(client.line().await, "timed out");
+    assert_eq!(client.line().await, "fast");
+    server.shutdown().await;
+}
+
 fn slow_echo(max_in_flight: usize) -> ServerBuilder<TextPackage> {
     Server::builder(LineFilter::default)
         .on_package(async |session, package| {

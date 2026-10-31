@@ -2,6 +2,7 @@
 //!
 //! ```sh
 //! cargo run --example websocket_echo_server --features websocket
+//! cargo run --example websocket_echo_server --features websocket,deflate # compressed
 //! ```
 //!
 //! Then, in a browser console:
@@ -19,13 +20,13 @@ async fn main() -> Result<(), supersocket::Error> {
         )
         .init();
 
-    WebSocketServer::builder()
-        .on_message(async |session, message| {
-            session.send(&message).await?;
-            Ok(())
-        })
-        .listen("0.0.0.0:4040")
-        .build()?
-        .run()
-        .await
+    let builder = WebSocketServer::builder().on_message(async |session, message| {
+        session.send(&message).await?;
+        Ok(())
+    });
+    // With the `deflate` feature, messages are compressed for clients that support it, as
+    // browsers do.
+    #[cfg(feature = "deflate")]
+    let builder = builder.compression(supersocket::websocket::CompressionOptions::default());
+    builder.listen("0.0.0.0:4040").build()?.run().await
 }

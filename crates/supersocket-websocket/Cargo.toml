@@ -17,6 +17,8 @@ all-features = true
 client = ["dep:supersocket-client"]
 ## `wss://` for the client, with `client`.
 tls = ["supersocket-client?/tls"]
+## Per-message compression (RFC 7692 `permessage-deflate`) for the server and the client.
+deflate = ["dep:flate2"]
 
 [dependencies]
 supersocket-connection.workspace = true
@@ -24,6 +26,7 @@ supersocket-proto.workspace = true
 supersocket-server.workspace = true
 supersocket-client = { workspace = true, optional = true }
 bytes.workspace = true
+flate2 = { version = "1.1", optional = true }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tokio-util.workspace = true
 tracing.workspace = true

@@ -11,10 +11,10 @@ use std::{
 use common::WAIT;
 use futures_util::{SinkExt, StreamExt};
 use supersocket::{
-    CloseReason,
+    CloseReason, CommandPackage, HandlerResult,
     websocket::{
-        Accept, CloseCode, CloseFrame, Rejection, WebSocketBuilder, WebSocketServer,
-        WebSocketSession,
+        Accept, CloseCode, CloseFrame, Rejection, WebSocketBuilder, WebSocketCommand,
+        WebSocketServer, WebSocketSession,
     },
 };
 use tokio::{
@@ -322,22 +322,30 @@ const MASK: [u8; 4] = [0xa1, 0xb2, 0xc3, 0xd4];
 
 impl RawClient {
     async fn connect(address: SocketAddr) -> Self {
+        Self::connect_with(address, "").await.0
+    }
+
+    /// Connects with `extra` header lines in the handshake request, and returns the response
+    /// head as well.
+    async fn connect_with(address: SocketAddr, extra: &str) -> (Self, String) {
         let mut stream = TcpStream::connect(address).await.unwrap();
-        let response = Self::handshake(&mut stream).await;
+        let response = Self::handshake_with(&mut stream, extra).await;
         assert!(response.starts_with("HTTP/1.1 101 "), "{response}");
-        Self { stream }
+        (Self { stream }, response)
     }
 
     /// Sends a handshake request and returns the response head.
     async fn handshake(stream: &mut TcpStream) -> String {
-        stream
-            .write_all(
-                b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
-                  Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-                  Sec-WebSocket-Version: 13\r\n\r\n",
-            )
-            .await
-            .unwrap();
+        Self::handshake_with(stream, "").await
+    }
+
+    async fn handshake_with(stream: &mut TcpStream, extra: &str) -> String {
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n{extra}\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
         read_head(stream).await
     }
 
@@ -588,4 +596,234 @@ async fn session_state_can_come_from_the_connection() {
         "{reply}"
     );
     server.shutdown().await;
+}
+
+struct Add;
+
+impl WebSocketCommand<CommandPackage> for Add {
+    fn key(&self) -> String {
+        "ADD".into()
+    }
+
+    async fn execute(&self, session: &WebSocketSession, package: CommandPackage) -> HandlerResult {
+        let mut sum = 0i64;
+        for arg in package.args() {
+            sum += arg.parse::<i64>()?;
+        }
+        session.send_text(&sum.to_string()).await?;
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn text_messages_are_dispatched_to_commands() {
+    let (server, address) = start(WebSocketServer::builder().commands(|commands| {
+        commands
+            .add(Add)
+            .on_unknown(async |session, package: CommandPackage| {
+                session
+                    .send_text(&format!("unknown {}", package.key))
+                    .await?;
+                Ok(())
+            });
+    }));
+    let mut ws = connect(address).await;
+    ws.send(tungstenite::Message::text("ADD 1 2 3"))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut ws).await.to_text().unwrap(), "6");
+    ws.send(tungstenite::Message::text("MUL 2 3"))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut ws).await.to_text().unwrap(), "unknown MUL");
+    // Binary messages are not commands.
+    ws.send(tungstenite::Message::binary(vec![1, 2, 3]))
+        .await
+        .unwrap();
+    ws.send(tungstenite::Message::text("ADD 4 5"))
+        .await
+        .unwrap();
+    assert_eq!(next(&mut ws).await.to_text().unwrap(), "9");
+    server.shutdown().await;
+}
+
+/// Connects offering `protocols` and returns the connection and the subprotocol the server chose.
+async fn connect_offering(address: SocketAddr, protocols: &str) -> (Tungstenite, Option<String>) {
+    let mut request = format!("ws://{address}/").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("Sec-WebSocket-Protocol", protocols.parse().unwrap());
+    let (ws, response) = connect_async(request).await.unwrap();
+    let chosen = response
+        .headers()
+        .get("sec-websocket-protocol")
+        .map(|value| value.to_str().unwrap().to_owned());
+    (ws, chosen)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subprotocols_can_have_handlers_of_their_own() {
+    let (server, address) = start(
+        WebSocketServer::builder()
+            .subprotocol("upper", |upper| {
+                upper.on_message(async |session, message| {
+                    let text = message.as_text().unwrap_or_default().to_uppercase();
+                    session.send_text(&text).await?;
+                    Ok(())
+                })
+            })
+            .subprotocol("calc", |calc| {
+                calc.commands(|commands| {
+                    commands.add(Add);
+                })
+            })
+            .subprotocols(["plain"])
+            .on_message(async |session, message| {
+                session.send(&message).await?;
+                Ok(())
+            }),
+    );
+    for (offered, chosen, sent, expected) in [
+        ("calc", Some("calc"), "ADD 2 2", "4"),
+        ("upper", Some("upper"), "hi", "HI"),
+        // The server's order of preference decides.
+        ("plain, upper", Some("upper"), "hi", "HI"),
+        // A subprotocol without a handler of its own uses the default one.
+        ("plain", Some("plain"), "hi", "hi"),
+    ] {
+        let (mut ws, protocol) = connect_offering(address, offered).await;
+        assert_eq!(protocol.as_deref(), chosen, "{offered}");
+        ws.send(tungstenite::Message::text(sent)).await.unwrap();
+        assert_eq!(
+            next(&mut ws).await.to_text().unwrap(),
+            expected,
+            "{offered}"
+        );
+        ws.close(None).await.unwrap();
+    }
+    // A client whose subprotocols are all unknown gets none, and the default handler; tungstenite
+    // refuses such a response, so the frames are written by hand.
+    let (mut client, response) =
+        RawClient::connect_with(address, "Sec-WebSocket-Protocol: unknown\r\n").await;
+    assert!(!response.contains("Sec-WebSocket-Protocol"), "{response}");
+    client.send(0x81, b"hi", true).await;
+    assert_eq!(client.receive().await, (0x81, b"hi".to_vec()));
+    server.shutdown().await;
+}
+
+#[cfg(feature = "deflate")]
+mod compression {
+    use super::*;
+    use supersocket::websocket::CompressionOptions;
+
+    /// "Hello", compressed as in RFC 7692 section 7.2.3.1.
+    const HELLO: [u8; 7] = [0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00];
+    /// 4096 zero bytes, compressed.
+    const ZEROS_4096: [u8; 21] = [
+        0xec, 0xc1, 0x01, 0x0d, 0x00, 0x00, 0x00, 0xc2, 0xa0, 0xf7, 0x4f, 0x6d, 0x0f, 0x07, 0x14,
+        0x00, 0x00, 0x00, 0xf0, 0x6e, 0x00,
+    ];
+    /// What browsers offer.
+    const OFFER: &str = "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n";
+
+    fn compressing(options: CompressionOptions) -> WebSocketBuilder {
+        echo().compression(options)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn compression_is_negotiated_and_long_replies_are_compressed() {
+        let (server, address) = start(compressing(CompressionOptions {
+            threshold: 64,
+            ..CompressionOptions::default()
+        }));
+        let (mut client, response) = RawClient::connect_with(address, OFFER).await;
+        assert!(
+            response.contains(
+                "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; \
+                 client_no_context_takeover\r\n"
+            ),
+            "{response}"
+        );
+        // A compressed message from the client is decompressed; the short reply is sent as it is.
+        client.send(0xC1, &HELLO, true).await;
+        assert_eq!(client.receive().await, (0x81, b"Hello".to_vec()));
+        // A long reply is compressed, whether or not the request was.
+        let long = "a".repeat(2000);
+        client.send(0x81, long.as_bytes(), true).await;
+        let (first, payload) = client.receive().await;
+        assert_eq!(first, 0xC1, "a compressed text frame");
+        assert!(payload.len() < 100, "{} bytes", payload.len());
+        // A fragmented compressed message is decompressed once it is complete.
+        client.send(0x41, &HELLO[..3], true).await;
+        client.send(0x80, &HELLO[3..], true).await;
+        assert_eq!(client.receive().await, (0x81, b"Hello".to_vec()));
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn offers_the_server_cannot_honor_are_declined() {
+        let (server, address) = start(compressing(CompressionOptions::default()));
+        let (mut client, response) = RawClient::connect_with(
+            address,
+            "Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=10\r\n",
+        )
+        .await;
+        assert!(!response.contains("Sec-WebSocket-Extensions"), "{response}");
+        // Without the extension, RSV1 is a protocol error.
+        client.send(0xC1, &HELLO, true).await;
+        client.expect_close(CloseCode::PROTOCOL_ERROR).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn final_deflate_blocks_do_not_truncate_messages() {
+        let (server, address) = start(compressing(CompressionOptions::default()));
+        let (mut client, _) = RawClient::connect_with(address, OFFER).await;
+        let blocks = b"\x01\x05\x00\xfa\xffHello\x00\x05\x00\xfa\xffWorld\x00";
+        client.send(0xC1, blocks, true).await;
+        assert_eq!(client.receive().await, (0x81, b"HelloWorld".to_vec()));
+        // Both the WebSocket and DEFLATE block boundaries may split this message.
+        client.send(0x41, &blocks[..12], true).await;
+        client.send(0x80, &blocks[12..], true).await;
+        assert_eq!(client.receive().await, (0x81, b"HelloWorld".to_vec()));
+        client
+            .send(0xC1, b"\x01\x05\x00\xfa\xffHello\xff", true)
+            .await;
+        client.expect_close(CloseCode::INVALID_PAYLOAD).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn messages_that_decompress_beyond_the_limit_are_refused() {
+        let (server, address) = start(
+            compressing(CompressionOptions::default())
+                .configure(|options| options.max_package_length = 1024),
+        );
+        let (mut client, _) = RawClient::connect_with(address, OFFER).await;
+        client.send(0xC2, &ZEROS_4096, true).await;
+        client.expect_close(CloseCode::MESSAGE_TOO_BIG).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn broadcasts_with_try_send_are_compressed_too() {
+        let (server, address) = start(
+            WebSocketServer::builder()
+                .compression(CompressionOptions {
+                    threshold: 0,
+                    ..CompressionOptions::default()
+                })
+                .on_message(async |session, message| {
+                    session.try_send(&message)?;
+                    Ok(())
+                }),
+        );
+        let (mut client, _) = RawClient::connect_with(address, OFFER).await;
+        let long = "b".repeat(2000);
+        client.send(0x81, long.as_bytes(), true).await;
+        let (first, payload) = client.receive().await;
+        assert_eq!(first, 0xC1, "a compressed text frame");
+        assert!(payload.len() < 100, "{} bytes", payload.len());
+        server.shutdown().await;
+    }
 }

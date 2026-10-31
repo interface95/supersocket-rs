@@ -19,9 +19,10 @@ use supersocket_proto::ProtocolError;
 
 use crate::{
     CloseCode, CloseFrame, Message,
+    deflate::{Encoder, Setup},
     filter::{HeadFilter, Package, Role, WebSocketPackage},
     frame::{
-        MAX_CLOSE_FRAME, MAX_CONTROL_PAYLOAD, MAX_HEADER_SIZE, OP_BINARY, OP_PING, OP_PONG,
+        FIN, MAX_CLOSE_FRAME, MAX_CONTROL_PAYLOAD, MAX_HEADER_SIZE, OP_BINARY, OP_PING, OP_PONG,
         OP_TEXT, apply_mask, close_frame, encode_header,
     },
     handshake::{Head, accept_key, base64, push_header},
@@ -41,11 +42,20 @@ pub struct WebSocketClientBuilder {
     headers: Vec<(String, String)>,
     options: ClientOptions,
     deferred: Vec<Deferred>,
+    deflate: Option<Setup>,
     #[cfg(feature = "tls")]
     tls: Option<supersocket_client::TlsConnector>,
 }
 
 impl WebSocketClientBuilder {
+    /// Offers per-message compression (RFC 7692 `permessage-deflate`) to the server; see
+    /// [`CompressionOptions`](crate::CompressionOptions). Default: no compression.
+    #[cfg(feature = "deflate")]
+    pub fn compression(mut self, options: crate::CompressionOptions) -> Self {
+        self.deflate = Some(options);
+        self
+    }
+
     /// Offers `protocols` to the server, in order of preference; see
     /// [`WebSocketClient::protocol`].
     pub fn subprotocols(mut self, protocols: impl IntoIterator<Item = impl Into<String>>) -> Self {
@@ -89,8 +99,10 @@ impl WebSocketClientBuilder {
     pub async fn connect(self) -> io::Result<WebSocketClient> {
         let url = Url::parse(&self.url)?;
         let max_size = self.options.max_package_length;
-        let mut builder = EasyClient::builder(move || HeadFilter::new(Role::Client, max_size))
-            .options(self.options.clone());
+        let deflate = self.deflate;
+        let mut builder =
+            EasyClient::builder(move || HeadFilter::new(Role::Client, max_size, deflate))
+                .options(self.options.clone());
         for deferred in self.deferred {
             builder = deferred(builder);
         }
@@ -120,6 +132,9 @@ impl WebSocketClientBuilder {
                 &self.subprotocols.join(", "),
             );
         }
+        if let Some(offer) = deflate.as_ref().map(extension_offer) {
+            push_header(&mut request, "Sec-WebSocket-Extensions", &offer);
+        }
         for (name, value) in &self.headers {
             push_header(&mut request, name, value);
         }
@@ -127,8 +142,15 @@ impl WebSocketClientBuilder {
         let handshake = async {
             client.send(request).await?;
             match client.receive().await? {
-                Some(WebSocketPackage(Package::Handshake(Ok(head)))) => {
-                    check_response(&head, &key, &self.subprotocols)
+                Some(WebSocketPackage(Package::Handshake(Ok(handshake)))) => {
+                    // The filter checked the extensions when compression was offered.
+                    let protocol = check_response(
+                        &handshake.head,
+                        &key,
+                        &self.subprotocols,
+                        deflate.is_some(),
+                    )?;
+                    Ok((protocol, handshake.deflate))
                 }
                 Some(WebSocketPackage(Package::Handshake(Err(error)))) => {
                     Err(invalid_data(format!("invalid handshake response: {error}")))
@@ -139,13 +161,14 @@ impl WebSocketClientBuilder {
                 )),
             }
         };
-        let protocol = tokio::time::timeout(self.options.connect_timeout, handshake)
+        let (protocol, deflate) = tokio::time::timeout(self.options.connect_timeout, handshake)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the handshake timed out"))??;
 
         let sender = WebSocketSender {
             sender: client.sender(),
             close_sent: Arc::new(AtomicBool::new(false)),
+            compression: deflate.map(|accepted| Arc::new(accepted.encoder())),
         };
         Ok(WebSocketClient {
             client: Some(client),
@@ -205,6 +228,7 @@ impl WebSocketClient {
             headers: Vec::new(),
             options: ClientOptions::default(),
             deferred: Vec::new(),
+            deflate: None,
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -235,7 +259,7 @@ impl WebSocketClient {
                 Package::Message(message) => return Ok(Some(message)),
                 Package::Ping(payload) => {
                     if !self.sender.close_sent.load(Ordering::Acquire) {
-                        let _ = self.sender.send_frame(OP_PONG, &payload).await;
+                        let _ = self.sender.send_frame(FIN | OP_PONG, &payload).await;
                     }
                 }
                 Package::Close(frame) => {
@@ -348,6 +372,8 @@ impl fmt::Debug for WebSocketClient {
 pub struct WebSocketSender {
     sender: ClientSender,
     close_sent: Arc<AtomicBool>,
+    /// Compresses outgoing messages, when the extension was negotiated.
+    compression: Option<Arc<Encoder>>,
 }
 
 impl WebSocketSender {
@@ -378,7 +404,7 @@ impl WebSocketSender {
                 "a ping payload is at most 125 bytes",
             ));
         }
-        self.send_frame(OP_PING, payload).await
+        self.send_frame(FIN | OP_PING, payload).await
     }
 
     /// Starts the closing handshake by sending a close frame; the receiving side then returns
@@ -410,7 +436,18 @@ impl WebSocketSender {
                 "the WebSocket connection is closing",
             ));
         }
-        self.send_frame(opcode, payload).await
+        if let Some(encoder) = &self.compression {
+            // With a shared window, a frame that a cancelled send left behind goes first.
+            loop {
+                let encoded = encoder.encode(opcode, payload).await;
+                let (first, data) = encoded.frame(opcode, payload);
+                self.send_frame(first, data).await?;
+                if encoded.finish() {
+                    return Ok(());
+                }
+            }
+        }
+        self.send_frame(FIN | opcode, payload).await
     }
 
     /// Queues a close frame as the last data, so that no frame can follow it.
@@ -420,10 +457,10 @@ impl WebSocketSender {
         self.sender.send_last(&frame[..length])
     }
 
-    async fn send_frame(&self, opcode: u8, payload: &[u8]) -> io::Result<()> {
+    async fn send_frame(&self, first: u8, payload: &[u8]) -> io::Result<()> {
         let mut frame = BytesMut::new();
         let mask = random_bytes::<4>();
-        encode_frame(opcode, payload, Some(mask), &mut frame);
+        encode_frame(first, payload, Some(mask), &mut frame);
         self.sender.send(&frame).await
     }
 }
@@ -436,10 +473,10 @@ impl fmt::Debug for WebSocketSender {
     }
 }
 
-/// Encodes an unfragmented frame into `buf`, masked with `mask` when one is given.
-fn encode_frame(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>, buf: &mut BytesMut) {
+/// Encodes a frame with the first byte `first` into `buf`, masked with `mask` when one is given.
+fn encode_frame(first: u8, payload: &[u8], mask: Option<[u8; 4]>, buf: &mut BytesMut) {
     let mut header = [0; MAX_HEADER_SIZE];
-    let size = encode_header(opcode, payload.len(), mask, &mut header);
+    let size = encode_header(first, payload.len(), mask, &mut header);
     buf.reserve(size + payload.len());
     buf.extend_from_slice(&header[..size]);
     let start = buf.len();
@@ -449,8 +486,25 @@ fn encode_frame(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>, buf: &mut Byt
     }
 }
 
-/// Checks the server's answer to the handshake and returns the subprotocol it chose.
-fn check_response(head: &Head, key: &str, offered: &[String]) -> io::Result<Option<String>> {
+/// The `Sec-WebSocket-Extensions` value offering compression.
+#[cfg(feature = "deflate")]
+fn extension_offer(options: &Setup) -> String {
+    crate::deflate::offer(options)
+}
+
+#[cfg(not(feature = "deflate"))]
+fn extension_offer(options: &Setup) -> String {
+    match *options {}
+}
+
+/// Checks the server's answer to the handshake and returns the subprotocol it chose. Extensions
+/// were checked by the handshake filter when some were offered; otherwise none may be chosen.
+fn check_response(
+    head: &Head,
+    key: &str,
+    offered: &[String],
+    extensions_offered: bool,
+) -> io::Result<Option<String>> {
     let status = head
         .start_line
         .strip_prefix("HTTP/1.1 ")
@@ -475,7 +529,7 @@ fn check_response(head: &Head, key: &str, offered: &[String]) -> io::Result<Opti
             "the server sent a wrong Sec-WebSocket-Accept".into(),
         ));
     }
-    if head.header("Sec-WebSocket-Extensions").is_some() {
+    if !extensions_offered && head.header("Sec-WebSocket-Extensions").is_some() {
         return Err(invalid_data(
             "the server chose an extension that was not offered".into(),
         ));

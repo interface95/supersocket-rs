@@ -46,6 +46,10 @@ struct State {
     sealed: bool,
 }
 
+/// The initial capacity of a new batch in the send buffer: room for a batch of small messages,
+/// within the size the allocator serves from its thread cache.
+const BATCH_CAPACITY: usize = 1024;
+
 impl SendQueue {
     /// A queue whose [`send`](Self::send) waits once `limit` bytes are waiting to be written or
     /// being written. A send is accepted whenever nothing is, so a limit of zero sends one piece
@@ -108,9 +112,17 @@ impl SendQueue {
         if waiting != 0 && waiting >= self.limit {
             return Ok(false);
         }
-        state
-            .pending
-            .reserve(parts.iter().map(|part| part.len()).sum());
+        let size: usize = parts.iter().map(|part| part.len()).sum();
+        if state.pending.capacity() == 0 {
+            // The writer took the previous batch, so this starts a new one. Give it room for a
+            // batch of small messages at once instead of growing a few bytes at a time; the
+            // buffer is freed again once written.
+            state
+                .pending
+                .reserve(size.max(BATCH_CAPACITY.min(self.limit)));
+        } else {
+            state.pending.reserve(size);
+        }
         for part in parts {
             state.pending.extend_from_slice(part);
         }

@@ -4,7 +4,9 @@
 //! request and switches to the frame filter, and sessions count as connected once the handshake
 //! is complete, so broadcasts never reach a connection that is still upgrading. Listeners with
 //! TLS give `wss://`. Pings, pongs and the closing handshake are handled for you: handlers see
-//! text and binary messages, and fragmented messages arrive joined.
+//! text and binary messages, and fragmented messages arrive joined. Messages can be dispatched to
+//! commands, subprotocols can have handlers of their own, and with the `deflate` feature
+//! per-message compression (RFC 7692) is negotiated with clients that offer it.
 //!
 //! ```no_run
 //! use supersocket_websocket::WebSocketServer;
@@ -27,6 +29,8 @@
 
 #[cfg(feature = "client")]
 mod client;
+mod commands;
+mod deflate;
 mod filter;
 mod frame;
 #[cfg(fuzzing)]
@@ -39,6 +43,9 @@ mod session;
 
 #[cfg(feature = "client")]
 pub use client::{WebSocketClient, WebSocketClientBuilder, WebSocketSender};
+pub use commands::{SubprotocolBuilder, WebSocketCommand, WebSocketCommands};
+#[cfg(feature = "deflate")]
+pub use deflate::CompressionOptions;
 pub use filter::WebSocketPackage;
 pub use handshake::{Accept, HandshakeRequest, Rejection};
 pub use message::{CloseCode, CloseFrame, Message};

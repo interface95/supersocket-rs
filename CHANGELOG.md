@@ -25,6 +25,9 @@ The first release.
 - TLS listeners with client certificates and custom rustls configurations (feature `tls`);
   PROXY protocol v1 and v2; TCP keepalive and socket buffer sizes per listener.
 - Configuration from TOML or JSON files with environment overrides (feature `config`).
+- Little work per package: the handling timeout only sets up a timer once a handler actually
+  waits, serial handling does not touch the task set of concurrent handling, and a send batch
+  starts with room for several small messages instead of growing a few bytes at a time.
 
 ### Client (`supersocket-client`)
 
@@ -36,3 +39,7 @@ The first release.
 - Server and client for RFC 6455 on the same core: subprotocols, handshake validation with
   custom response headers, pings with a pong timeout, and the closing handshake; interoperability
   tested against tungstenite.
+- Per-message compression (RFC 7692 `permessage-deflate`) for the server and the client, feature
+  `deflate`: pooled compressors and no compression state per connection by default.
+- Commands for WebSocket messages (`WebSocketCommand`, `commands`) and handlers per subprotocol
+  (`subprotocol`), like SuperSocket's `UseCommand` and `UseWebSocketMessageHandler(protocol, ..)`.
