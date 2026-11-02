@@ -33,8 +33,9 @@ pub struct CommandPackage {
 impl CommandPackage {
     /// Decodes a UTF-8 command line.
     pub fn decode(buf: Bytes) -> Result<Self, ProtocolError> {
-        let text = TextPackage::decode(buf)?.text;
-        let (key, body) = text.split_once(' ').unwrap_or((text.as_str(), ""));
+        let text =
+            std::str::from_utf8(&buf).map_err(|_| ProtocolError::new("text is not valid UTF-8"))?;
+        let (key, body) = text.split_once(' ').unwrap_or((text, ""));
         Ok(Self {
             key: key.to_owned(),
             body: body.to_owned(),
@@ -61,6 +62,37 @@ mod tests {
         let package = CommandPackage::decode(Bytes::from_static(b"PING")).unwrap();
         assert_eq!((package.key.as_str(), package.body.as_str()), ("PING", ""));
         assert_eq!(package.args().count(), 0);
+    }
+
+    #[test]
+    fn command_package_preserves_text_boundaries() {
+        for (input, key, body) in [
+            ("", "", ""),
+            ("PING", "PING", ""),
+            ("PING ", "PING", ""),
+            (" ", "", ""),
+            ("  ", "", " "),
+            (" NAME alice", "", "NAME alice"),
+            ("ECHO  你好\t世界 🚀", "ECHO", " 你好\t世界 🚀"),
+            ("ECHO\u{00a0}hello", "ECHO\u{00a0}hello", ""),
+            ("\tPING", "\tPING", ""),
+        ] {
+            let package = CommandPackage::decode(Bytes::copy_from_slice(input.as_bytes())).unwrap();
+            assert_eq!((package.key.as_str(), package.body.as_str()), (key, body));
+        }
+
+        let package =
+            CommandPackage::decode(Bytes::from_static("ECHO a\tb\u{2003}c".as_bytes())).unwrap();
+        assert_eq!(package.args().collect::<Vec<_>>(), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn command_package_preserves_invalid_utf8_errors() {
+        for input in [&b"\xff"[..], &b"ECHO \xff"[..], &b"ECHO \xe4\xb8"[..]] {
+            let error = CommandPackage::decode(Bytes::copy_from_slice(input)).unwrap_err();
+            assert_eq!(error.to_string(), "protocol error: text is not valid UTF-8");
+            assert!(std::error::Error::source(&error).is_none());
+        }
     }
 
     #[test]
