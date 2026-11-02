@@ -1,0 +1,25 @@
+   Compiling supersocket-proto v0.1.0 (/private/var/folders/z_/tj17mmq51n7cf_9y0gg7sx740000gp/T/supersocket-opt-qox0si1a/source/crates/supersocket-proto)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (/var/folders/z_/tj17mmq51n7cf_9y0gg7sx740000gp/T/supersocket-opt-qox0si1a/target/debug/deps/supersocket_proto-7c78f1ee4151acd2)
+
+running 17 tests
+test error::tests::carries_its_source ... ok
+test filters::terminator::tests::handles_terminator_split_across_reads ... ok
+test filters::fixed_size::tests::cuts_fixed_size_packages ... ok
+test filters::begin_end_mark::tests::decodes_marked_packages ... ok
+test filters::fixed_header::tests::decodes_packages_fed_byte_by_byte ... ok
+test filters::terminator::tests::splits_merged_lines ... ok
+test filters::terminator::tests::decodes_command_lines ... ok
+test filters::terminator::tests::decoders_may_hold_state ... ok
+test filters::begin_end_mark::tests::rejects_data_without_begin_mark ... ok
+test filters::fixed_header::tests::overflowing_lengths_are_protocol_errors ... ok
+test filters::transparent::tests::every_read_is_a_package ... ok
+test filters::terminator::tests::supports_multi_byte_terminators ... ok
+test package::optimization_compatibility::preserves_invalid_utf8_errors ... ok
+test package::tests::command_package_splits_key_body_and_args ... ok
+test package::optimization_compatibility::preserves_command_text_boundaries ... ok
+test package::tests::invalid_utf8_is_a_protocol_error ... ok
+test filters::begin_end_mark::tests::finds_end_marks_split_across_reads_of_a_long_body ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

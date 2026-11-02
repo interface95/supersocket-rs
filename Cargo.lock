@@ -800,6 +800,7 @@ dependencies = [
 name = "supersocket-bench"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "socket2",
  "tokio",
 ]

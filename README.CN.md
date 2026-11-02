@@ -505,6 +505,10 @@ Server::builder(LineFilter::default).options(options)
 
 压测工具在 [`tools/bench`](tools/bench)，里面有复现这些数字的步骤。
 
+自定义 Session、连接中间件、命令分发和前后过滤器的完整链路也有
+[Rust / C# 对比报告](tools/bench/results/2026-11-01-macos-arm64/report.md)，附原始逐轮数据和复现脚本。
+该测试在 macOS / Apple M5 Max 上运行，与上面的 Linux 回显测试环境不同，不能直接计算两者的性能开销差。
+
 ## 路线图
 
 - 跑一遍 Autobahn 测试套件

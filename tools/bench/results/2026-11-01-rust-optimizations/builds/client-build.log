@@ -1,0 +1,18 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling libc v0.2.191
+   Compiling zmij v1.0.23
+   Compiling serde_core v1.0.229
+   Compiling serde_json v1.0.154
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling pin-project-lite v0.2.17
+   Compiling bytes v1.12.1
+   Compiling syn v3.0.9
+   Compiling mio v1.2.4
+   Compiling socket2 v0.6.5
+   Compiling tokio-macros v2.7.2
+   Compiling tokio v1.54.1
+   Compiling supersocket-bench v0.1.0 (/private/var/folders/z_/tj17mmq51n7cf_9y0gg7sx740000gp/T/supersocket-opt-qox0si1a/source/tools/bench)
+    Finished `release` profile [optimized] target(s) in 4.02s

@@ -1,0 +1,25 @@
+--- a/crates/supersocket-proto/src/package.rs
++++ b/crates/supersocket-proto/src/package.rs
+@@ -33,8 +33,9 @@
+ impl CommandPackage {
+     /// Decodes a UTF-8 command line.
+     pub fn decode(buf: Bytes) -> Result<Self, ProtocolError> {
+-        let text = TextPackage::decode(buf)?.text;
+-        let (key, body) = text.split_once(' ').unwrap_or((text.as_str(), ""));
++        let text = std::str::from_utf8(&buf)
++            .map_err(|_| ProtocolError::new("text is not valid UTF-8"))?;
++        let (key, body) = text.split_once(' ').unwrap_or((text, ""));
+         Ok(Self {
+             key: key.to_owned(),
+             body: body.to_owned(),
+--- a/crates/supersocket/examples/bench_pipeline.rs
++++ b/crates/supersocket/examples/bench_pipeline.rs
+@@ -125,7 +125,7 @@
+ 
+     async fn execute(&self, session: &UserSession, package: CommandPackage) -> HandlerResult {
+         session
+-            .send(format!("OK echo={}\r\n", package.body))
++            .send_vectored(&[b"OK echo=", package.body.as_bytes(), b"\r\n"])
+             .await?;
+         Ok(())
+     }

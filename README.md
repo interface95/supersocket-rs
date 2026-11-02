@@ -556,6 +556,11 @@ measures framework overhead only; real applications spend most of their time els
 
 The load generator is in [`tools/bench`](tools/bench), with the steps to reproduce the numbers.
 
+A separate [Rust / C# full-pipeline report](tools/bench/results/2026-11-01-macos-arm64/report.md)
+covers custom session state, connection middleware, command dispatch and before/after filters,
+with raw samples and reproduction scripts. It runs on macOS / Apple M5 Max, so its numbers
+must not be compared directly with the Linux echo results above to infer pipeline overhead.
+
 ## Roadmap
 
 - A run of the Autobahn test suite

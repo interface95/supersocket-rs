@@ -1,0 +1,1 @@
+LISTENING 127.0.0.1:59922 framework=.NET 11.0.0-rc.2.26504.105 server_gc=True processors=8 echo_impl=Async

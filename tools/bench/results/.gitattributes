@@ -1,0 +1,3 @@
+# Preserve captured output and unified-diff context markers byte-for-byte.
+*.log -whitespace
+*.patch -whitespace

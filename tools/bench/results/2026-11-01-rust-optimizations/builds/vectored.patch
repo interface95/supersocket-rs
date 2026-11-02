@@ -1,0 +1,11 @@
+--- a/crates/supersocket/examples/bench_pipeline.rs
++++ b/crates/supersocket/examples/bench_pipeline.rs
+@@ -125,7 +125,7 @@
+ 
+     async fn execute(&self, session: &UserSession, package: CommandPackage) -> HandlerResult {
+         session
+-            .send(format!("OK echo={}\r\n", package.body))
++            .send_vectored(&[b"OK echo=", package.body.as_bytes(), b"\r\n"])
+             .await?;
+         Ok(())
+     }

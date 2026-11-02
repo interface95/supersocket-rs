@@ -1,0 +1,5 @@
+   Compiling supersocket-proto v0.1.0 (/private/var/folders/z_/tj17mmq51n7cf_9y0gg7sx740000gp/T/supersocket-opt-qox0si1a/source/crates/supersocket-proto)
+   Compiling supersocket-connection v0.1.0 (/private/var/folders/z_/tj17mmq51n7cf_9y0gg7sx740000gp/T/supersocket-opt-qox0si1a/source/crates/supersocket-connection)
+   Compiling supersocket-server v0.1.0 (/private/var/folders/z_/tj17mmq51n7cf_9y0gg7sx740000gp/T/supersocket-opt-qox0si1a/source/crates/supersocket-server)
+   Compiling supersocket v0.1.0 (/private/var/folders/z_/tj17mmq51n7cf_9y0gg7sx740000gp/T/supersocket-opt-qox0si1a/source/crates/supersocket)
+    Finished `release` profile [optimized] target(s) in 1.35s

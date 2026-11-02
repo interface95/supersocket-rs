@@ -1,0 +1,7 @@
+{
+  "archive": "baseline-source.tar.gz",
+  "sha256": "d09a5417fc17a510aeaa4dffff19aaac1dd64f6b1dbcc3d83fb4dee5654136fa",
+  "files": 121,
+  "bytes": 228364,
+  "description": "Baseline source before optimizations. Both changed source files match the verified original contents. Preparation injects identical cfg(test)-only compatibility tests into all variants. Executables are rebuildable from this snapshot, saved patches, locked dependencies and recorded Rust compiler/profile."
+}

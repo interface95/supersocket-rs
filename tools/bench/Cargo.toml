@@ -1,5 +1,6 @@
 [package]
 name = "supersocket-bench"
+default-run = "supersocket-bench"
 description = "Load generator for the echo benchmarks of supersocket-rs."
 version.workspace = true
 edition.workspace = true
@@ -8,6 +9,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+serde_json.workspace = true
 socket2.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
