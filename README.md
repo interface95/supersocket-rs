@@ -71,6 +71,7 @@ Run the examples in `crates/supersocket/examples`:
 ```sh
 cargo run --example echo_server        # nc 127.0.0.1 4040
 cargo run --example command_server
+cargo run --example session_server    # custom sessions, commands and middleware together
 cargo run --example custom_protocol
 cargo run --example live_chat
 cargo run --example tls_echo_server --features tls
@@ -381,6 +382,53 @@ impl<S: SessionState> Middleware<S> for ConnectionLimit {
 
 Sessions connect concurrently, so a limit keeps its own count rather than reading
 `session_count()`.
+
+### Custom sessions, commands and middleware together
+
+[`session_server.rs`](crates/supersocket/examples/session_server.rs) combines these extension points
+in a runnable server using composition and traits. No optional features are required:
+
+| Component | Responsibility |
+|---|---|
+| `UserState` / `Session<UserState>` | Keeps a separate display name for each connection; `SessionState` sends the greeting and logs closure |
+| `ConnectionLimit` | Session middleware that admits at most two connections, rejects the rest, and releases slots when admitted connections close |
+| `Name`, `WhoAmI`, `Echo`, `Quit` | Implement `AsyncCommand` to set a name, inspect state, echo a message, and close the session |
+| `RequireName` | A filter on `ECHO` only, requiring a display name; a rejected command leaves the connection usable |
+| `Audit` | A global command filter logging dispatch before and after recognized commands, including those skipped by a command's own filter |
+
+Start the server:
+
+```sh
+cargo run --example session_server
+```
+
+Send commands from another terminal; `printf` supplies the CRLF required by the protocol:
+
+```sh
+printf 'ECHO hello\r\nNAME alice\r\nWHOAMI\r\nECHO hello\r\nQUIT\r\n' | nc 127.0.0.1 4040
+```
+
+Expected replies:
+
+```text
+READY commands: NAME <name>, WHOAMI, ECHO <text>, QUIT
+ERR set NAME first
+OK name=alice
+OK name=alice
+OK echo=hello
+BYE
+```
+
+Command names are uppercase. Display names allow 1–32 ASCII letters, digits or underscores.
+`NAME` only sets a display name for this connection; it does not authenticate a user.
+Before a name is set, `WHOAMI` replies `OK name=anonymous`; unknown commands reply
+`ERR unknown command`. `QUIT` sends its goodbye before closing the connection.
+
+Run `nc 127.0.0.1 4040` in three terminals and keep the connections open: the third receives
+`ERR server busy` and disconnects. Closing either admitted connection makes room for another.
+Server logs show middleware admission, session connection, command filtering, slot release and
+session closure. Ctrl+C shuts the server down gracefully. To use a different port, run
+`cargo run --example session_server -- 127.0.0.1:4041` and connect clients to that port.
 
 ### TLS
 

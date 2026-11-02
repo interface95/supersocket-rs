@@ -62,6 +62,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```sh
 cargo run --example echo_server        # nc 127.0.0.1 4040
 cargo run --example command_server
+cargo run --example session_server    # 自定义会话、命令与中间件配合使用
 cargo run --example custom_protocol
 cargo run --example live_chat
 cargo run --example tls_echo_server --features tls
@@ -347,6 +348,48 @@ impl<S: SessionState> Middleware<S> for ConnectionLimit {
 ```
 
 会话是并发建立的，所以限流时要自己计数，不能依赖 `session_count()`。
+
+### 自定义会话、命令与中间件的完整示例
+
+[`session_server.rs`](crates/supersocket/examples/session_server.rs) 使用组合和 trait，把这些扩展点放在同一个可运行的服务中，无需额外 feature：
+
+| 组件 | 职责 |
+|---|---|
+| `UserState` / `Session<UserState>` | 每个连接独立保存昵称，通过 `SessionState` 发送欢迎消息、记录关闭事件 |
+| `ConnectionLimit` | 会话中间件，最多放行两个连接；拒绝多余连接，并在已放行连接关闭时释放名额 |
+| `Name`、`WhoAmI`、`Echo`、`Quit` | 实现 `AsyncCommand`，分别设置昵称、查询状态、回显消息、关闭会话 |
+| `RequireName` | 单命令过滤器，只允许设置了昵称的会话执行 `ECHO`；拒绝命令后连接仍然可用 |
+| `Audit` | 全局命令过滤器，记录已匹配命令的分发前后日志，包括被单命令过滤器跳过的命令 |
+
+启动服务：
+
+```sh
+cargo run --example session_server
+```
+
+在另一个终端发送命令，`printf` 会加上协议要求的 CRLF：
+
+```sh
+printf 'ECHO hello\r\nNAME alice\r\nWHOAMI\r\nECHO hello\r\nQUIT\r\n' | nc 127.0.0.1 4040
+```
+
+预期响应：
+
+```text
+READY commands: NAME <name>, WHOAMI, ECHO <text>, QUIT
+ERR set NAME first
+OK name=alice
+OK name=alice
+OK echo=hello
+BYE
+```
+
+命令名使用大写；昵称允许 1–32 个 ASCII 字母、数字或下划线。`NAME` 只是设置当前连接的演示昵称，不做身份认证。
+未设置昵称时，`WHOAMI` 返回 `OK name=anonymous`；未知命令返回 `ERR unknown command`。`QUIT` 发完告别消息后关闭连接。
+
+在三个终端分别执行 `nc 127.0.0.1 4040` 并保持连接，第三个会收到 `ERR server busy` 后断开。关闭任一已放行连接后，新连接又能进入。
+服务端日志可观察中间件准入、会话连接、命令过滤、名额释放和会话关闭；Ctrl+C 会优雅关闭整个服务。
+需要换端口时运行 `cargo run --example session_server -- 127.0.0.1:4041`，客户端使用相同端口。
 
 ### TLS
 
