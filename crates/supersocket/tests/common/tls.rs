@@ -186,6 +186,6 @@ pub fn start_tls_echo(certificate: &TestCertificate) -> (Server<TextPackage>, So
         .configure(move |options| options.listeners.push(listener))
         .build()
         .unwrap();
-    let address = server.start().unwrap()[0];
+    let address = server.start().unwrap()[0].tcp().unwrap();
     (server, address)
 }

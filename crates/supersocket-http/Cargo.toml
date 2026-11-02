@@ -1,0 +1,26 @@
+[package]
+name = "supersocket-http"
+description = "HTTP/1.1 for supersocket-rs: a request pipeline filter, responses, keep-alive and Server-Sent Events."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+supersocket-proto.workspace = true
+supersocket-server.workspace = true
+bytes.workspace = true
+memchr.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

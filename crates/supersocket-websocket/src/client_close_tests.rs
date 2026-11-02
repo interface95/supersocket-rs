@@ -30,6 +30,7 @@ async fn client_on(stream: impl Stream) -> WebSocketClient {
         sender: client.sender(),
         close_sent: Arc::new(AtomicBool::new(false)),
         compression: None,
+        sending: Arc::new(tokio::sync::RwLock::new(())),
     };
     WebSocketClient {
         client: Some(client),

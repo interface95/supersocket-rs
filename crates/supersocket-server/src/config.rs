@@ -283,6 +283,39 @@ mod tests {
     }
 
     #[test]
+    fn oversized_float_durations_are_errors_instead_of_panics() {
+        for field in ["package_handling_timeout", "send_timeout"] {
+            let text = format!("{field} = 1e100");
+            assert!(matches!(
+                ServerOptions::from_toml_str(&text),
+                Err(ConfigError::Invalid(_))
+            ));
+        }
+        let options = ServerOptions::from_toml_str("send_timeout = 0.125").unwrap();
+        assert_eq!(options.send_timeout, Some(Duration::from_millis(125)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listeners_may_name_a_unix_socket_path() {
+        let options =
+            ServerOptions::from_toml_str("[[listeners]]\npath = \"/tmp/app.sock\"").unwrap();
+        assert_eq!(
+            options.listeners[0].path.as_deref(),
+            Some(Path::new("/tmp/app.sock"))
+        );
+        assert!(options.listeners[0].address.is_empty());
+        // One or the other, and at least one.
+        assert!(
+            ServerOptions::from_toml_str(
+                "[[listeners]]\naddress = \"0.0.0.0:1\"\npath = \"/tmp/app.sock\""
+            )
+            .is_err()
+        );
+        assert!(ServerOptions::from_toml_str("[[listeners]]\nno_delay = true").is_err());
+    }
+
+    #[test]
     fn rejects_unknown_fields() {
         assert!(ServerOptions::from_toml_str("nmae = \"typo\"").is_err());
     }

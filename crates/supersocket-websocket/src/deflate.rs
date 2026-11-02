@@ -214,6 +214,7 @@ mod enabled {
                 reset: self.negotiated.reset_decompressor,
                 context: None,
                 history: VecDeque::new(),
+                scratch: vec![0; SCRATCH_SIZE],
             }
         }
 
@@ -423,6 +424,8 @@ mod enabled {
     /// and adds back before decompressing.
     const TRAILER: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
     const WINDOW_SIZE: usize = 32768;
+    /// How much of a restored window is inflated at a time; the output is discarded.
+    const SCRATCH_SIZE: usize = 4096;
     const FINAL_EMPTY_BLOCK: [u8; 5] = [0x01, 0x00, 0x00, 0xff, 0xff];
 
     /// Compressors and decompressors for connections that keep no window between messages. They
@@ -491,8 +494,10 @@ mod enabled {
         reset: bool,
         /// The decompressor with the peer's window, when the peer keeps one between messages.
         context: Option<Decompress>,
-        /// Restores the LZ77 window when a BFINAL block ends the backend's raw stream.
+        /// Restores the LZ77 window after validating a message boundary ends the raw stream.
         history: VecDeque<u8>,
+        /// Where the bytes that restore the window are inflated to and discarded.
+        scratch: Vec<u8>,
     }
 
     impl Decoder {
@@ -504,17 +509,20 @@ mod enabled {
             limit: usize,
         ) -> Result<Vec<u8>, DecodeError> {
             let mut decompressor = self.context.take().unwrap_or_else(take_decompressor);
-            let result = inflate(&mut decompressor, input, limit, &self.history).and_then(
-                |(data, ended)| {
-                    if !self.reset {
-                        remember(&mut self.history, &data);
-                        if ended {
-                            restore_window(&mut decompressor, &self.history, &[])?;
-                        }
-                    }
-                    Ok(data)
-                },
-            );
+            let result = inflate(
+                &mut decompressor,
+                input,
+                limit,
+                &self.history,
+                &mut self.scratch,
+            )
+            .and_then(|data| {
+                if !self.reset {
+                    remember(&mut self.history, &data);
+                    restore_window(&mut decompressor, &self.history, &[], &mut self.scratch)?;
+                }
+                Ok(data)
+            });
             if result.is_ok() && !self.reset {
                 self.context = Some(decompressor);
             } else {
@@ -534,10 +542,14 @@ mod enabled {
 
     /// flate2's default backend has no dictionary setter. A non-final stored block restores the
     /// same window without adding application output or depending on a particular backend.
+    /// Puts the last window of `history` followed by `output` back as the window of the reset
+    /// decompressor, by inflating them as one stored block. The block is fed in its parts, so
+    /// nothing is copied together first, and what comes out is discarded through `scratch`.
     fn restore_window(
         decompressor: &mut Decompress,
         history: &VecDeque<u8>,
         output: &[u8],
+        scratch: &mut [u8],
     ) -> Result<(), DecodeError> {
         let output = &output[output.len().saturating_sub(WINDOW_SIZE)..];
         let previous = history.len().min(WINDOW_SIZE - output.len());
@@ -546,38 +558,58 @@ mod enabled {
         if length == 0 {
             return Ok(());
         }
-        let mut seed = Vec::with_capacity(5 + usize::from(length));
-        seed.push(0);
-        seed.extend_from_slice(&length.to_le_bytes());
-        seed.extend_from_slice(&(!length).to_le_bytes());
-        seed.extend(history.range(history.len() - previous..));
-        seed.extend_from_slice(output);
-        let mut discarded = Vec::with_capacity(usize::from(length) + 1);
-        decompressor
-            .decompress_vec(&seed, &mut discarded, FlushDecompress::None)
-            .map_err(|_| DecodeError::Corrupt)?;
-        if decompressor.total_in() as usize != seed.len() || discarded.len() != usize::from(length)
-        {
+        let mut header = [0; 5];
+        header[1..3].copy_from_slice(&length.to_le_bytes());
+        header[3..5].copy_from_slice(&(!length).to_le_bytes());
+        // The last `previous` bytes of the history, which may span both of its halves.
+        let (front, back) = history.as_slices();
+        let skip = history.len() - previous;
+        let front = &front[skip.min(front.len())..];
+        let back = &back[skip.saturating_sub(history.len() - back.len())..];
+        let mut produced = 0;
+        for part in [&header[..], front, back, output] {
+            let mut consumed = 0;
+            loop {
+                let (in_before, out_before) = (decompressor.total_in(), decompressor.total_out());
+                decompressor
+                    .decompress(&part[consumed..], scratch, FlushDecompress::None)
+                    .map_err(|_| DecodeError::Corrupt)?;
+                let read = (decompressor.total_in() - in_before) as usize;
+                let wrote = (decompressor.total_out() - out_before) as usize;
+                consumed += read;
+                produced += wrote;
+                // The decompressor takes in more than it can write out at once: once a part is
+                // consumed, keep going until what it buffered has come out.
+                if consumed == part.len() && wrote == 0 {
+                    break;
+                }
+                if read == 0 && wrote == 0 {
+                    return Err(DecodeError::Corrupt);
+                }
+            }
+        }
+        if produced != usize::from(length) {
             return Err(DecodeError::Corrupt);
         }
         Ok(())
     }
 
-    /// Decompresses every block of one message, including blocks following BFINAL. Only this
-    /// uncommon path needs an extra final block to verify its tail and then restore its window.
+    /// Decompresses every block of one message, including blocks following BFINAL. An extra
+    /// final empty block checks that the message ended on a complete sync-flush boundary.
+    /// This ends the backend stream; a shared window is restored after successful validation.
     fn inflate(
         decompressor: &mut Decompress,
         input: &[u8],
         limit: usize,
         history: &VecDeque<u8>,
-    ) -> Result<(Vec<u8>, bool), DecodeError> {
+        scratch: &mut [u8],
+    ) -> Result<Vec<u8>, DecodeError> {
         let capacity = input
             .len()
             .saturating_mul(3)
             .max(64)
             .min(limit.saturating_add(1));
         let mut out = Vec::with_capacity(capacity);
-        let mut ended = false;
         for (phase, (data, flush)) in [
             (input, FlushDecompress::None),
             (&TRAILER[..], FlushDecompress::Sync),
@@ -587,9 +619,6 @@ mod enabled {
         .enumerate()
         {
             let verifying = phase == 2;
-            if verifying && !ended {
-                break;
-            }
             let before_phase = out.len();
             let mut consumed = 0;
             loop {
@@ -620,8 +649,7 @@ mod enabled {
                         if phase != 0 {
                             return Err(DecodeError::Corrupt);
                         }
-                        ended = true;
-                        restore_window(decompressor, history, &out)?;
+                        restore_window(decompressor, history, &out, scratch)?;
                     }
                     _ if verifying => return Err(DecodeError::Corrupt),
                     // Drain output already buffered by the backend before supplying the trailer.
@@ -630,14 +658,14 @@ mod enabled {
                     _ => {}
                 }
             }
-            if phase == 1 && ended && out.len() != before_phase {
+            if phase == 1 && out.len() != before_phase {
                 return Err(DecodeError::Corrupt);
             }
         }
         if out.len() > limit {
             return Err(DecodeError::TooBig);
         }
-        Ok((out, ended))
+        Ok(out)
     }
 
     /// Compressed data to send. With a shared window it holds the window until the caller reports
@@ -1071,6 +1099,30 @@ mod enabled {
         }
 
         #[test]
+        fn nonfinal_blocks_reject_incomplete_message_tails() {
+            let hello = [0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00];
+            for reset in [true, false] {
+                for input in [
+                    &b""[..],
+                    &b"\x00\x05\x00\xfa\xffw"[..],
+                    &b"\x00\x0a\x00\xf5\xffw"[..],
+                    // The data block is complete, but its empty sync-flush block is absent.
+                    &b"\x00\x01\x00\xfe\xffw"[..],
+                ] {
+                    let mut decoder = negotiated(reset).decoder();
+                    assert_eq!(decoder.decode(&hello, 1024).unwrap(), b"Hello");
+                    assert_eq!(
+                        decoder.decode(input, 1024),
+                        Err(DecodeError::Corrupt),
+                        "reset={reset}, input={input:02x?}"
+                    );
+                    // Invalid input discards the context, so no partial message is retained.
+                    assert_eq!(decoder.decode(&hello, 1024).unwrap(), b"Hello");
+                }
+            }
+        }
+
+        #[test]
         fn final_blocks_continue_with_the_same_window_and_message_limit() {
             let final_hello = [0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00];
             let refer_to_hello = [0xf2, 0x00, 0x11, 0x00, 0x00];
@@ -1117,7 +1169,7 @@ mod enabled {
         }
 
         #[test]
-        fn final_blocks_accept_sync_flushed_tails_of_various_sizes() {
+        fn accepts_sync_flushed_tails_with_and_without_final_blocks() {
             let final_hello = [0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00];
             for level in [0, 1, 6, 9] {
                 for size in [0, 1, 2, 7, 63, 64, 65, 127, 128, 1024, 32768, 65536] {
@@ -1137,17 +1189,21 @@ mod enabled {
                             .collect();
                         let mut compressor = Compress::new(Compression::new(level), false);
                         let tail = deflate(&mut compressor, &payload).unwrap();
-                        let input = [&final_hello[..], &tail].concat();
-                        let expected = [&b"Hello"[..], &payload].concat();
-                        for reset in [true, false] {
-                            let mut decoder = negotiated(reset).decoder();
-                            assert_eq!(
-                                decoder.decode(&input, expected.len()).unwrap_or_else(|error| {
-                                    panic!("{error:?}: level={level}, size={size}, pattern={pattern}, reset={reset}")
-                                }),
-                                expected,
-                                "level={level}, size={size}, pattern={pattern}, reset={reset}"
-                            );
+                        for (prefix, plaintext) in
+                            [(&b""[..], &b""[..]), (&final_hello[..], &b"Hello"[..])]
+                        {
+                            let input = [prefix, &tail].concat();
+                            let expected = [plaintext, &payload].concat();
+                            for reset in [true, false] {
+                                let mut decoder = negotiated(reset).decoder();
+                                assert_eq!(
+                                    decoder.decode(&input, expected.len()).unwrap_or_else(|error| {
+                                        panic!("{error:?}: level={level}, size={size}, pattern={pattern}, reset={reset}, prefix={prefix:02x?}")
+                                    }),
+                                    expected,
+                                    "level={level}, size={size}, pattern={pattern}, reset={reset}, prefix={prefix:02x?}"
+                                );
+                            }
                         }
                     }
                 }

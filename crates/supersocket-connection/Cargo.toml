@@ -24,7 +24,9 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 
 [dev-dependencies]
+supersocket-proto = { workspace = true, features = ["codec"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tokio-util = { workspace = true, features = ["codec"] }
 
 [lints]
 workspace = true

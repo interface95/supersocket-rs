@@ -24,7 +24,7 @@ impl Socks4Proxy {
         }
     }
 
-    /// The user id sent to the proxy. Default: empty.
+    /// The user id sent to the proxy. Default: empty. Connecting rejects embedded NUL bytes.
     pub fn user_id(mut self, user_id: impl Into<String>) -> Self {
         self.user_id = user_id.into();
         self
@@ -38,6 +38,12 @@ impl Connector for Socks4Proxy {
         previous: Option<Connection>,
     ) -> io::Result<Connection> {
         must_be_first("Socks4Proxy", &previous)?;
+        if self.user_id.contains('\0') || target.host().contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SOCKS4 user IDs and host names must not contain NUL",
+            ));
+        }
         let mut request = vec![4, 1];
         request.extend(target.port().to_be_bytes());
         match target.ip() {

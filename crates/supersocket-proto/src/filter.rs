@@ -8,6 +8,8 @@ use crate::ProtocolError;
 /// remove that package's bytes from `buf` and return `Ok(Some(package))`. Return `Ok(None)` when
 /// more data is needed; the filter may still consume bytes it has already examined. Returning an
 /// error closes the connection with a protocol error.
+/// Bytes consumed while returning `None` still count towards the connection's package-length
+/// limit until a package is returned or the filter switches to another protocol.
 pub trait PipelineFilter: Send + 'static {
     /// The package type this filter produces.
     type Package: Send + 'static;

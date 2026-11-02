@@ -1,4 +1,13 @@
-use std::{fmt, io, sync::Mutex, time::Duration};
+use std::{
+    fmt,
+    future::poll_fn,
+    io,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    pin::Pin,
+    sync::Mutex,
+    task::Poll,
+    time::Duration,
+};
 
 use bytes::BytesMut;
 use tokio::{
@@ -44,6 +53,8 @@ struct State {
     closed: bool,
     /// The last data has been queued: nothing more is accepted, but the queue is still written.
     sealed: bool,
+    /// The transport is handed over once the queue is written: the writer leaves it open.
+    detaching: bool,
 }
 
 /// The initial capacity of a new batch in the send buffer: room for a batch of small messages,
@@ -100,16 +111,89 @@ impl SendQueue {
         Ok(())
     }
 
-    /// Queues `parts` when there is room; `Ok(false)` means the limit is reached.
-    fn enqueue(&self, parts: &[&[u8]]) -> io::Result<bool> {
-        let mut state = self.state.lock().unwrap();
+    /// Queues what `write` appends to the send buffer, like [`send`](Self::send) without a buffer
+    /// in between: a package is encoded straight into the queue, like SuperSocket's `SendAsync`
+    /// with a `PipeWriter` action. `write` runs while the queue is locked, so it must be quick and
+    /// must not wait. It is called once at most, once there is room. Nothing is queued when it
+    /// fails, and its error is returned, as is the queue's own error once the queue is closed.
+    pub async fn send_with<E: From<io::Error>>(
+        &self,
+        write: impl FnOnce(&mut BytesMut) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut write = Some(write);
+        loop {
+            let drained = self.drained.notified();
+            if self.enqueue_with(&mut write)? {
+                break;
+            }
+            drained.await;
+        }
+        self.data_available.notify_one();
+        Ok(())
+    }
+
+    /// Like [`send_with`](Self::send_with) without waiting: fails with
+    /// [`ErrorKind::WouldBlock`](io::ErrorKind::WouldBlock) while the limit is reached, in which
+    /// case `write` is not called.
+    pub fn try_send_with<E: From<io::Error>>(
+        &self,
+        write: impl FnOnce(&mut BytesMut) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut write = Some(write);
+        if !self.enqueue_with(&mut write)? {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock).into());
+        }
+        self.data_available.notify_one();
+        Ok(())
+    }
+
+    /// Whether more data may be queued: an error once the queue is closed, `false` while the
+    /// limit is reached.
+    fn has_room(&self, state: &State) -> io::Result<bool> {
         if state.closed || state.sealed {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
         // What is queued and what is being written both count; a peer that stopped reading
         // leaves a batch in flight for good.
         let waiting = state.pending.len() + state.in_flight;
-        if waiting != 0 && waiting >= self.limit {
+        Ok(waiting == 0 || waiting < self.limit)
+    }
+
+    /// Runs `write` on the send buffer when there is room, taking it out of `write`; `Ok(false)`
+    /// means the limit is reached and `write` was left untouched. What `write` appended before
+    /// failing or panicking is removed again, and a panic continues unwinding once the queue is
+    /// unlocked, so that it cannot poison the lock.
+    fn enqueue_with<E: From<io::Error>>(
+        &self,
+        write: &mut Option<impl FnOnce(&mut BytesMut) -> Result<(), E>>,
+    ) -> Result<bool, E> {
+        let mut state = self.state.lock().unwrap();
+        if !self.has_room(&state)? {
+            return Ok(false);
+        }
+        if state.pending.capacity() == 0 {
+            state.pending.reserve(BATCH_CAPACITY.min(self.limit));
+        }
+        let before = state.pending.len();
+        let write = write.take().expect("the writer is used once");
+        match catch_unwind(AssertUnwindSafe(|| write(&mut state.pending))) {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(error)) => {
+                state.pending.truncate(before);
+                Err(error)
+            }
+            Err(panic) => {
+                state.pending.truncate(before);
+                drop(state);
+                resume_unwind(panic)
+            }
+        }
+    }
+
+    /// Queues `parts` when there is room; `Ok(false)` means the limit is reached.
+    fn enqueue(&self, parts: &[&[u8]]) -> io::Result<bool> {
+        let mut state = self.state.lock().unwrap();
+        if !self.has_room(&state)? {
             return Ok(false);
         }
         let size: usize = parts.iter().map(|part| part.len()).sum();
@@ -156,15 +240,27 @@ impl SendQueue {
         self.drained.notify_waiters();
     }
 
+    /// Stops accepting data like [`close`](Self::close), but the writer leaves the transport
+    /// open once it has written what is queued, for a connection that is taken over.
+    pub fn detach(&self) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.closed = true;
+            state.detaching = true;
+        }
+        self.data_available.notify_one();
+        self.drained.notify_waiters();
+    }
+
     /// Whether the queue has been closed.
     pub fn is_closed(&self) -> bool {
         self.state.lock().unwrap().closed
     }
 
     /// Writes queued data to `writer` until the queue is closed and empty, then shuts `writer`
-    /// down. A write that does not finish within `send_timeout` fails with
-    /// [`ErrorKind::TimedOut`](io::ErrorKind::TimedOut). The queue is closed when this returns,
-    /// whether it succeeded or not.
+    /// down, unless the queue was [detached](Self::detach). A write that does not finish within
+    /// `send_timeout` fails with [`ErrorKind::TimedOut`](io::ErrorKind::TimedOut). The queue is
+    /// closed when this returns, whether it succeeded or not.
     ///
     /// Each written batch is freed, so an idle connection holds no send buffer.
     pub async fn run_writer<W: AsyncWrite + Unpin>(
@@ -206,15 +302,14 @@ impl SendQueue {
             };
             if let Err(error) = written {
                 self.close();
-                // Still try to tell the peer that the connection ends, but give up as a write
-                // would.
-                let shutdown = writer.shutdown();
-                let _ = match send_timeout {
-                    Some(limit) => tokio::time::timeout(limit, shutdown).await.ok(),
-                    None => Some(shutdown.await),
-                };
+                // Make one best-effort shutdown attempt, without delaying the error that tells
+                // the owner to close the connection. A failed transport may never finish it.
+                let _ = poll_fn(|cx| Poll::Ready(Pin::new(&mut writer).poll_shutdown(cx))).await;
                 return Err(error);
             }
+        }
+        if self.state.lock().unwrap().detaching {
+            return Ok(());
         }
         writer.shutdown().await
     }
@@ -236,7 +331,7 @@ impl fmt::Debug for SendQueue {
 mod tests {
     use std::sync::Arc;
 
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
@@ -261,6 +356,110 @@ mod tests {
         let mut received = String::new();
         reader.read_to_string(&mut received).await.unwrap();
         assert_eq!(received, "one two three");
+    }
+
+    #[tokio::test]
+    async fn a_detached_queue_leaves_the_transport_open() {
+        let (writer, mut reader) = tokio::io::duplex(1024);
+        let queue = Arc::new(SendQueue::new(1024));
+        let mut writer = Some(writer);
+        let task = tokio::spawn({
+            let queue = queue.clone();
+            let mut writer = writer.take().unwrap();
+            async move { queue.run_writer(&mut writer, None).await.map(|()| writer) }
+        });
+        queue.send(b"last words").await.unwrap();
+        queue.detach();
+        assert_eq!(
+            queue.send(b"late").await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        let mut writer = task.await.unwrap().unwrap();
+        // The writer is still usable: it was not shut down.
+        writer.write_all(b" and more").await.unwrap();
+        drop(writer);
+        let mut received = String::new();
+        reader.read_to_string(&mut received).await.unwrap();
+        assert_eq!(received, "last words and more");
+    }
+
+    #[tokio::test]
+    async fn send_with_encodes_into_the_queue() {
+        let (writer, mut reader) = tokio::io::duplex(1024);
+        let queue = Arc::new(SendQueue::new(1024));
+        let task = tokio::spawn({
+            let queue = queue.clone();
+            async move { queue.run_writer(writer, None).await }
+        });
+        queue
+            .send_with(|buf| {
+                buf.extend_from_slice(b"one ");
+                Ok::<_, io::Error>(())
+            })
+            .await
+            .unwrap();
+        // A failing writer leaves nothing behind.
+        let error = queue
+            .send_with(|buf| {
+                buf.extend_from_slice(b"garbage");
+                Err(io::Error::other("encoding failed"))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "encoding failed");
+        queue
+            .try_send_with(|buf| {
+                buf.extend_from_slice(b"two");
+                Ok::<_, io::Error>(())
+            })
+            .unwrap();
+        queue.close();
+        task.await.unwrap().unwrap();
+        let mut received = String::new();
+        reader.read_to_string(&mut received).await.unwrap();
+        assert_eq!(received, "one two");
+        assert_eq!(
+            queue
+                .send_with(|_| Ok::<_, io::Error>(()))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn a_panicking_writer_leaves_the_queue_usable() {
+        let queue = SendQueue::new(1024);
+        queue.try_send(b"kept ").unwrap();
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            queue.try_send_with(|buf| {
+                buf.extend_from_slice(b"partial");
+                panic!("boom");
+                #[allow(unreachable_code)]
+                Ok::<_, io::Error>(())
+            })
+        }));
+        assert!(panicked.is_err());
+        // The lock is not poisoned and the partial data is gone.
+        queue.try_send(b"after").unwrap();
+        let state = queue.state.lock().unwrap();
+        assert_eq!(&state.pending[..], b"kept after");
+    }
+
+    #[test]
+    fn try_send_with_does_not_call_the_writer_without_room() {
+        let queue = SendQueue::new(8);
+        queue.try_send(b"12345678").unwrap();
+        let mut called = false;
+        let error = queue
+            .try_send_with(|_| {
+                called = true;
+                Ok::<_, io::Error>(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(!called);
     }
 
     #[test]
@@ -301,7 +500,7 @@ mod tests {
     }
 
     /// Fails every write and records whether it was shut down.
-    struct Broken(Arc<std::sync::atomic::AtomicBool>);
+    struct Broken(Arc<std::sync::atomic::AtomicBool>, bool);
 
     impl AsyncWrite for Broken {
         fn poll_write(
@@ -324,7 +523,11 @@ mod tests {
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<io::Result<()>> {
             self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-            std::task::Poll::Ready(Ok(()))
+            if self.1 {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
         }
     }
 
@@ -334,12 +537,31 @@ mod tests {
         let queue = SendQueue::new(1024);
         queue.send(b"data").await.unwrap();
         let error = queue
-            .run_writer(Broken(shut_down.clone()), None)
+            .run_writer(Broken(shut_down.clone(), false), None)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
         assert!(shut_down.load(std::sync::atomic::Ordering::SeqCst));
         assert!(queue.is_closed());
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_does_not_wait_for_transport_shutdown() {
+        for send_timeout in [None, Some(Duration::from_secs(60))] {
+            let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let queue = SendQueue::new(1024);
+            queue.send(b"data").await.unwrap();
+            let error = tokio::time::timeout(
+                Duration::from_millis(100),
+                queue.run_writer(Broken(attempted.clone(), true), send_timeout),
+            )
+            .await
+            .expect("transport shutdown must not delay a write error")
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+            assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(queue.is_closed());
+        }
     }
 
     #[tokio::test]

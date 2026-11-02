@@ -127,7 +127,7 @@ fn to_duration<E: serde::de::Error>(scalar: Scalar) -> Result<Duration, E> {
     match scalar {
         Scalar::Unsigned(seconds) => Ok(Duration::from_secs(seconds)),
         Scalar::Float(seconds) if seconds.is_finite() && seconds >= 0.0 => {
-            Ok(Duration::from_secs_f64(seconds))
+            Duration::try_from_secs_f64(seconds).map_err(E::custom)
         }
         Scalar::Text(text) => humantime::parse_duration(text.trim())
             .map_err(|error| E::custom(format!("invalid duration {text:?}: {error}"))),

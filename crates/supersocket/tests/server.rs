@@ -12,17 +12,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::{Client, next_reason, start, track_close_reasons};
+use common::{Client, WAIT, next_reason, start, track_close_reasons};
 use supersocket::{
     BeginEndMarkFilter, BoxError, BoxFilter, ConnectionInfo, FixedHeaderFilter,
     FixedHeaderProtocol, PackageHandler, PackageHandling, PipelineFilterExt, ServerBuilder,
-    ServerInfo,
+    ServerInfo, ServerStatus, SessionStatus,
     bytes::{Buf, BufMut, Bytes, BytesMut},
     prelude::*,
+    send_fmt,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    time::timeout,
 };
 
 fn echo_lines() -> ServerBuilder<TextPackage> {
@@ -695,6 +697,49 @@ async fn concurrent_handling_overlaps_packages_up_to_the_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_capacity_wait_does_not_dispatch_after_close() {
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler_release = release.clone();
+    let server = Server::builder(LineFilter::default)
+        .configure(|options| {
+            options.package_handling = PackageHandling::Concurrent { max_in_flight: 1 };
+        })
+        .on_package(move |session, package| {
+            let started = started.clone();
+            let release = handler_release.clone();
+            async move {
+                started.send(package.text.clone()).unwrap();
+                if package.text == "QUIT" {
+                    release.notified().await;
+                    session.close(CloseReason::LocalClosed);
+                }
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    server.start().unwrap();
+    let (mut peer, connection) = tokio::io::duplex(1024);
+    server
+        .serve_connection(connection, ConnectionInfo::default())
+        .unwrap();
+    peer.write_all(b"QUIT\r\nMUTATE\r\n").await.unwrap();
+    assert_eq!(starts.recv().await.unwrap(), "QUIT");
+    release.notify_one();
+    let mut bytes = Vec::new();
+    tokio::time::timeout(common::WAIT, peer.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    server.shutdown().await;
+    assert!(
+        starts.try_recv().is_err(),
+        "a command waiting for capacity must not start after the session closes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sessions_can_be_used_from_other_tasks_without_interleaving() {
     let (server, address) = start(Server::builder(LineFilter::default).on_package(
         async |session, _package| {
@@ -1269,13 +1314,13 @@ async fn session_state_can_be_built_from_the_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn listeners_take_host_names_and_socket_addresses() {
     let server = echo_lines().listen("localhost:0").build().unwrap();
-    let address = server.start().unwrap()[0];
+    let address = server.start().unwrap()[0].tcp().unwrap();
     assert!(address.ip().is_loopback());
     server.shutdown().await;
 
     let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = echo_lines().listen(bound).build().unwrap();
-    assert_eq!(server.start().unwrap()[0].ip(), bound.ip());
+    assert_eq!(server.start().unwrap()[0].tcp().unwrap().ip(), bound.ip());
     server.shutdown().await;
 }
 
@@ -1329,5 +1374,197 @@ async fn broadcasts_with_try_send_skip_full_sessions() {
     assert_eq!(members.len(), 2);
     assert_eq!(members[&sessions[0].id()], sessions[0]);
     assert_ne!(sessions[0], sessions[1]);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_and_session_status_follow_their_lives() {
+    /// Records the status a session has while it is being registered.
+    struct Observer(Arc<Mutex<Vec<SessionStatus>>>);
+
+    impl Middleware for Observer {
+        async fn register_session(&self, session: &Session) -> bool {
+            self.0.lock().unwrap().push(session.status());
+            true
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (sender, mut closed) = tokio::sync::mpsc::unbounded_channel();
+    let server = Server::builder(LineFilter::default)
+        .middleware(Observer(seen.clone()))
+        .on_connected({
+            let seen = seen.clone();
+            move |session| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(session.status());
+                }
+            }
+        })
+        .on_package(async |session, package| {
+            session
+                .send(format!("{} {}\r\n", package.text, session.status()))
+                .await?;
+            session.close(CloseReason::LocalClosed);
+            Ok(())
+        })
+        .on_closed(move |session, _| {
+            let sender = sender.clone();
+            async move {
+                let _ = sender.send((session.status(), session));
+            }
+        })
+        .listen("127.0.0.1:0")
+        .build()
+        .unwrap();
+    assert_eq!(server.status(), ServerStatus::Idle);
+    let address = server.start().unwrap()[0].tcp().unwrap();
+    assert_eq!(server.status(), ServerStatus::Running);
+
+    let mut client = Client::connect(address).await;
+    client.send(b"hi\r\n").await;
+    assert_eq!(client.line().await, "hi connected");
+    let (while_closing, session) = timeout(WAIT, closed.recv()).await.unwrap().unwrap();
+    assert_eq!(while_closing, SessionStatus::Closing);
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        [SessionStatus::Connecting, SessionStatus::Connected]
+    );
+    // Once the closed handlers have run, the session is closed for good.
+    timeout(WAIT, async {
+        while session.status() != SessionStatus::Closed {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the session did not reach the closed status");
+    assert!(session.is_closed());
+
+    server.stop_accepting();
+    assert_eq!(server.status(), ServerStatus::Draining);
+    server.shutdown().await;
+    assert_eq!(server.status(), ServerStatus::Stopped);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commands_with_maps_packages_before_dispatch() {
+    let errors = Arc::new(AtomicUsize::new(0));
+    let (server, address) = start(
+        Server::builder(LineFilter::default)
+            .commands_with(
+                |line: TextPackage| {
+                    if line.text.is_empty() {
+                        return Ok(None);
+                    }
+                    if line.text.starts_with('!') {
+                        return Err(ProtocolError::new("comments are not commands"));
+                    }
+                    CommandPackage::decode(Bytes::from(line.text)).map(Some)
+                },
+                |commands| {
+                    commands.add(Add).on_unknown(async |session, package| {
+                        session.send(format!("unknown {}\r\n", package.key)).await?;
+                        Ok(())
+                    });
+                },
+            )
+            .on_error({
+                let errors = errors.clone();
+                move |_, error| {
+                    let errors = errors.clone();
+                    async move {
+                        assert!(matches!(error, PackageError::Handler(_)), "{error}");
+                        errors.fetch_add(1, Ordering::SeqCst);
+                        ErrorAction::Continue
+                    }
+                }
+            }),
+    );
+    let mut client = Client::connect(address).await;
+    client
+        .send(b"ADD 1 2\r\n\r\n!comment\r\nMUL 2\r\nADD 4 5\r\n")
+        .await;
+    assert_eq!(client.line().await, "3");
+    assert_eq!(client.line().await, "unknown MUL");
+    assert_eq!(client.line().await, "9");
+    assert_eq!(errors.load(Ordering::SeqCst), 1);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_with_and_send_fmt_write_straight_into_the_send_buffer() {
+    let (server, address) = start(Server::builder(LineFilter::default).on_package(
+        async |session, package| {
+            // A writer that fails leaves nothing behind.
+            let failed = session
+                .send_with(|buf| {
+                    buf.extend_from_slice(b"never sent\r\n");
+                    Err::<(), _>(std::io::Error::other("changed my mind"))
+                })
+                .await;
+            assert_eq!(failed.unwrap_err().to_string(), "changed my mind");
+            send_fmt!(
+                session,
+                "{} has {} bytes\r\n",
+                package.text,
+                package.text.len()
+            )
+            .await?;
+            session.try_send_with(|buf| {
+                buf.extend_from_slice(b"done\r\n");
+                Ok::<_, std::io::Error>(())
+            })?;
+            Ok(())
+        },
+    ));
+    let mut client = Client::connect(address).await;
+    client.send(b"hello\r\n").await;
+    assert_eq!(client.line().await, "hello has 5 bytes");
+    assert_eq!(client.line().await, "done");
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_can_hand_their_connection_over() {
+    let (builder, mut reasons) = track_close_reasons(Server::builder(LineFilter::default));
+    let (server, address) = start(builder.on_package(async |session, package| {
+        if package.text != "RAW" {
+            session.send(format!("{}\r\n", package.text)).await?;
+            return Ok(());
+        }
+        // The goodbye is queued before the hand-over and arrives first.
+        session.send("switching to raw mode\r\n").await?;
+        let detaching = session.detach()?;
+        // Detaching again, or sending, is refused.
+        assert!(session.detach().is_err());
+        tokio::spawn(async move {
+            let connection = detaching.await.expect("the connection was handed over");
+            let mut stream = connection.into_stream();
+            // Everything that arrived after the RAW line is still there.
+            let mut buf = [0u8; 3];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"abc");
+            stream.write_all(b"ABC").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        Ok(())
+    }));
+    let mut client = Client::connect(address).await;
+    client.send(b"hello\r\n").await;
+    assert_eq!(client.line().await, "hello");
+    // The bytes after the RAW line arrive in the same write, read ahead by the session.
+    client.send(b"RAW\r\nabc").await;
+    assert_eq!(client.line().await, "switching to raw mode");
+    assert_eq!(client.bytes(3).await, b"ABC");
+    assert_eq!(next_reason(&mut reasons).await, CloseReason::Detached);
+    timeout(WAIT, async {
+        while server.info().session_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the detached session stayed in the container");
+    client.expect_closed().await;
     server.shutdown().await;
 }

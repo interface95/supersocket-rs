@@ -30,7 +30,7 @@ fn start_on(
         .configure(|options| options.listeners.push(listener))
         .build()
         .unwrap();
-    let address = server.start().unwrap()[0];
+    let address = server.start().unwrap()[0].tcp().unwrap();
     (server, address)
 }
 

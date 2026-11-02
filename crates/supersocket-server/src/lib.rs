@@ -31,8 +31,11 @@ mod extensions;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing;
+#[cfg(feature = "json")]
+mod json;
 mod layer;
 mod lenient;
+mod listener;
 mod middleware;
 mod options;
 mod proxy_protocol;
@@ -46,16 +49,26 @@ pub use command::{AsyncCommand, AsyncCommandExt, CommandFilter, Commands, Filter
 pub use config::ConfigError;
 pub use error::{BoxError, Error, HandlerResult};
 pub use extensions::Extensions;
+#[cfg(feature = "json")]
+#[doc(hidden)]
+pub use json::decode as decode_json_body;
+#[cfg(feature = "json")]
+pub use json::{Json, JsonCommand};
 #[cfg(feature = "gzip")]
 pub use layer::GzipLayer;
 pub use layer::StreamLayer;
+pub use listener::{ListenAddr, Listener};
 pub use middleware::Middleware;
 pub use options::{ListenOptions, PackageHandling, ServerOptions, TlsOptions};
 pub use proxy_protocol::{ProxyCommand, ProxyInfo};
 pub use server::{
-    ErrorAction, PackageError, PackageHandler, Server, ServerBuilder, ServerInfo, shutdown_signal,
+    ErrorAction, PackageError, PackageHandler, Server, ServerBuilder, ServerInfo, ServerStatus,
+    shutdown_signal,
 };
-pub use session::{CloseReason, ConnectionInfo, Session, SessionContainer, SessionState};
+pub use session::{
+    CloseReason, ConnectionInfo, Detached, Detaching, Session, SessionContainer, SessionState,
+    SessionStatus,
+};
 pub use supersocket_connection::{BoxStream, Stream};
 #[cfg(feature = "tls")]
 pub use tls::TlsInfo;

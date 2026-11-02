@@ -2,7 +2,7 @@ use std::{
     collections::HashMap, fmt::Debug, future::Future, hash::Hash, sync::Arc, time::Duration,
 };
 
-use supersocket_proto::CommandPackage;
+use supersocket_proto::{CommandPackage, ProtocolError};
 
 use crate::{
     BoxFuture, HandlerResult,
@@ -259,6 +259,69 @@ impl<P: KeyedPackage, S: SessionState> ServerBuilder<P, S> {
         let mut commands = Commands::new();
         configure(&mut commands);
         self.set_package_handler(Box::new(commands))
+    }
+}
+
+impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
+    /// Dispatches each package to a command once `mapper` has turned it into a package of type
+    /// `K` that names its command, like SuperSocket's `UseCommand` with an `IPackageMapper`: for
+    /// example the text of a [`TextPackage`](supersocket_proto::TextPackage) read as a command
+    /// line, or JSON decoded into a type of your own. `Ok(None)` skips a package, and an error is
+    /// handled like one from a handler. This becomes the package handler, replacing one set with
+    /// [`on_package`](Self::on_package).
+    ///
+    /// ```
+    /// use supersocket_proto::{CommandPackage, LineFilter, bytes::Bytes};
+    /// use supersocket_server::Server;
+    ///
+    /// // Lines such as "ADD 1 2" dispatched as command lines.
+    /// let builder = Server::builder(LineFilter::default).commands_with(
+    ///     |line| CommandPackage::decode(Bytes::from(line.text)).map(Some),
+    ///     |commands| {
+    ///         commands.on_unknown(async |session, package| {
+    ///             session.send(format!("unknown command {}\r\n", package.key)).await?;
+    ///             Ok(())
+    ///         });
+    ///     },
+    /// );
+    /// ```
+    pub fn commands_with<K, M>(self, mapper: M, configure: impl FnOnce(&mut Commands<K, S>)) -> Self
+    where
+        K: KeyedPackage,
+        M: Fn(P) -> Result<Option<K>, ProtocolError> + Send + Sync + 'static,
+    {
+        let mut commands = Commands::new();
+        configure(&mut commands);
+        self.set_package_handler(Box::new(MappedCommands { commands, mapper }))
+    }
+}
+
+/// Commands fed through a package mapper; see [`ServerBuilder::commands_with`].
+struct MappedCommands<K: KeyedPackage, S, M> {
+    commands: Commands<K, S>,
+    mapper: M,
+}
+
+impl<P, K, S, M> DynPackageHandler<P, S> for MappedCommands<K, S, M>
+where
+    P: Send + 'static,
+    K: KeyedPackage,
+    S: SessionState,
+    M: Fn(P) -> Result<Option<K>, ProtocolError> + Send + Sync + 'static,
+{
+    fn handle<'a>(
+        &'a self,
+        session: Session<S>,
+        package: P,
+        limit: Duration,
+    ) -> BoxFuture<'a, Result<(), PackageError>> {
+        Box::pin(handle_with_limit(limit, move || async move {
+            match (self.mapper)(package) {
+                Ok(Some(mapped)) => self.commands.dispatch(session, mapped).await,
+                Ok(None) => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        }))
     }
 }
 

@@ -1,5 +1,7 @@
 use std::{
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     net::SocketAddr,
     pin::pin,
     sync::{Arc, Weak},
@@ -7,7 +9,9 @@ use std::{
 };
 
 use bytes::BytesMut;
-use supersocket_connection::{PackageReader, ReadError, ReadOptions, SendQueue, catch_panic};
+use supersocket_connection::{
+    PackageReader, ReadError, ReadOptions, SendQueue, catch_panic, catch_panic_sync,
+};
 use supersocket_proto::{BoxFilter, PackageEncoder, PipelineFilter};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio_util::sync::CancellationToken;
@@ -220,7 +224,9 @@ impl<P: Send + 'static> EasyClient<P> {
 
     /// Hands every package to `handler` in a background task, like SuperSocket's
     /// `PackageHandler` event with `StartReceive`. Packages are handled one at a time. Returns a
-    /// sender for sending and closing; the task ends when the connection closes.
+    /// sender for sending and closing; the task ends when the connection closes. Packages that
+    /// arrive while the connection is closing, such as a goodbye from the server, are still
+    /// handled; a handler that is still pending once the connection is closed is dropped.
     ///
     /// The task does not keep the connection open: once the returned sender and every clone of it
     /// are dropped, the connection is closed as if the client had been dropped.
@@ -234,25 +240,43 @@ impl<P: Send + 'static> EasyClient<P> {
             sender,
         } = self;
         let connection: Weak<SenderInner> = Arc::downgrade(&sender.inner);
+        let shared = receiver.shared.clone();
         tokio::spawn(async move {
-            loop {
-                match receiver.receive().await {
-                    Ok(Some(package)) => {
-                        let Some(inner) = connection.upgrade() else {
+            let receiving = async move {
+                loop {
+                    match receiver.receive().await {
+                        Ok(Some(package)) => {
+                            let Some(inner) = connection.upgrade() else {
+                                break;
+                            };
+                            let handled =
+                                match catch_panic_sync(|| handler(ClientSender { inner }, package))
+                                {
+                                    Ok(handling) => catch_panic(handling).await,
+                                    Err(panic) => Err(panic),
+                                };
+                            if let Err(panic) = handled {
+                                tracing::error!(%panic, "client package handler panicked");
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::debug!(%error, "receive failed");
                             break;
-                        };
-                        let handling = handler(ClientSender { inner }, package);
-                        if let Err(panic) = catch_panic(handling).await {
-                            tracing::error!(%panic, "client package handler panicked");
                         }
                     }
-                    Ok(None) => break,
-                    Err(error) => {
-                        tracing::debug!(%error, "receive failed");
-                        break;
+                }
+            };
+            tokio::select! {
+                biased;
+                () = shared.closed.cancelled() => {},
+                result = catch_panic(receiving) => {
+                    if let Err(panic) = result {
+                        tracing::error!(%panic, "client receive task panicked");
                     }
                 }
             }
+            shared.close();
         });
         sender
     }
@@ -274,6 +298,14 @@ impl<P: Send + 'static> EasyClient<P> {
         package: &T,
     ) -> io::Result<()> {
         self.sender.send_package(encoder, package).await
+    }
+
+    /// Queues what `write` appends to the send buffer; see [`ClientSender::send_with`].
+    pub async fn send_with<E: From<io::Error>>(
+        &self,
+        write: impl FnOnce(&mut BytesMut) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.sender.send_with(write).await
     }
 
     /// Local address of the socket.
@@ -419,17 +451,69 @@ impl ClientSender {
         self.inner.shared.queue.send_last(data.as_ref())
     }
 
-    /// Encodes `package` with `encoder` and queues it like [`send`](Self::send).
+    /// Encodes `package` with `encoder` straight into the send buffer and queues it like
+    /// [`send`](Self::send). An encoding error is reported as
+    /// [`ErrorKind::InvalidInput`](io::ErrorKind::InvalidInput).
     pub async fn send_package<T: ?Sized>(
         &self,
         encoder: &impl PackageEncoder<T>,
         package: &T,
     ) -> io::Result<()> {
-        let mut buf = BytesMut::new();
-        encoder
-            .encode(package, &mut buf)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        self.send(&buf).await
+        self.send_with(|buf| {
+            encoder
+                .encode(package, buf)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+        })
+        .await
+    }
+
+    /// Queues what `write` appends to the send buffer, like [`send`](Self::send) without a buffer
+    /// in between. `write` runs while the send queue is locked, so it must be quick and must not
+    /// wait. Nothing is queued when it fails, and its error is returned; the connection's own
+    /// errors are I/O errors.
+    pub async fn send_with<E: From<io::Error>>(
+        &self,
+        write: impl FnOnce(&mut BytesMut) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.inner.shared.queue.send_with(write).await
+    }
+
+    /// Like [`send_with`](Self::send_with) without waiting: fails with
+    /// [`ErrorKind::WouldBlock`](io::ErrorKind::WouldBlock) while the send buffer limit is
+    /// reached, in which case `write` is not called.
+    pub fn try_send_with<E: From<io::Error>>(
+        &self,
+        write: impl FnOnce(&mut BytesMut) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.inner.shared.queue.try_send_with(write)
+    }
+
+    /// Formats `args` straight into the send buffer and queues it like [`send`](Self::send).
+    /// Only while the send buffer limit is reached is the text formatted into a `String` first,
+    /// to wait for room. Call it through the [`send_fmt!`](supersocket_connection::send_fmt)
+    /// macro, `send_fmt!(sender, "ADD {a} {b}\r\n").await?`: `format_args!` cannot be kept
+    /// across an `await` in a `Send` future, and the macro lets go of it in time.
+    pub fn send_fmt<'a>(
+        &'a self,
+        args: fmt::Arguments<'_>,
+    ) -> impl Future<Output = io::Result<()>> + Send + use<'a> {
+        use std::fmt::Write as _;
+        // The arguments cannot be kept across an await, so they are used before the first one.
+        let queued = self.try_send_with(|buf| {
+            buf.write_fmt(args)
+                .map_err(|_| io::Error::other("formatting the data failed"))
+        });
+        let fallback = match queued {
+            Ok(()) => Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(Some(args.to_string())),
+            Err(error) => Err(error),
+        };
+        async move {
+            match fallback? {
+                Some(text) => self.send(text).await,
+                None => Ok(()),
+            }
+        }
     }
 
     /// Whether the connection is closed or closing.

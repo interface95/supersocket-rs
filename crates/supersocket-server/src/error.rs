@@ -1,4 +1,6 @@
-use std::{io, net::SocketAddr};
+use std::io;
+
+use crate::ListenAddr;
 
 /// A boxed error. Any `std::error::Error + Send + Sync` converts into it with `?`.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -32,7 +34,7 @@ pub enum Error {
     #[error("failed to bind {address}: {source}")]
     Bind {
         /// The address that could not be bound.
-        address: SocketAddr,
+        address: ListenAddr,
         /// The underlying I/O error.
         source: io::Error,
     },

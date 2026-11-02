@@ -30,6 +30,12 @@ gzip = ["supersocket-server/gzip", "supersocket-client?/gzip"]
 codec = ["supersocket-proto/codec"]
 ## WebSocket per-message compression (`permessage-deflate`), with `websocket`.
 deflate = ["websocket", "supersocket-websocket/deflate"]
+## Commands whose package body is JSON: `JsonCommand`, and with `websocket` `JsonWebSocketCommand`.
+json = ["supersocket-server/json", "supersocket-websocket?/json"]
+## The UDP listener, `udp::UdpListener`, which serves datagrams as sessions.
+udp = ["dep:supersocket-udp"]
+## HTTP/1.1 in the `http` module: a request filter, responses, keep-alive and Server-Sent Events.
+http = ["dep:supersocket-http"]
 
 [dependencies]
 supersocket-connection.workspace = true
@@ -37,10 +43,13 @@ supersocket-proto.workspace = true
 supersocket-server.workspace = true
 supersocket-client = { workspace = true, optional = true }
 supersocket-websocket = { workspace = true, optional = true }
+supersocket-udp = { workspace = true, optional = true }
+supersocket-http = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures-util.workspace = true
 rcgen.workspace = true
+serde.workspace = true
 socket2 = { workspace = true, features = ["all"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls.workspace = true
@@ -76,6 +85,14 @@ required-features = ["websocket"]
 name = "websocket_client"
 required-features = ["websocket", "client"]
 
+[[example]]
+name = "http_server"
+required-features = ["http"]
+
+[[example]]
+name = "udp_echo_server"
+required-features = ["udp"]
+
 [[test]]
 name = "tls"
 required-features = ["tls"]
@@ -103,6 +120,18 @@ required-features = ["websocket"]
 [[test]]
 name = "websocket_client"
 required-features = ["websocket", "client", "tls"]
+
+[[test]]
+name = "json"
+required-features = ["json"]
+
+[[test]]
+name = "udp"
+required-features = ["udp"]
+
+[[test]]
+name = "http"
+required-features = ["http"]
 
 [lints]
 workspace = true

@@ -217,22 +217,33 @@ fn parse_v2(buf: &[u8]) -> Result<Option<(Header, usize)>, &'static str> {
             length,
         )));
     }
-    let (addresses, tlvs) = match family_protocol >> 4 {
-        0 => (None, body),
-        1 => {
+    let family = family_protocol >> 4;
+    let protocol = family_protocol & 0x0f;
+    if family > 3 {
+        return Err("unknown address family in the PROXY protocol header");
+    }
+    if protocol > 2 {
+        return Err("unknown transport protocol in the PROXY protocol header");
+    }
+    let (addresses, tlvs) = match (family, protocol) {
+        // An unspecified transport cannot supply a usable address layout. Keep the
+        // actual socket endpoints and skip its declared block without interpreting it.
+        (1..=3, 0) => (None, &[][..]),
+        (0, _) => (None, body),
+        (1, _) => {
             let (addresses, rest) = split(body, 12)?;
             let ip = |at: usize| IpAddr::from(<[u8; 4]>::try_from(&addresses[at..at + 4]).unwrap());
             (Some(addresses_from(ip(0), ip(4), &addresses[8..])), rest)
         }
-        2 => {
+        (2, _) => {
             let (addresses, rest) = split(body, 36)?;
             let ip =
                 |at: usize| IpAddr::from(<[u8; 16]>::try_from(&addresses[at..at + 16]).unwrap());
             (Some(addresses_from(ip(0), ip(16), &addresses[32..])), rest)
         }
         // Unix socket paths do not fit in a socket address.
-        3 => (None, split(body, 216)?.1),
-        _ => return Err("unknown address family in the PROXY protocol header"),
+        (3, _) => (None, split(body, 216)?.1),
+        _ => unreachable!("the address family was validated"),
     };
     // A proxy's own connection carries no client address, whatever the header holds.
     let (source, destination) = match (command, addresses) {
@@ -377,6 +388,47 @@ mod tests {
             header.destination,
             Some(SocketAddr::new("::2".parse().unwrap(), 0))
         );
+    }
+
+    #[test]
+    fn rejects_reserved_v2_transport_protocols() {
+        for family in 0..=3 {
+            let body = vec![
+                0;
+                match family {
+                    1 => 12,
+                    2 => 36,
+                    3 => 216,
+                    _ => 0,
+                }
+            ];
+            for protocol in 3..=15 {
+                let mut data = v2(1, family, &body);
+                data[13] = family << 4 | protocol;
+                assert!(
+                    parse(&data).is_err(),
+                    "accepted protocol byte {:#x}",
+                    data[13]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unspecified_v2_transport_does_not_supply_addresses() {
+        for family in 1..=3 {
+            // UNSPEC has no usable transport layout; ignore its block even when short.
+            for body in [&[][..], &[192, 0, 2, 1, 198, 51, 100, 1, 0, 1, 0, 2][..]] {
+                let mut data = v2(1, family, body);
+                data[13] = family << 4;
+                let length = data.len();
+                data.extend(b"application data");
+                let (header, consumed) = parse_complete(&data);
+                assert_eq!(consumed, length);
+                assert_eq!((header.source, header.destination), (None, None));
+                assert!(header.tlvs.is_empty());
+            }
+        }
     }
 
     #[test]

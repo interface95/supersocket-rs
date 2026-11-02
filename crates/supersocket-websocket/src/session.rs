@@ -3,7 +3,8 @@ use std::{fmt, io, net::SocketAddr, ops::Deref, sync::atomic::Ordering};
 use supersocket_server::{CloseReason, Extensions, ServerInfo, Session};
 
 use crate::{
-    CloseCode, CloseFrame, HandshakeRequest, Message, WebSocketState,
+    CloseCode, CloseFrame, FragmentWriter, HandshakeRequest, Message, MessageKind, WebSocketState,
+    fragments::FrameSink,
     frame::{FIN, MAX_CONTROL_PAYLOAD, OP_BINARY, OP_PING, OP_TEXT, RSV1},
     handshake::NO_REQUEST,
     server::{send_close, send_frame, try_send_frame},
@@ -114,6 +115,10 @@ impl<S> WebSocketSession<S> {
                 "the WebSocket connection is closing",
             ));
         }
+        // A fragmented message is being sent: this one would have to wait.
+        let Ok(_sending) = self.session.sending.try_read() else {
+            return Err(io::ErrorKind::WouldBlock.into());
+        };
         let (opcode, payload) = match message {
             Message::Text(text) => (OP_TEXT, text.as_bytes()),
             Message::Binary(data) => (OP_BINARY, &data[..]),
@@ -137,6 +142,35 @@ impl<S> WebSocketSession<S> {
         send_frame(&self.session, FIN | OP_PING, payload).await
     }
 
+    /// Sends a message in fragments, for a message too large to hold in memory or produced over
+    /// time; see [`FragmentWriter`]. Other messages wait until it is finished. The message is
+    /// not compressed.
+    ///
+    /// ```
+    /// use supersocket_websocket::{MessageKind, WebSocketSession};
+    ///
+    /// # async fn run(session: WebSocketSession, chunks: Vec<Vec<u8>>) -> std::io::Result<()> {
+    /// let mut message = session.send_fragmented(MessageKind::Binary).await?;
+    /// for chunk in &chunks {
+    ///     message.write(chunk).await?;
+    /// }
+    /// message.finish(b"").await
+    /// # }
+    /// ```
+    pub async fn send_fragmented(&self, kind: MessageKind) -> io::Result<FragmentWriter<'_>>
+    where
+        S: Send + Sync + 'static,
+    {
+        if self.session.close_sent.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the WebSocket connection is closing",
+            ));
+        }
+        let sending = self.session.sending.write().await;
+        Ok(FragmentWriter::new(&self.session, sending, kind))
+    }
+
     async fn send_data(&self, opcode: u8, payload: &[u8]) -> io::Result<()> {
         if self.session.close_sent.load(Ordering::Acquire) {
             return Err(io::Error::new(
@@ -144,6 +178,8 @@ impl<S> WebSocketSession<S> {
                 "the WebSocket connection is closing",
             ));
         }
+        // Wait for a fragmented message that is being sent.
+        let _sending = self.session.sending.read().await;
         if let Some(encoder) = self.session.compression.get() {
             // With a shared window, a frame that a cancelled send left behind goes first.
             loop {
@@ -186,6 +222,24 @@ impl<S: Send + Sync + 'static> WebSocketSession<S> {
             }
         });
         sent
+    }
+}
+
+impl<S: Send + Sync + 'static> FrameSink for Session<WebSocketState<S>> {
+    fn send_frame<'a>(
+        &'a self,
+        first: u8,
+        payload: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>> {
+        Box::pin(send_frame(self, first, payload))
+    }
+
+    fn try_send_frame(&self, first: u8, payload: &[u8]) -> io::Result<()> {
+        try_send_frame(self, first, payload)
+    }
+
+    fn abandon(&self) {
+        self.close(CloseReason::LocalClosed);
     }
 }
 

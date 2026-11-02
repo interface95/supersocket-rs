@@ -17,12 +17,6 @@ pub use transparent::TransparentFilter;
 /// A function that decodes the bytes of one package, used by the built-in filters.
 pub type Decoder<P> = Box<dyn FnMut(bytes::Bytes) -> Result<P, crate::ProtocolError> + Send>;
 
-pub(crate) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
 #[cfg(test)]
 pub(crate) mod test_util {
     use bytes::BytesMut;

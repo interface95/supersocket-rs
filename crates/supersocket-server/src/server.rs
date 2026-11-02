@@ -23,6 +23,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{
     BoxError, BoxFuture, Error, HandlerResult, connection,
     layer::{DynStreamLayer, StreamLayer},
+    listener::{DynListener, ListenAddr, Listener},
     middleware::{DynMiddleware, Middleware},
     options::{ListenOptions, ServerOptions},
     session::{CloseReason, ConnectionInfo, Session, SessionContainer, SessionState},
@@ -269,6 +270,8 @@ pub struct ServerBuilder<P, S = ()> {
     on_accept: Option<AcceptHook>,
     layers: Vec<Box<dyn DynStreamLayer>>,
     session_factory: SessionFactory<S>,
+    /// Listeners of other transports, besides those in the options.
+    listeners: Vec<Box<dyn DynListener>>,
 }
 
 impl<P: Send + 'static> ServerBuilder<P> {
@@ -316,6 +319,7 @@ impl<P: Send + 'static> ServerBuilder<P> {
             on_accept: self.on_accept,
             layers: self.layers,
             session_factory: Arc::new(factory),
+            listeners: self.listeners,
         }
     }
 }
@@ -436,6 +440,20 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
         self
     }
 
+    /// Listens on the Unix domain socket at `path`, on Unix; see [`ListenOptions::unix`].
+    pub fn listen_unix(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.options.listeners.push(ListenOptions::unix(path));
+        self
+    }
+
+    /// Accepts connections from a listener of your own, for transports that the TCP and Unix
+    /// socket listeners of the options do not cover; see [`Listener`]. Its connections are served
+    /// like the others, and [`Server::stop_accepting`] stops it.
+    pub fn listener(mut self, listener: impl Listener) -> Self {
+        self.listeners.push(Box::new(listener));
+        self
+    }
+
     /// Changes the options in place.
     pub fn configure(mut self, configure: impl FnOnce(&mut ServerOptions)) -> Self {
         configure(&mut self.options);
@@ -458,11 +476,11 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
     /// connections handed to [`Server::serve_connection`] once it is started.
     pub fn build(self) -> Result<Server<P, S>, Error> {
         self.options.validate()?;
-        let listeners = self
+        let endpoints = self
             .options
             .listeners
             .iter()
-            .map(Listener::prepare)
+            .map(Endpoint::prepare)
             .collect::<Result<Vec<_>, _>>()?;
         let mut middlewares = self.middlewares;
         middlewares.sort_by_key(|middleware| middleware.order());
@@ -488,7 +506,8 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
                 on_accept: self.on_accept,
                 layers: self.layers,
                 session_factory: self.session_factory,
-                listeners,
+                endpoints,
+                listeners: std::sync::Mutex::new(self.listeners),
                 connection_limit,
                 next_session_id: AtomicU64::new(1),
                 started: AtomicBool::new(false),
@@ -497,6 +516,34 @@ impl<P: Send + 'static, S: SessionState> ServerBuilder<P, S> {
                 shutdown: CancellationToken::new(),
                 tracker: TaskTracker::new(),
             }),
+        })
+    }
+}
+
+/// Where a server is in its life, like SuperSocket's `ServerState`; see [`Server::status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ServerStatus {
+    /// Built, not started.
+    Idle,
+    /// Accepting connections and serving sessions.
+    Running,
+    /// The listeners are closed after [`Server::stop_accepting`]; the sessions go on.
+    Draining,
+    /// Shutting down: the sessions are being closed.
+    Stopping,
+    /// Shut down.
+    Stopped,
+}
+
+impl fmt::Display for ServerStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Draining => "draining",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
         })
     }
 }
@@ -519,7 +566,10 @@ pub(crate) struct ServerInner<P, S> {
     pub(crate) on_accept: Option<AcceptHook>,
     pub(crate) layers: Vec<Box<dyn DynStreamLayer>>,
     pub(crate) session_factory: SessionFactory<S>,
-    listeners: Vec<Arc<Listener>>,
+    /// The listeners of the options: TCP and Unix sockets.
+    endpoints: Vec<Arc<Endpoint>>,
+    /// Listeners of other transports, taken out when the server starts.
+    listeners: std::sync::Mutex<Vec<Box<dyn DynListener>>>,
     connection_limit: Option<Arc<Semaphore>>,
     pub(crate) next_session_id: AtomicU64,
     started: AtomicBool,
@@ -530,41 +580,117 @@ pub(crate) struct ServerInner<P, S> {
     pub(crate) tracker: TaskTracker,
 }
 
-pub(crate) struct Listener {
-    address: SocketAddr,
+/// A listener of the options, prepared when the server is built and bound when it starts.
+pub(crate) struct Endpoint {
+    kind: EndpointKind,
     pub(crate) options: ListenOptions,
     #[cfg(feature = "tls")]
     pub(crate) tls: Option<crate::tls::TlsListener>,
 }
 
-impl Listener {
+enum EndpointKind {
+    Tcp(SocketAddr),
+    #[cfg(unix)]
+    Unix(std::path::PathBuf),
+}
+
+/// A bound listener of the options.
+enum Bound {
+    Tcp(TcpListener),
+    /// The socket file is removed when the listener is dropped, however long it was bound.
+    #[cfg(unix)]
+    Unix {
+        listener: tokio::net::UnixListener,
+        path: std::path::PathBuf,
+    },
+}
+
+#[cfg(unix)]
+impl Drop for Bound {
+    fn drop(&mut self) {
+        if let Self::Unix { path, .. } = self {
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    tracing::debug!(path = %path.display(), %error, "removing the socket file failed");
+                }
+            }
+        }
+    }
+}
+
+/// A connection accepted by a [`Bound`] listener.
+enum Accepted {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+}
+
+impl Bound {
+    async fn accept(&self) -> io::Result<Accepted> {
+        match self {
+            Self::Tcp(listener) => listener
+                .accept()
+                .await
+                .map(|(stream, _)| Accepted::Tcp(stream)),
+            #[cfg(unix)]
+            Self::Unix { listener, .. } => listener
+                .accept()
+                .await
+                .map(|(stream, _)| Accepted::Unix(stream)),
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<ListenAddr> {
+        match self {
+            Self::Tcp(listener) => listener.local_addr().map(ListenAddr::Tcp),
+            #[cfg(unix)]
+            Self::Unix { path, .. } => Ok(ListenAddr::Unix(path.clone())),
+        }
+    }
+}
+
+impl Endpoint {
     fn prepare(options: &ListenOptions) -> Result<Arc<Self>, Error> {
-        let invalid = |source| Error::InvalidAddress {
-            address: options.address.clone(),
-            source,
+        let kind = match &options.path {
+            #[cfg(unix)]
+            Some(path) => EndpointKind::Unix(path.clone()),
+            #[cfg(not(unix))]
+            Some(path) => {
+                return Err(Error::InvalidOptions(format!(
+                    "listener {}: Unix socket listeners need a Unix platform",
+                    path.display()
+                )));
+            }
+            None => {
+                let invalid = |source| Error::InvalidAddress {
+                    address: options.address.clone(),
+                    source,
+                };
+                // Host names are resolved once, here; a socket address resolves to itself.
+                let address = std::net::ToSocketAddrs::to_socket_addrs(options.address.as_str())
+                    .map_err(invalid)?
+                    .next()
+                    .ok_or_else(|| {
+                        invalid(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "the host name did not resolve to any address",
+                        ))
+                    })?;
+                EndpointKind::Tcp(address)
+            }
         };
-        // Host names are resolved once, here; a socket address resolves to itself.
-        let address = std::net::ToSocketAddrs::to_socket_addrs(options.address.as_str())
-            .map_err(invalid)?
-            .next()
-            .ok_or_else(|| {
-                invalid(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "the host name did not resolve to any address",
-                ))
-            })?;
         #[cfg(not(feature = "tls"))]
         if options.tls.is_some() {
-            return Err(Error::TlsDisabled(options.address.clone()));
+            return Err(Error::TlsDisabled(options.label()));
         }
         Ok(Arc::new(Self {
-            address,
+            kind,
             options: options.clone(),
             #[cfg(feature = "tls")]
             tls: options
                 .tls
                 .as_ref()
-                .map(|tls| crate::tls::TlsListener::new(&options.address, tls))
+                .map(|tls| crate::tls::TlsListener::new(&options.label(), tls))
                 .transpose()?,
         }))
     }
@@ -573,31 +699,72 @@ impl Listener {
         self.options.tls.is_some()
     }
 
-    fn bind(&self) -> Result<TcpListener, Error> {
-        let bind = || {
-            let socket = if self.address.is_ipv4() {
-                TcpSocket::new_v4()?
-            } else {
-                TcpSocket::new_v6()?
-            };
-            // On Windows SO_REUSEADDR would let another socket bind a port that is in use.
-            #[cfg(not(windows))]
-            socket.set_reuseaddr(true)?;
-            // The receive buffer must be set before listening to count for the window scaling
-            // of new connections. Each accepted connection gets the sizes again in `configure`.
-            if let Some(size) = self.options.socket_receive_buffer_size {
-                socket.set_recv_buffer_size(size)?;
-            }
-            if let Some(size) = self.options.socket_send_buffer_size {
-                socket.set_send_buffer_size(size)?;
-            }
-            socket.bind(self.address)?;
-            socket.listen(self.options.backlog)
+    fn addr(&self) -> ListenAddr {
+        match &self.kind {
+            EndpointKind::Tcp(address) => ListenAddr::Tcp(*address),
+            #[cfg(unix)]
+            EndpointKind::Unix(path) => ListenAddr::Unix(path.clone()),
+        }
+    }
+
+    fn bind(&self) -> Result<Bound, Error> {
+        let bound = match &self.kind {
+            EndpointKind::Tcp(address) => self.bind_tcp(*address).map(Bound::Tcp),
+            #[cfg(unix)]
+            EndpointKind::Unix(path) => self.bind_unix(path).map(|listener| Bound::Unix {
+                listener,
+                path: path.clone(),
+            }),
         };
-        bind().map_err(|source| Error::Bind {
-            address: self.address,
+        bound.map_err(|source| Error::Bind {
+            address: self.addr(),
             source,
         })
+    }
+
+    fn bind_tcp(&self, address: SocketAddr) -> io::Result<TcpListener> {
+        let socket = if address.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        // On Windows SO_REUSEADDR would let another socket bind a port that is in use.
+        #[cfg(not(windows))]
+        socket.set_reuseaddr(true)?;
+        // The receive buffer must be set before listening to count for the window scaling
+        // of new connections. Each accepted connection gets the sizes again in `configure`.
+        if let Some(size) = self.options.socket_receive_buffer_size {
+            socket.set_recv_buffer_size(size)?;
+        }
+        if let Some(size) = self.options.socket_send_buffer_size {
+            socket.set_send_buffer_size(size)?;
+        }
+        socket.bind(address)?;
+        socket.listen(self.options.backlog)
+    }
+
+    #[cfg(unix)]
+    fn bind_unix(&self, path: &std::path::Path) -> io::Result<tokio::net::UnixListener> {
+        use std::os::unix::fs::FileTypeExt;
+
+        // A socket file left behind by an earlier run would make binding fail; anything else at
+        // the path is not ours to remove.
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path)?,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the path exists and is not a socket",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+        socket.bind(&socket2::SockAddr::unix(path)?)?;
+        socket.listen(i32::try_from(self.options.backlog).unwrap_or(i32::MAX))?;
+        socket.set_nonblocking(true)?;
+        tokio::net::UnixListener::from_std(socket.into())
     }
 
     /// Applies the listener's settings to a connection it accepted.
@@ -654,6 +821,7 @@ impl<P: Send + 'static> Server<P> {
             on_accept: None,
             layers: Vec::new(),
             session_factory: Arc::new(|_| ()),
+            listeners: Vec::new(),
         }
     }
 }
@@ -664,9 +832,26 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
         &self.inner.info
     }
 
-    /// Binds all listeners and starts accepting connections. Returns the bound addresses, which
-    /// tells the actual port when a listener uses port 0.
-    pub fn start(&self) -> Result<Vec<SocketAddr>, Error> {
+    /// Where the server is in its life.
+    pub fn status(&self) -> ServerStatus {
+        let server = &self.inner;
+        if server.stopped.load(Ordering::SeqCst) {
+            ServerStatus::Stopped
+        } else if server.shutdown.is_cancelled() {
+            ServerStatus::Stopping
+        } else if !server.started.load(Ordering::SeqCst) {
+            ServerStatus::Idle
+        } else if server.accepting.is_cancelled() {
+            ServerStatus::Draining
+        } else {
+            ServerStatus::Running
+        }
+    }
+
+    /// Binds all listeners and starts accepting connections. Returns where they listen, in the
+    /// order of the options followed by the listeners added with [`ServerBuilder::listener`];
+    /// a TCP listener bound to port 0 reports the port it got.
+    pub fn start(&self) -> Result<Vec<ListenAddr>, Error> {
         let server = &self.inner;
         if server.started.swap(true, Ordering::SeqCst) {
             return Err(Error::AlreadyStarted);
@@ -675,17 +860,17 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
         // than leaving the server permanently marked as started.
         let bind = || {
             let bound = server
-                .listeners
+                .endpoints
                 .iter()
-                .map(|listener| Ok((listener.bind()?, listener.clone())))
+                .map(|endpoint| Ok((endpoint.bind()?, endpoint.clone())))
                 .collect::<Result<Vec<_>, Error>>()?;
             let addresses = bound
                 .iter()
-                .map(|(tcp, _)| tcp.local_addr())
+                .map(|(bound, _)| bound.local_addr())
                 .collect::<io::Result<Vec<_>>>()?;
             Ok::<_, Error>((bound, addresses))
         };
-        let (bound, addresses) = match bind() {
+        let (bound, mut addresses) = match bind() {
             Ok(result) => result,
             Err(error) => {
                 server.started.store(false, Ordering::SeqCst);
@@ -698,7 +883,8 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
                 "no package handler or commands configured, packages are dropped"
             );
         }
-        if server.listeners.is_empty() {
+        let listeners = std::mem::take(&mut *server.listeners.lock().unwrap());
+        if server.endpoints.is_empty() && listeners.is_empty() {
             tracing::warn!(
                 server = server.info.name(),
                 "no listeners configured, only connections passed to serve_connection are served"
@@ -710,15 +896,24 @@ impl<P: Send + 'static, S: SessionState> Server<P, S> {
                 for started in server.middlewares[..index].iter().rev() {
                     started.shutdown(&server.info);
                 }
+                *server.listeners.lock().unwrap() = listeners;
                 server.started.store(false, Ordering::SeqCst);
                 return Err(Error::Middleware(error));
             }
         }
-        for ((tcp, listener), address) in bound.into_iter().zip(&addresses) {
-            tracing::info!(server = server.info.name(), %address, tls = listener.is_secure(), "listening");
+        for ((bound, endpoint), address) in bound.into_iter().zip(&addresses) {
+            tracing::info!(server = server.info.name(), %address, tls = endpoint.is_secure(), "listening");
             server
                 .tracker
-                .spawn(accept_loop(server.clone(), tcp, listener));
+                .spawn(accept_loop(server.clone(), bound, endpoint));
+        }
+        for listener in listeners {
+            let address = listener.local_addr();
+            tracing::info!(server = server.info.name(), %address, "listening");
+            addresses.push(address);
+            server
+                .tracker
+                .spawn(custom_accept_loop(server.clone(), listener));
         }
         if let Some(timeout) = server.info.options.idle_session_timeout {
             server
@@ -823,50 +1018,125 @@ impl<P, S> fmt::Debug for Server<P, S> {
     }
 }
 
+/// Accepts connections on a listener of the options until the server stops accepting.
 async fn accept_loop<P: Send + 'static, S: SessionState>(
     server: Arc<ServerInner<P, S>>,
-    tcp: TcpListener,
-    listener: Arc<Listener>,
+    bound: Bound,
+    endpoint: Arc<Endpoint>,
 ) {
     loop {
-        tokio::select! {
+        let accepted = tokio::select! {
+            _ = server.shutdown.cancelled() => break,
+            _ = server.accepting.cancelled() => break,
+            accepted = bound.accept() => accepted,
+        };
+        let accepted = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // Typically running out of file descriptors; back off instead of spinning.
+                tracing::error!(server = server.info.name(), %error, "accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Some(permit) = acquire_permit(&server).await else {
+            break;
+        };
+        // The TLS handshake and session setup run in the connection's own task, so a slow
+        // client never holds up the accept loop.
+        match accepted {
+            Accepted::Tcp(stream) => {
+                if !server.layers.is_empty() {
+                    server.tracker.spawn(connection::serve_layered_tcp(
+                        server.clone(),
+                        stream,
+                        endpoint.clone(),
+                        permit,
+                    ));
+                    continue;
+                }
+                #[cfg(feature = "tls")]
+                if endpoint.tls.is_some() {
+                    server.tracker.spawn(connection::serve_tls(
+                        server.clone(),
+                        stream,
+                        endpoint.clone(),
+                        permit,
+                    ));
+                    continue;
+                }
+                server.tracker.spawn(connection::serve(
+                    server.clone(),
+                    stream,
+                    endpoint.clone(),
+                    permit,
+                ));
+            }
+            #[cfg(unix)]
+            Accepted::Unix(stream) => {
+                server.tracker.spawn(connection::serve_unix(
+                    server.clone(),
+                    stream,
+                    endpoint.clone(),
+                    permit,
+                ));
+            }
+        }
+    }
+}
+
+/// Accepts connections from a listener of another transport until it ends or the server stops
+/// accepting.
+async fn custom_accept_loop<P: Send + 'static, S: SessionState>(
+    server: Arc<ServerInner<P, S>>,
+    mut listener: Box<dyn DynListener>,
+) {
+    loop {
+        let accepted = tokio::select! {
             _ = server.shutdown.cancelled() => return,
             _ = server.accepting.cancelled() => return,
-            accepted = tcp.accept() => match accepted {
-                // The TLS handshake and session setup run in the connection's own task, so a slow
-                // client never holds up the accept loop.
-                Ok((stream, _)) => {
-                    // Idle listeners must not reserve connection capacity. Each listener holds
-                    // at most this one accepted socket while waiting, and accepts no more until
-                    // a session ends. Cancelling the wait drops the socket too.
-                    let permit = match &server.connection_limit {
-                        Some(limit) => tokio::select! {
-                            biased;
-                            _ = server.shutdown.cancelled() => return,
-                            _ = server.accepting.cancelled() => return,
-                            permit = limit.clone().acquire_owned() => {
-                                Some(permit.expect("the connection limit is never closed"))
-                            }
-                        },
-                        None => None,
-                    };
-                    if !server.layers.is_empty() {
-                        server.tracker.spawn(connection::serve_layered_tcp(server.clone(), stream, listener.clone(), permit));
-                        continue;
-                    }
-                    #[cfg(feature = "tls")]
-                    if listener.tls.is_some() {
-                        server.tracker.spawn(connection::serve_tls(server.clone(), stream, listener.clone(), permit));
-                        continue;
-                    }
-                    server.tracker.spawn(connection::serve(server.clone(), stream, listener.clone(), permit));
-                }
-                Err(error) => {
-                    // Typically running out of file descriptors; back off instead of spinning.
-                    tracing::error!(server = server.info.name(), %error, "accept failed");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            },
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, connection) = match accepted {
+            Ok(Some(accepted)) => accepted,
+            Ok(None) => {
+                tracing::info!(server = server.info.name(), address = %listener.local_addr(), "listener closed");
+                return;
+            }
+            Err(error) => {
+                tracing::error!(server = server.info.name(), address = %listener.local_addr(), %error, "accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Some(permit) = acquire_permit(&server).await else {
+            return;
+        };
+        server.tracker.spawn(connection::serve_stream(
+            server.clone(),
+            stream,
+            connection,
+            permit,
+        ));
+    }
+}
+
+/// Waits for a connection slot when there is a connection limit. Idle listeners must not reserve
+/// capacity: each one holds at most one accepted connection while waiting, and accepts no more
+/// until a session ends. `None` means the server stopped accepting meanwhile, which drops the
+/// connection too.
+async fn acquire_permit<P, S>(
+    server: &ServerInner<P, S>,
+) -> Option<Option<tokio::sync::OwnedSemaphorePermit>> {
+    let Some(limit) = &server.connection_limit else {
+        return Some(None);
+    };
+    tokio::select! {
+        biased;
+        _ = server.shutdown.cancelled() => None,
+        _ = server.accepting.cancelled() => None,
+        permit = limit.clone().acquire_owned() => {
+            Some(Some(permit.expect("the connection limit is never closed")))
         }
     }
 }

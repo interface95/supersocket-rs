@@ -35,24 +35,33 @@ async fn main() -> Result<(), supersocket::Error> {
   to another filter mid-stream.
 - **Sessions** are cheap handles you can clone into other tasks to send from anywhere. Attach
   typed per-session state, or arbitrary data through extensions.
-- **Commands** dispatch packages by key, with filters that run before and after commands.
+- **Commands** dispatch packages by key, with filters that run before and after commands,
+  packages of any type mapped to keyed ones, and commands whose body is JSON.
 - **Middleware** sees sessions come and go and can reject them.
 - **Serial or concurrent** package handling per session, with a handling timeout and an error
   handler that decides whether a failing session stays open. A panicking handler is caught and
   reported to the error handler; it never takes the server down.
 - **Batched writes**: data queued while packages are handled goes out in one system call, with
-  back-pressure when a peer reads slowly and an optional send timeout.
+  back-pressure when a peer reads slowly and an optional send timeout. `send_with` encodes a
+  reply straight into the send buffer.
 - **Idle sessions hold no buffers**, so many mostly idle connections stay cheap.
 - **A client**, modeled on SuperSocket's `EasyClient`: it connects through a chain of
   connectors (TCP or an HTTP CONNECT, SOCKS4 or SOCKS5 proxy, then TLS) and reuses the server's
   pipeline filters and send queue.
 - **WebSocket** (RFC 6455) server and client built on the same core: the handshake filter
   switches to the frame filter, and sessions count as connected once the handshake is complete.
-  Fragments, pings and the closing handshake are handled for you; tested against tungstenite.
+  Fragments, pings and the closing handshake are handled for you, large messages can be sent in
+  fragments; tested against tungstenite.
 - **TLS** through rustls, including client certificates, **PROXY protocol** v1 and v2 behind load
   balancers, TCP keepalive and socket buffer sizes per listener.
-- **Any transport**: hand the server connections from Unix sockets, stdin and stdout or an HTTP
-  upgrade, and wrap connections in **stream layers** such as the built-in gzip compression.
+- **Any transport**: Unix socket listeners next to the TCP ones, a `Listener` trait for
+  transports of your own, connections handed over from stdin and stdout or an HTTP upgrade, and
+  **stream layers** such as the built-in gzip compression around every connection. A session can
+  hand its connection back for another protocol to take over.
+- **UDP**: a listener that turns datagrams into sessions keyed by their sender, so filters,
+  commands and middleware work over UDP too.
+- **HTTP/1.1**: a request filter with keep-alive and chunked bodies, responses, and Server-Sent
+  Events, for services that speak HTTP next to their own protocol.
 - **Configuration** from TOML or JSON files with environment overrides, **tracing** for logs,
   graceful shutdown on Ctrl+C or SIGTERM.
 
@@ -62,7 +71,7 @@ Until the first release, depend on the repository:
 
 ```toml
 [dependencies]
-supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # optional features: "tls", "config", "client", "proxy", "websocket", "gzip", "codec"
+supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # optional features: "tls", "config", "client", "proxy", "websocket", "deflate", "gzip", "codec", "json", "udp", "http"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -81,6 +90,8 @@ cargo run --example proxy_client --features proxy -- 127.0.0.1:1080 example.com:
 cargo run --example websocket_echo_server --features websocket
 cargo run --example websocket_chat --features websocket
 cargo run --example websocket_client --features websocket,client   # with websocket_echo_server running
+cargo run --example udp_echo_server --features udp     # nc -u 127.0.0.1 4040
+cargo run --example http_server --features http        # curl -N http://127.0.0.1:8080/events
 ```
 
 ## Guide
@@ -161,6 +172,40 @@ Server::builder(CommandLineFilter::default).commands(|commands| {
 A `CommandFilter` implements `on_executing` (return `false` to skip the command) and
 `on_executed`, which receives the command's result.
 
+Packages of any type can be dispatched once a mapper has turned them into keyed packages, like
+SuperSocket's `UseCommand` with an `IPackageMapper`. With the `json` feature, a command's body
+can be JSON, decoded before the command runs, like `JsonAsyncCommand<T>`:
+
+```rust
+#[derive(Deserialize)]
+struct Credentials {
+    user: String,
+}
+
+struct Login;
+
+impl JsonCommand for Login {
+    type Value = Credentials;
+
+    fn key(&self) -> String {
+        "LOGIN".into()
+    }
+
+    async fn execute(&self, session: &Session, credentials: Credentials) -> HandlerResult {
+        session.send(format!("hello {}\r\n", credentials.user)).await?;
+        Ok(())
+    }
+}
+
+// Lines such as `LOGIN {"user": "alice"}`: the first word is the key, the rest is the body.
+Server::builder(LineFilter::default).commands_with(
+    |line| CommandPackage::decode(Bytes::from(line.text)).map(Some),
+    |commands| {
+        commands.add(Json(Login));
+    },
+)
+```
+
 ### Sessions
 
 A `Session` is a cheap handle: clone it into other tasks and call `send` from anywhere. Data
@@ -200,6 +245,15 @@ session.server().sessions().for_each(|other| {
 Session state is created with `Default` by `.session::<S>()`, or from the connection, such as
 its address or TLS client certificate, by `.session_with(|connection| S { .. })`.
 
+`send_with` encodes a reply straight into the send buffer, like SuperSocket's `SendAsync` with a
+`PipeWriter` action, and `send_fmt!` formats one there without a `String` in between.
+`session.status()` tells whether a session is connecting, connected, closing or closed.
+
+```rust
+session.send_with(|buf| encoder.encode(&reply, buf)).await?;
+send_fmt!(session, "OK {} items\r\n", items.len()).await?;
+```
+
 ### Package handling, errors and timeouts
 
 ```rust
@@ -236,7 +290,8 @@ further connections wait in the listen backlog. Once a slot is available, `hands
 covers the PROXY protocol header, the TLS handshake, stream layers and a protocol handshake.
 For a rolling restart, `stop_accepting()` closes the listeners while the existing
 sessions finish, and `run_until(signal)` runs the server until a future of your own completes
-instead of Ctrl+C or SIGTERM. `Server` is `Clone`, so other tasks can hold a handle for this.
+instead of Ctrl+C or SIGTERM. `Server` is `Clone`, so other tasks can hold a handle for this,
+and `server.status()` tells whether it is idle, running, draining, stopping or stopped.
 
 ### Client
 
@@ -329,9 +384,21 @@ offers is chosen for its connection:
 WebSocketServer::builder()
     .commands(|commands| {
         commands.add(Add); // a `WebSocketCommand<CommandPackage>`: "ADD 1 2" is answered with "3"
+        commands.add(Json(Join)); // feature "json": a `JsonWebSocketCommand`, "JOIN {\"room\": \"lobby\"}"
     })
     .subprotocol("chat", |chat| chat.on_message(broadcast))
     .subprotocol("calc", |calc| calc.commands(|commands| { commands.add(Add); }))
+```
+
+A message too large to hold in memory, or produced over time, is sent in fragments. Other
+messages wait until it is finished; pings, pongs and close frames do not:
+
+```rust
+let mut message = session.send_fragmented(MessageKind::Binary).await?;
+for chunk in chunks {
+    message.write(&chunk).await?;
+}
+message.finish(b"").await?;
 ```
 
 With the `deflate` feature, `compression(CompressionOptions::default())` offers per-message
@@ -483,15 +550,41 @@ socket option.
 
 ### Other transports and stream layers
 
-Connections do not have to come from the server's TCP listeners. Hand any byte stream to the
-server once it is started, and it becomes a session like the others: middleware sees it, it
-joins the session container and shutting down closes it. A server may have no listeners at all.
+Listeners are not only TCP. A listener may be a Unix domain socket, from the builder or the
+config file, and any transport can be a listener of its own by implementing `Listener`, like
+SuperSocket's `IConnectionListener`: its connections are served like the others, within the
+connection limit and the handshake timeout, and `stop_accepting()` stops it. `start()` reports
+where every listener listens as a `ListenAddr`.
 
 ```rust
-let listener = tokio::net::UnixListener::bind("/tmp/app.sock")?;
-while let Ok((stream, _)) = listener.accept().await {
-    server.serve_connection(stream, ConnectionInfo::default())?; // no IP addresses on a Unix socket
-}
+Server::builder(LineFilter::default)
+    .listen("0.0.0.0:4040")
+    .listen_unix("/tmp/app.sock") // or `path = "/tmp/app.sock"` in a config file
+    .listener(my_listener)        // anything implementing `Listener`
+```
+
+Connections can also be handed to a running server one by one, such as stdin and stdout joined
+with `tokio::io::join` or a connection an HTTP server upgraded. It becomes a session like the
+others: middleware sees it, it joins the session container and shutting down closes it. A server
+may have no listeners at all.
+
+```rust
+server.serve_connection(stream, ConnectionInfo::default())?; // no IP addresses on a pipe
+```
+
+The other way round, a session can hand its connection back, like SuperSocket's `DetachAsync`:
+`session.detach()` closes the session with `CloseReason::Detached` once what it queued is sent,
+and the returned future yields the raw connection with the bytes read ahead, for another
+protocol or server to take over. Await it from another task: the hand-over happens once the
+handler has returned.
+
+```rust
+let detaching = session.detach()?;
+tokio::spawn(async move {
+    if let Some(connection) = detaching.await {
+        websocket_server.serve_connection(connection.into_stream(), ConnectionInfo::default())?;
+    }
+});
 ```
 
 Stream layers wrap every connection after the TLS handshake, like SuperSocket's
@@ -504,6 +597,51 @@ EasyClient::builder(LineFilter::default).connector(GzipConnector)
 ```
 
 Implement `StreamLayer` for your own layers, such as accounting or another encryption.
+
+### UDP
+
+With the `udp` feature, `UdpListener` serves datagrams as sessions, like SuperSocket's
+`UseUdp()`: the first datagram from a peer opens a session, later ones from the same peer are
+delivered to it, and what the session sends goes back to the peer as datagrams. Which datagrams
+belong together is decided by a `SessionKey`, by default the peer's address, like SuperSocket's
+`IUdpSessionIdentifierProvider`. Peers never say goodbye on UDP, so set `idle_session_timeout`
+to close sessions that went silent.
+
+```rust
+Server::builder(LineFilter::default)
+    .on_package(echo)
+    .configure(|options| options.idle_session_timeout = Some(Duration::from_secs(60)))
+    .listener(UdpListener::bind("0.0.0.0:4040".parse()?)?)
+```
+
+### HTTP
+
+With the `http` feature, `HttpFilter` cuts a connection into `HttpRequest`s, body included,
+with keep-alive and chunked bodies, like SuperSocket's `SuperSocket.Http`. `respond` answers
+with an `HttpResponse` and keeps the connection alive when both sides allow it, and `start_sse`
+opens a Server-Sent Events stream with an optional heartbeat. This is a small HTTP for services
+that speak it next to their own protocol, such as a health endpoint or a push stream, not a web
+framework.
+
+```rust
+use supersocket::http::{HttpFilter, HttpResponse, HttpSessionExt, SseEvent, SseOptions};
+
+Server::builder(HttpFilter::default)
+    .on_package(async |session, request| {
+        match (request.method(), request.path()) {
+            ("GET", "/health") => session.respond(&request, HttpResponse::ok().text("ok")).await?,
+            ("GET", "/events") => {
+                let options = SseOptions::default().keep_alive(Duration::from_secs(15));
+                let events = session.start_sse(options).await?;
+                tokio::spawn(async move {
+                    let _ = events.send(&SseEvent::new("hello").event("greeting")).await;
+                });
+            }
+            _ => session.respond(&request, HttpResponse::new(404).text("not found")).await?,
+        }
+        Ok(())
+    })
+```
 
 ### Configuration
 
@@ -565,7 +703,6 @@ must not be compared directly with the Linux echo results above to infer pipelin
 
 - A run of the Autobahn test suite
 - Derive-style command registration
-- UDP sessions, if there is demand
 
 ## License
 

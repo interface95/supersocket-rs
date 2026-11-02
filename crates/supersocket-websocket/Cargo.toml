@@ -19,6 +19,8 @@ client = ["dep:supersocket-client"]
 tls = ["supersocket-client?/tls"]
 ## Per-message compression (RFC 7692 `permessage-deflate`) for the server and the client.
 deflate = ["dep:flate2"]
+## `JsonWebSocketCommand`, commands whose message body is JSON.
+json = ["supersocket-server/json", "dep:serde"]
 
 [dependencies]
 supersocket-connection.workspace = true
@@ -27,7 +29,9 @@ supersocket-server.workspace = true
 supersocket-client = { workspace = true, optional = true }
 bytes.workspace = true
 flate2 = { version = "1.1", optional = true }
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+memchr.workspace = true
+serde = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-util.workspace = true
 tracing.workspace = true
 

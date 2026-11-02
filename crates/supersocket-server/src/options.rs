@@ -16,7 +16,8 @@ pub struct ServerOptions {
     /// Addresses to listen on.
     pub listeners: Vec<ListenOptions>,
 
-    /// Largest package a filter may buffer before it is a protocol error. Default: 1 MiB.
+    /// Largest encoded package, including framing and bytes already consumed while the package
+    /// is incomplete, before it is a protocol error. Default: 1 MiB.
     #[serde(deserialize_with = "lenient::usize")]
     pub max_package_length: usize,
 
@@ -55,8 +56,9 @@ pub struct ServerOptions {
     pub close_timeout: Duration,
 
     /// How long a connection may take to become connected once admitted for processing: reading
-    /// the PROXY protocol header, the TLS handshake, the stream layers and the protocol handshake
-    /// of a server that [requires one](crate::ServerBuilder::require_handshake), all together.
+    /// the PROXY protocol header, the TLS handshake, the stream layers, middleware registration
+    /// and the protocol handshake of a server that
+    /// [requires one](crate::ServerBuilder::require_handshake), all together.
     /// Waiting for a connection slot does not count. A connection that takes longer is dropped.
     /// Default: 10 seconds.
     #[serde(with = "lenient::duration")]
@@ -124,11 +126,34 @@ impl ServerOptions {
         if self.max_connections == Some(0) {
             return invalid("max_connections must be greater than zero".into());
         }
+        if self
+            .max_connections
+            .is_some_and(|limit| limit > tokio::sync::Semaphore::MAX_PERMITS)
+        {
+            return invalid("max_connections exceeds the semaphore limit".into());
+        }
         for listener in &self.listeners {
+            match (&listener.path, listener.address.is_empty()) {
+                (None, true) => return invalid("a listener needs an address or a path".into()),
+                (Some(_), false) => {
+                    return invalid(format!(
+                        "listener {}: set either an address or a path, not both",
+                        listener.address
+                    ));
+                }
+                #[cfg(not(unix))]
+                (Some(path), true) => {
+                    return invalid(format!(
+                        "listener {}: Unix socket listeners need a Unix platform",
+                        path.display()
+                    ));
+                }
+                _ => {}
+            }
             let zero = |field: &str| {
                 invalid(format!(
                     "listener {}: {field} must be greater than zero",
-                    listener.address
+                    listener.label()
                 ))
             };
             if listener.backlog == 0 {
@@ -154,7 +179,7 @@ impl ServerOptions {
                     return invalid(format!(
                         "listener {}: a TLS config replaces cert, key and the client certificate \
                          settings; set them in the rustls configuration instead",
-                        listener.address
+                        listener.label()
                     ));
                 }
             }
@@ -185,8 +210,17 @@ pub enum PackageHandling {
 #[serde(deny_unknown_fields)]
 pub struct ListenOptions {
     /// Socket address to bind, such as `"0.0.0.0:4040"` or `"[::]:4040"`. Port 0 picks a free port.
-    #[serde(deserialize_with = "lenient::string")]
+    /// Empty for a Unix socket listener, which [`path`](Self::path) names.
+    #[serde(default, deserialize_with = "lenient::string")]
     pub address: String,
+
+    /// Path of a Unix domain socket to listen on instead of a TCP address, like SuperSocket's
+    /// `ListenOptions.Path`; Unix only. A socket file left behind by an earlier run is removed
+    /// before binding, and the file is removed again when the listener closes. The TCP settings
+    /// (`no_delay`, `keepalive` and the socket buffer sizes) do not apply; TLS and the PROXY
+    /// protocol do. Default: none.
+    #[serde(default, deserialize_with = "lenient::option_path")]
+    pub path: Option<PathBuf>,
 
     /// Length of the queue of connections waiting to be accepted. Default: 1024.
     #[serde(default = "default_backlog", deserialize_with = "lenient::u32")]
@@ -230,6 +264,7 @@ impl ListenOptions {
     pub fn new(address: impl Into<String>) -> Self {
         Self {
             address: address.into(),
+            path: None,
             backlog: default_backlog(),
             no_delay: default_no_delay(),
             keepalive: None,
@@ -237,6 +272,22 @@ impl ListenOptions {
             socket_send_buffer_size: None,
             proxy_protocol: false,
             tls: None,
+        }
+    }
+
+    /// A Unix domain socket at `path` with default settings; see [`path`](Self::path).
+    pub fn unix(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: Some(path.into()),
+            ..Self::new("")
+        }
+    }
+
+    /// The address or path, for messages.
+    pub(crate) fn label(&self) -> String {
+        match &self.path {
+            Some(path) => path.display().to_string(),
+            None => self.address.clone(),
         }
     }
 }
@@ -320,5 +371,26 @@ impl PartialEq for TlsOptions {
             && self.key == other.key
             && self.client_ca == other.client_ca
             && self.client_auth_optional == other.client_auth_optional
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_limit_must_fit_the_semaphore() {
+        for limit in [tokio::sync::Semaphore::MAX_PERMITS + 1, usize::MAX] {
+            let options = ServerOptions {
+                max_connections: Some(limit),
+                ..ServerOptions::default()
+            };
+            assert!(matches!(options.validate(), Err(Error::InvalidOptions(_))));
+        }
+        let options = ServerOptions {
+            max_connections: Some(tokio::sync::Semaphore::MAX_PERMITS),
+            ..ServerOptions::default()
+        };
+        assert!(options.validate().is_ok());
     }
 }

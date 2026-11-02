@@ -10,7 +10,7 @@ use supersocket::{
     CloseReason,
     client::{ReadError, TlsConnector},
     websocket::{
-        CloseCode, CloseFrame, Message, Rejection, WebSocketBuilder, WebSocketClient,
+        CloseCode, CloseFrame, Message, MessageKind, Rejection, WebSocketBuilder, WebSocketClient,
         WebSocketServer,
     },
 };
@@ -33,7 +33,7 @@ use tokio_tungstenite::{
 
 fn start(builder: WebSocketBuilder) -> (WebSocketServer, SocketAddr) {
     let server = builder.listen("127.0.0.1:0").build().unwrap();
-    let address = server.start().unwrap()[0];
+    let address = server.start().unwrap()[0].tcp().unwrap();
     (server, address)
 }
 
@@ -193,7 +193,7 @@ async fn connects_over_tls() {
         .configure(|options| options.listeners.push(certificate.listener()))
         .build()
         .unwrap();
-    let address = server.start().unwrap()[0];
+    let address = server.start().unwrap()[0].tcp().unwrap();
 
     let mut client = WebSocketClient::builder(format!("wss://{address}/"))
         .tls(TlsConnector::with_root_certificates(certificate.roots()).server_name("localhost"))
@@ -453,4 +453,42 @@ mod compression {
             );
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_client_can_send_in_fragments() {
+    let (server, address) = start(WebSocketServer::builder().on_message(
+        async |session, message| {
+            session.send(&message).await?;
+            Ok(())
+        },
+    ));
+    let mut client = WebSocketClient::connect(format!("ws://{address}/"))
+        .await
+        .unwrap();
+    let mut writer = client.send_fragmented(MessageKind::Text).await.unwrap();
+    writer.write(b"one ").await.unwrap();
+    writer.write(b"two ").await.unwrap();
+    writer.finish(b"three").await.unwrap();
+    assert_eq!(
+        receive(&mut client).await,
+        Some(Message::Text("one two three".into()))
+    );
+    // A writer dropped half way ends its message, and the connection goes on.
+    let mut writer = client.send_fragmented(MessageKind::Binary).await.unwrap();
+    writer.write(b"part").await.unwrap();
+    drop(writer);
+    assert_eq!(
+        receive(&mut client).await,
+        Some(Message::Binary(supersocket::bytes::Bytes::from_static(
+            b"part"
+        )))
+    );
+    client.send_text("done").await.unwrap();
+    assert_eq!(
+        receive(&mut client).await,
+        Some(Message::Text("done".into()))
+    );
+    client.close(CloseCode::NORMAL, "").await.unwrap();
+    server.shutdown().await;
 }

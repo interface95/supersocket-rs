@@ -1,11 +1,13 @@
 use bytes::{Buf, Bytes, BytesMut};
+use memchr::memmem::Finder;
 
-use super::{Decoder, find};
+use super::Decoder;
 use crate::{CommandPackage, PipelineFilter, ProtocolError, TextPackage};
 
 /// Cuts packages at a terminator. The decoder receives a package without the terminator.
 pub struct TerminatorFilter<P> {
-    terminator: Bytes,
+    /// The search for the terminator, prepared once: it runs for every package.
+    terminator: Finder<'static>,
     decoder: Decoder<P>,
     searched: usize,
 }
@@ -20,10 +22,10 @@ impl<P> TerminatorFilter<P> {
         terminator: impl Into<Bytes>,
         decoder: impl FnMut(Bytes) -> Result<P, ProtocolError> + Send + 'static,
     ) -> Self {
-        let terminator = terminator.into();
+        let terminator: Bytes = terminator.into();
         assert!(!terminator.is_empty(), "terminator must not be empty");
         Self {
-            terminator,
+            terminator: Finder::new(&terminator[..]).into_owned(),
             decoder: Box::new(decoder),
             searched: 0,
         }
@@ -36,16 +38,14 @@ impl<P: Send + 'static> PipelineFilter for TerminatorFilter<P> {
     fn filter(&mut self, buf: &mut BytesMut) -> Result<Option<P>, ProtocolError> {
         // Skip what earlier calls already searched, minus enough bytes to catch a terminator that
         // was split across two reads.
-        let start = self
-            .searched
-            .saturating_sub(self.terminator.len() - 1)
-            .min(buf.len());
-        let Some(position) = find(&buf[start..], &self.terminator) else {
+        let length = self.terminator.needle().len();
+        let start = self.searched.saturating_sub(length - 1).min(buf.len());
+        let Some(position) = self.terminator.find(&buf[start..]) else {
             self.searched = buf.len();
             return Ok(None);
         };
         let package = buf.split_to(start + position).freeze();
-        buf.advance(self.terminator.len());
+        buf.advance(length);
         self.searched = 0;
         (self.decoder)(package).map(Some)
     }

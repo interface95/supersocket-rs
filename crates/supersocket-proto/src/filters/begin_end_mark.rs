@@ -1,13 +1,15 @@
 use bytes::{Buf, Bytes, BytesMut};
+use memchr::memmem::Finder;
 
-use super::{Decoder, find};
+use super::Decoder;
 use crate::{PipelineFilter, ProtocolError};
 
 /// Cuts packages wrapped in a begin mark and an end mark. The decoder receives a package without
 /// the marks. Data that does not start with the begin mark is a protocol error.
 pub struct BeginEndMarkFilter<P> {
     begin: Bytes,
-    end: Bytes,
+    /// The search for the end mark, prepared once: it runs for every package.
+    end: Finder<'static>,
     decoder: Decoder<P>,
     searched: usize,
 }
@@ -30,7 +32,7 @@ impl<P> BeginEndMarkFilter<P> {
         );
         Self {
             begin,
-            end,
+            end: Finder::new(&end[..]).into_owned(),
             decoder: Box::new(decoder),
             searched: 0,
         }
@@ -53,16 +55,14 @@ impl<P: Send + 'static> PipelineFilter for BeginEndMarkFilter<P> {
         // Skip the part of the body earlier calls already searched, minus enough bytes to catch an
         // end mark split across two reads, so a package arriving slowly is searched only once.
         let body = &buf[self.begin.len()..];
-        let start = self
-            .searched
-            .saturating_sub(self.end.len() - 1)
-            .min(body.len());
-        let Some(position) = find(&body[start..], &self.end).map(|found| start + found) else {
+        let end_length = self.end.needle().len();
+        let start = self.searched.saturating_sub(end_length - 1).min(body.len());
+        let Some(position) = self.end.find(&body[start..]).map(|found| start + found) else {
             self.searched = body.len();
             return Ok(None);
         };
         self.searched = 0;
-        let mut package = buf.split_to(self.begin.len() + position + self.end.len());
+        let mut package = buf.split_to(self.begin.len() + position + end_length);
         package.advance(self.begin.len());
         package.truncate(position);
         (self.decoder)(package.freeze()).map(Some)

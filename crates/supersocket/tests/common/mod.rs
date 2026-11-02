@@ -58,7 +58,7 @@ pub fn start<P: Send + 'static, S: SessionState>(
     builder: ServerBuilder<P, S>,
 ) -> (Server<P, S>, SocketAddr) {
     let server = builder.listen("127.0.0.1:0").build().unwrap();
-    let address = server.start().unwrap()[0];
+    let address = server.start().unwrap()[0].tcp().unwrap();
     (server, address)
 }
 

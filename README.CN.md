@@ -32,19 +32,23 @@ async fn main() -> Result<(), supersocket::Error> {
 - **协议过滤器**把字节流切成包：按行、按结束符、定长、带长度字段的定长包头、首尾标记，也可以自己实现。
   过滤器可以在连接中途切换到另一个过滤器。
 - **会话**是很轻的句柄，可以克隆到别的任务里随时发送。可以挂带类型的会话状态，也可以通过扩展表挂任意数据。
-- **命令**按 key 分发包，命令过滤器在命令执行前后运行。
+- **命令**按 key 分发包，命令过滤器在命令执行前后运行；任意类型的包都能映射成带 key 的包再分发，命令正文还可以是 JSON。
 - **中间件**能看到会话的建立和关闭，也可以拒绝会话。
 - 每个会话的包可以**串行或并发**处理，有处理超时，出错时由错误回调决定会话是否继续。处理函数 panic 会被捕获并交给错误回调，不会拖垮服务。
 - **合并发送**：处理一批包期间排队的数据用一次系统调用发出；对方读得慢时 `send` 会等待，也可以设发送超时。
+  `send_with` 把回复直接编码进发送缓冲区。
 - **空闲会话不占缓冲区**，大量长期空闲的连接也很省内存。
 - **客户端**照 SuperSocket 的 `EasyClient` 设计：通过一串连接器建立连接（先 TCP 或 HTTP CONNECT、SOCKS4、SOCKS5 代理，再套 TLS），
   复用服务端的协议过滤器和发送队列。
 - **WebSocket**（RFC 6455）服务端和客户端建在同一个核心上：握手过滤器读完升级请求后切换到帧过滤器，握手完成后会话才算连上。
-  分片、ping 和关闭握手都替你处理好了，并和 tungstenite 做过互通测试。
+  分片、ping 和关闭握手都替你处理好了，大消息可以分片发送，并和 tungstenite 做过互通测试。
 - 通过 rustls 支持 **TLS**，包括客户端证书认证；部署在负载均衡后面时支持 **PROXY protocol** v1 和 v2；
   每个监听地址可以单独设置 TCP keepalive 和 socket 收发缓冲区。
-- **任意传输层**：Unix 套接字、stdin/stdout、HTTP 升级后的连接都能交给服务端处理；连接还可以套上**流包装层**，
-  比如内置的 gzip 压缩。
+- **任意传输层**：TCP 监听器旁边可以配 Unix 套接字监听器，自己的传输层实现 `Listener` 即可接入；stdin/stdout、
+  HTTP 升级后的连接也能交给服务端处理；连接还可以套上**流包装层**，比如内置的 gzip 压缩。会话也可以把连接交还出来，
+  让另一个协议接管。
+- **UDP**：一个监听器把数据报按发送方分成会话，过滤器、命令和中间件在 UDP 上照常工作。
+- **HTTP/1.1**：请求过滤器支持 keep-alive 和分块正文，附带响应类型和 Server-Sent Events，适合在自己的协议之外再提供 HTTP 接口。
 - **配置**可以从 TOML 或 JSON 文件读取，并用环境变量覆盖；日志用 **tracing**；收到 Ctrl+C 或 SIGTERM 时优雅关闭。
 
 ## 开始使用
@@ -53,7 +57,7 @@ async fn main() -> Result<(), supersocket::Error> {
 
 ```toml
 [dependencies]
-supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # 可选 feature："tls"、"config"、"client"、"proxy"、"websocket"、"gzip"、"codec"
+supersocket = { git = "https://github.com/interface95/supersocket-rs" }  # 可选 feature："tls"、"config"、"client"、"proxy"、"websocket"、"deflate"、"gzip"、"codec"、"json"、"udp"、"http"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -72,6 +76,8 @@ cargo run --example proxy_client --features proxy -- 127.0.0.1:1080 example.com:
 cargo run --example websocket_echo_server --features websocket
 cargo run --example websocket_chat --features websocket
 cargo run --example websocket_client --features websocket,client   # 先运行 websocket_echo_server
+cargo run --example udp_echo_server --features udp     # nc -u 127.0.0.1 4040
+cargo run --example http_server --features http        # curl -N http://127.0.0.1:8080/events
 ```
 
 ## 使用说明
@@ -149,6 +155,39 @@ Server::builder(CommandLineFilter::default).commands(|commands| {
 
 `CommandFilter` 实现 `on_executing`（返回 `false` 跳过命令）和 `on_executed`（拿到命令的执行结果）。
 
+任意类型的包先经过一个映射函数变成带 key 的包，就能分发给命令，对应 SuperSocket `UseCommand` 的 `IPackageMapper`。
+开启 `json` feature 后，命令正文可以是 JSON，在命令运行前解码好，对应 `JsonAsyncCommand<T>`：
+
+```rust
+#[derive(Deserialize)]
+struct Credentials {
+    user: String,
+}
+
+struct Login;
+
+impl JsonCommand for Login {
+    type Value = Credentials;
+
+    fn key(&self) -> String {
+        "LOGIN".into()
+    }
+
+    async fn execute(&self, session: &Session, credentials: Credentials) -> HandlerResult {
+        session.send(format!("hello {}\r\n", credentials.user)).await?;
+        Ok(())
+    }
+}
+
+// 形如 `LOGIN {"user": "alice"}` 的行：第一个词是 key，其余是正文。
+Server::builder(LineFilter::default).commands_with(
+    |line| CommandPackage::decode(Bytes::from(line.text)).map(Some),
+    |commands| {
+        commands.add(Json(Login));
+    },
+)
+```
+
 ### 会话
 
 `Session` 是很轻的句柄，可以克隆到别的任务里随时调用 `send`，并发发送的数据不会交错。会话状态是一个实现了
@@ -185,6 +224,14 @@ session.server().sessions().for_each(|other| {
 会话状态可以用 `.session::<S>()` 按 `Default` 创建，也可以用 `.session_with(|connection| S { .. })`
 根据连接信息（地址、TLS 客户端证书等）创建。
 
+`send_with` 把回复直接编码进发送缓冲区，对应 SuperSocket 里带 `PipeWriter` 回调的 `SendAsync`；`send_fmt!` 在那里直接格式化，
+不经过中间的 `String`。`session.status()` 告诉你会话是正在连接、已连接、正在关闭还是已关闭。
+
+```rust
+session.send_with(|buf| encoder.encode(&reply, buf)).await?;
+send_fmt!(session, "OK {} items\r\n", items.len()).await?;
+```
+
 ### 包处理、错误和超时
 
 ```rust
@@ -218,7 +265,8 @@ Server::builder(LineFilter::default)
 达到连接上限时，每个监听器最多暂存一个已接受、等待空位的连接，其余连接留在监听队列中。
 获得空位后，`handshake_timeout` 覆盖 PROXY protocol 头、TLS 握手、流包装层和协议握手；等待空位不计入这个时限。
 滚动重启时，`stop_accepting()` 先关掉监听器、让已有会话继续跑完；`run_until(signal)` 让服务端运行到你自己的
-future 完成为止，而不是只能等 Ctrl+C 或 SIGTERM。`Server` 实现了 `Clone`，别的任务可以拿着句柄做这些事。
+future 完成为止，而不是只能等 Ctrl+C 或 SIGTERM。`Server` 实现了 `Clone`，别的任务可以拿着句柄做这些事；
+`server.status()` 告诉你服务端处于空闲、运行、排空、停止中还是已停止。
 
 ### 客户端
 
@@ -301,9 +349,20 @@ WebSocketServer::builder()
 WebSocketServer::builder()
     .commands(|commands| {
         commands.add(Add); // 一个 `WebSocketCommand<CommandPackage>`："ADD 1 2" 回 "3"
+        commands.add(Json(Join)); // "json" feature：`JsonWebSocketCommand`，处理 "JOIN {\"room\": \"lobby\"}"
     })
     .subprotocol("chat", |chat| chat.on_message(broadcast))
     .subprotocol("calc", |calc| calc.commands(|commands| { commands.add(Add); }))
+```
+
+放不进内存或者边产生边发的大消息可以分片发送。其他消息会等它发完；ping、pong 和关闭帧不用等：
+
+```rust
+let mut message = session.send_fragmented(MessageKind::Binary).await?;
+for chunk in chunks {
+    message.write(&chunk).await?;
+}
+message.finish(b"").await?;
 ```
 
 启用 `deflate` feature 后，`compression(CompressionOptions::default())` 向客户端提供逐消息压缩（RFC 7692
@@ -439,14 +498,35 @@ ListenOptions {
 
 ### 其他传输层和流包装层
 
-连接不一定来自服务端自己的 TCP 监听器。服务端启动后，任何字节流都可以交给它，它会和其他会话一样：经过中间件、进入会话容器、
-随服务端关闭而关闭。服务端也可以完全不配置监听地址。
+监听器不止 TCP。监听器可以是 Unix 域套接字，在 builder 或配置文件里都能配；任何传输层实现 `Listener` 就能成为监听器，
+对应 SuperSocket 的 `IConnectionListener`：它接入的连接和其他连接一样受连接上限和握手超时约束，`stop_accepting()`
+也会停掉它。`start()` 以 `ListenAddr` 的形式报告每个监听器的位置。
 
 ```rust
-let listener = tokio::net::UnixListener::bind("/tmp/app.sock")?;
-while let Ok((stream, _)) = listener.accept().await {
-    server.serve_connection(stream, ConnectionInfo::default())?; // Unix 套接字没有 IP 地址
-}
+Server::builder(LineFilter::default)
+    .listen("0.0.0.0:4040")
+    .listen_unix("/tmp/app.sock") // 配置文件里写 `path = "/tmp/app.sock"`
+    .listener(my_listener)        // 任何实现了 `Listener` 的类型
+```
+
+连接也可以一个一个交给运行中的服务端，比如用 `tokio::io::join` 拼起来的 stdin/stdout，或者 HTTP 服务端升级后的连接。
+它会和其他会话一样：经过中间件、进入会话容器、随服务端关闭而关闭。服务端也可以完全不配置监听地址。
+
+```rust
+server.serve_connection(stream, ConnectionInfo::default())?; // 管道没有 IP 地址
+```
+
+反过来，会话也可以把连接交还出来，对应 SuperSocket 的 `DetachAsync`：`session.detach()` 在排队数据发完后以
+`CloseReason::Detached` 关闭会话，返回的 future 给出原始连接和提前读到的字节，交给另一个协议或服务端接管。
+要在别的任务里 await 它：交接发生在处理函数返回之后。
+
+```rust
+let detaching = session.detach()?;
+tokio::spawn(async move {
+    if let Some(connection) = detaching.await {
+        websocket_server.serve_connection(connection.into_stream(), ConnectionInfo::default())?;
+    }
+});
 ```
 
 流包装层在 TLS 握手之后包住每个连接，对应 SuperSocket 的 `IConnectionStreamInitializer`。启用 `gzip` feature 后，
@@ -458,6 +538,45 @@ EasyClient::builder(LineFilter::default).connector(GzipConnector)
 ```
 
 自己的包装层（比如流量统计、其他加密）实现 `StreamLayer` 即可。
+
+### UDP
+
+开启 `udp` feature 后，`UdpListener` 把数据报当作会话来服务，对应 SuperSocket 的 `UseUdp()`：一个对端的第一个数据报打开一个会话，
+之后同一对端的数据报都交给它，会话发出的数据以数据报形式回到对端。哪些数据报属于同一个会话由 `SessionKey` 决定，默认按对端地址，
+对应 SuperSocket 的 `IUdpSessionIdentifierProvider`。UDP 上对端不会说再见，所以要设置 `idle_session_timeout` 关掉沉默的会话。
+
+```rust
+Server::builder(LineFilter::default)
+    .on_package(echo)
+    .configure(|options| options.idle_session_timeout = Some(Duration::from_secs(60)))
+    .listener(UdpListener::bind("0.0.0.0:4040".parse()?)?)
+```
+
+### HTTP
+
+开启 `http` feature 后，`HttpFilter` 把连接切成一个个 `HttpRequest`（含正文），支持 keep-alive 和分块正文，对应 SuperSocket 的
+`SuperSocket.Http`。`respond` 用 `HttpResponse` 应答，双方都允许时保持连接；`start_sse` 打开一条 Server-Sent Events 流，
+可以带心跳。这是给在自己协议之外还要提供健康检查、推送流之类接口的服务用的小型 HTTP，不是 Web 框架。
+
+```rust
+use supersocket::http::{HttpFilter, HttpResponse, HttpSessionExt, SseEvent, SseOptions};
+
+Server::builder(HttpFilter::default)
+    .on_package(async |session, request| {
+        match (request.method(), request.path()) {
+            ("GET", "/health") => session.respond(&request, HttpResponse::ok().text("ok")).await?,
+            ("GET", "/events") => {
+                let options = SseOptions::default().keep_alive(Duration::from_secs(15));
+                let events = session.start_sse(options).await?;
+                tokio::spawn(async move {
+                    let _ = events.send(&SseEvent::new("hello").event("greeting")).await;
+                });
+            }
+            _ => session.respond(&request, HttpResponse::new(404).text("not found")).await?,
+        }
+        Ok(())
+    })
+```
 
 ### 配置
 
@@ -513,7 +632,6 @@ Server::builder(LineFilter::default).options(options)
 
 - 跑一遍 Autobahn 测试套件
 - 用派生宏注册命令
-- UDP 会话（有需求再做）
 
 ## 许可证
 

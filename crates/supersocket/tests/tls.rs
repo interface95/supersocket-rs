@@ -116,7 +116,7 @@ fn start_reporting(
         .configure(move |options| options.listeners.push(listener))
         .build()
         .unwrap();
-    let address = server.start().unwrap()[0];
+    let address = server.start().unwrap()[0].tcp().unwrap();
     (server, address, received)
 }
 
@@ -306,7 +306,7 @@ async fn stream_layers_run_inside_tls() {
         .configure(move |options| options.listeners.push(listener))
         .build()
         .unwrap();
-    let address = server.start().unwrap()[0];
+    let address = server.start().unwrap()[0].tcp().unwrap();
 
     let (reader, writer) = tokio::io::split(certificate.connect(address).await);
     let mut client = Client::new(reader, writer);
@@ -328,7 +328,7 @@ async fn tls_handshakes_must_finish_within_the_handshake_timeout() {
         })
         .build()
         .unwrap();
-    let address = server.start().unwrap()[0];
+    let address = server.start().unwrap()[0].tcp().unwrap();
 
     // Connected, but never starts the handshake.
     let mut stream = TcpStream::connect(address).await.unwrap();

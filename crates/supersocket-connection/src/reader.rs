@@ -20,8 +20,9 @@ const STACK_READ_SIZE: usize = 8 * 1024;
 /// Limits of a [`PackageReader`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadOptions {
-    /// Largest package, framing included. A filter sees at most this many buffered bytes, so a
-    /// longer package is an error once this much arrives without completing it. Default: 1 MiB.
+    /// Largest package, framing included. Bytes already consumed while the package is incomplete
+    /// count towards this limit too. A longer package is an error once this much arrives without
+    /// completing it. Default: 1 MiB.
     pub max_package_length: usize,
     /// How much to read at a time while a package is incomplete. Default: 4 KiB.
     pub receive_buffer_size: usize,
@@ -87,6 +88,8 @@ pub struct PackageReader<R, P> {
     filter: BoxFilter<P>,
     buf: BytesMut,
     options: ReadOptions,
+    /// Bytes consumed by the filter while the current package is still incomplete.
+    consumed: usize,
 }
 
 impl<R, P> PackageReader<R, P>
@@ -112,6 +115,7 @@ where
             filter,
             buf: buffered,
             options,
+            consumed: 0,
         }
     }
 
@@ -136,7 +140,8 @@ where
     /// While nothing is buffered, nothing is allocated until data arrives. This is cancel safe.
     pub async fn fill(&mut self) -> Result<usize, ReadError> {
         let limit = self.options.max_package_length;
-        if self.buf.len() >= limit {
+        let available = limit.saturating_sub(self.consumed);
+        if self.buf.len() >= available {
             return Err(ReadError::TooLarge { limit });
         }
         // Everything received has been consumed: drop the buffer so an idle connection holds none.
@@ -144,7 +149,7 @@ where
             self.buf = BytesMut::new();
         }
         // Never buffer more than the limit, so that no package can exceed it.
-        let room = limit - self.buf.len();
+        let room = available - self.buf.len();
         Ok(read_some(
             &mut self.reader,
             &mut self.buf,
@@ -159,12 +164,14 @@ where
     pub fn try_next(&mut self) -> Result<Option<P>, ReadError> {
         let limit = self.options.max_package_length;
         while !self.buf.is_empty() {
-            if limit == 0 {
+            let available = limit.saturating_sub(self.consumed);
+            if available == 0 {
                 return Err(ReadError::TooLarge { limit });
             }
             // Pre-read data may contain many packages. Give the filter the same bounded view
             // as fill(), keeping the rest out of reach until earlier bytes are consumed.
-            let tail = (self.buf.len() > limit).then(|| self.buf.split_off(limit));
+            let tail = (self.buf.len() > available).then(|| self.buf.split_off(available));
+            let before = self.buf.len();
             let step = catch_panic_sync(|| decode_step(&mut self.filter, &mut self.buf));
             let remaining = self.buf.len();
             let more_buffered = tail.is_some();
@@ -174,10 +181,14 @@ where
             }
             let step = step.map_err(ReadError::FilterPanicked)??;
             match step {
-                Step::Package(package) => return Ok(Some(package)),
-                Step::Switched => {}
+                Step::Package(package) => {
+                    self.consumed = 0;
+                    return Ok(Some(package));
+                }
+                Step::Switched => self.consumed = 0,
                 Step::NeedMore => {
-                    if remaining >= limit {
+                    self.consumed += before.saturating_sub(remaining);
+                    if remaining >= limit.saturating_sub(self.consumed) {
                         return Err(ReadError::TooLarge { limit });
                     }
                     if !more_buffered {
@@ -437,6 +448,79 @@ mod tests {
         assert_eq!(reader.try_next().unwrap().unwrap().text, "5678");
         let (_, rest) = reader.into_parts();
         assert_eq!(&rest[..], b"tail");
+    }
+
+    #[tokio::test]
+    async fn consumed_headers_count_towards_the_package_limit() {
+        let wire: &[u8] = b"\0\0\0\x08abcdefgh";
+        let mut reader = PackageReader::new(
+            wire,
+            Box::new(supersocket_proto::CodecFilter::new(
+                tokio_util::codec::LengthDelimitedCodec::new(),
+            )),
+            ReadOptions {
+                max_package_length: 8,
+                receive_buffer_size: 2,
+            },
+        );
+        assert!(matches!(
+            reader.next().await,
+            Err(ReadError::TooLarge { limit: 8 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn consumed_header_budget_resets_after_each_package() {
+        let mut reader = PackageReader::with_buffered(
+            &b"abcd\0\0\0\x01z"[..],
+            Box::new(supersocket_proto::CodecFilter::new(
+                tokio_util::codec::LengthDelimitedCodec::new(),
+            )),
+            ReadOptions {
+                max_package_length: 8,
+                receive_buffer_size: 2,
+            },
+            BytesMut::from(&b"\0\0\0\x04"[..]),
+        );
+        assert!(reader.try_next().unwrap().is_none());
+        assert_eq!(&reader.next().await.unwrap().unwrap()[..], b"abcd");
+        assert_eq!(&reader.next().await.unwrap().unwrap()[..], b"z");
+        assert!(reader.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn switching_filters_without_a_package_resets_the_byte_budget() {
+        struct Prelude(bool);
+
+        impl PipelineFilter for Prelude {
+            type Package = TextPackage;
+
+            fn filter(&mut self, buf: &mut BytesMut) -> Result<Option<TextPackage>, ProtocolError> {
+                if buf.len() >= 4 {
+                    let prefix = buf.split_to(4);
+                    assert_eq!(&prefix[..], b"HEAD");
+                    self.0 = true;
+                }
+                Ok(None)
+            }
+
+            fn next_filter(&mut self) -> Option<BoxFilter<TextPackage>> {
+                self.0
+                    .then(|| Box::new(LineFilter::default()) as BoxFilter<TextPackage>)
+            }
+        }
+
+        let mut reader = PackageReader::with_buffered(
+            &b""[..],
+            Box::new(Prelude(false)),
+            ReadOptions {
+                max_package_length: 8,
+                receive_buffer_size: 2,
+            },
+            BytesMut::from(&b"HEADabcdef\r\n"[..]),
+        );
+        assert_eq!(reader.next().await.unwrap().unwrap().text, "abcdef");
+        assert!(reader.next().await.unwrap().is_none());
     }
 
     #[tokio::test]

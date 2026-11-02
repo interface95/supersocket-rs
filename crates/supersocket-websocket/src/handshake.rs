@@ -72,7 +72,7 @@ impl fmt::Display for HeadError {
 pub(crate) fn head_length(buf: &[u8], searched: usize) -> Option<usize> {
     // The end may have begun in the last two bytes searched.
     let mut start = searched.saturating_sub(2);
-    while let Some(offset) = buf[start..].iter().position(|&byte| byte == b'\n') {
+    while let Some(offset) = memchr::memchr(b'\n', &buf[start..]) {
         let after = start + offset + 1;
         match &buf[after..] {
             [b'\n', ..] => return Some(after + 1),

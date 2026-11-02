@@ -32,11 +32,14 @@ mod client;
 mod commands;
 mod deflate;
 mod filter;
+mod fragments;
 mod frame;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing;
 mod handshake;
+#[cfg(feature = "json")]
+mod json;
 mod message;
 mod server;
 mod session;
@@ -47,7 +50,12 @@ pub use commands::{SubprotocolBuilder, WebSocketCommand, WebSocketCommands};
 #[cfg(feature = "deflate")]
 pub use deflate::CompressionOptions;
 pub use filter::WebSocketPackage;
+pub use fragments::FragmentWriter;
 pub use handshake::{Accept, HandshakeRequest, Rejection};
-pub use message::{CloseCode, CloseFrame, Message};
+#[cfg(feature = "json")]
+pub use json::JsonWebSocketCommand;
+pub use message::{CloseCode, CloseFrame, Message, MessageKind};
 pub use server::{WebSocketBuilder, WebSocketServer, WebSocketState};
 pub use session::WebSocketSession;
+#[cfg(feature = "json")]
+pub use supersocket_server::Json;

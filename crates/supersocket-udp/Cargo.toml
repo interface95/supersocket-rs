@@ -1,0 +1,27 @@
+[package]
+name = "supersocket-udp"
+description = "UDP for supersocket-rs: datagrams become sessions, keyed by their sender."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+supersocket-connection.workspace = true
+supersocket-server.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["net", "sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+supersocket-proto.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

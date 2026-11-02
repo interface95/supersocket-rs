@@ -18,6 +18,7 @@ codec = ["dep:tokio-util"]
 
 [dependencies]
 bytes.workspace = true
+memchr.workspace = true
 thiserror.workspace = true
 tokio-util = { workspace = true, features = ["codec"], optional = true }
 

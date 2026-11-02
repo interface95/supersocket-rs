@@ -18,9 +18,10 @@ use supersocket_client::{
 use supersocket_proto::ProtocolError;
 
 use crate::{
-    CloseCode, CloseFrame, Message,
+    CloseCode, CloseFrame, FragmentWriter, Message, MessageKind,
     deflate::{Encoder, Setup},
     filter::{HeadFilter, Package, Role, WebSocketPackage},
+    fragments::FrameSink,
     frame::{
         FIN, MAX_CLOSE_FRAME, MAX_CONTROL_PAYLOAD, MAX_HEADER_SIZE, OP_BINARY, OP_PING, OP_PONG,
         OP_TEXT, apply_mask, close_frame, encode_header,
@@ -169,6 +170,7 @@ impl WebSocketClientBuilder {
             sender: client.sender(),
             close_sent: Arc::new(AtomicBool::new(false)),
             compression: deflate.map(|accepted| Arc::new(accepted.encoder())),
+            sending: Arc::new(tokio::sync::RwLock::new(())),
         };
         Ok(WebSocketClient {
             client: Some(client),
@@ -278,7 +280,7 @@ impl WebSocketClient {
                     self.close_transport().await;
                     return Err(ReadError::Protocol(ProtocolError::new(why)));
                 }
-                Package::Pong | Package::Handshake(_) => {}
+                Package::Fragment | Package::Pong | Package::Handshake(_) => {}
             }
         }
         self.close_transport().await;
@@ -295,6 +297,11 @@ impl WebSocketClient {
             // An earlier receive may have been cancelled while waiting for the writer.
             self.sender.sender.close().await;
         }
+    }
+
+    /// Sends a message in fragments; see [`WebSocketSender::send_fragmented`].
+    pub async fn send_fragmented(&self, kind: MessageKind) -> io::Result<FragmentWriter<'_>> {
+        self.sender.send_fragmented(kind).await
     }
 
     /// A handle for sending from other tasks.
@@ -374,6 +381,9 @@ pub struct WebSocketSender {
     close_sent: Arc<AtomicBool>,
     /// Compresses outgoing messages, when the extension was negotiated.
     compression: Option<Arc<Encoder>>,
+    /// Taken for writing while a fragmented message is sent and for reading by every other
+    /// message send; control frames do not take it.
+    sending: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl WebSocketSender {
@@ -429,6 +439,20 @@ impl WebSocketSender {
         self.close_sent.load(Ordering::Acquire) || self.sender.is_closed()
     }
 
+    /// Sends a message in fragments, for a message too large to hold in memory or produced over
+    /// time; see [`FragmentWriter`]. Other messages wait until it is finished. The message is
+    /// not compressed.
+    pub async fn send_fragmented(&self, kind: MessageKind) -> io::Result<FragmentWriter<'_>> {
+        if self.close_sent.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the WebSocket connection is closing",
+            ));
+        }
+        let sending = self.sending.write().await;
+        Ok(FragmentWriter::new(self, sending, kind))
+    }
+
     async fn send_data(&self, opcode: u8, payload: &[u8]) -> io::Result<()> {
         if self.close_sent.load(Ordering::Acquire) {
             return Err(io::Error::new(
@@ -436,6 +460,8 @@ impl WebSocketSender {
                 "the WebSocket connection is closing",
             ));
         }
+        // Wait for a fragmented message that is being sent.
+        let _sending = self.sending.read().await;
         if let Some(encoder) = &self.compression {
             // With a shared window, a frame that a cancelled send left behind goes first.
             loop {
@@ -462,6 +488,29 @@ impl WebSocketSender {
         let mask = random_bytes::<4>();
         encode_frame(first, payload, Some(mask), &mut frame);
         self.sender.send(&frame).await
+    }
+}
+
+impl FrameSink for WebSocketSender {
+    fn send_frame<'a>(
+        &'a self,
+        first: u8,
+        payload: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>> {
+        Box::pin(WebSocketSender::send_frame(self, first, payload))
+    }
+
+    fn try_send_frame(&self, first: u8, payload: &[u8]) -> io::Result<()> {
+        let mut frame = BytesMut::new();
+        encode_frame(first, payload, Some(random_bytes::<4>()), &mut frame);
+        self.sender.try_send(&frame)
+    }
+
+    fn abandon(&self) {
+        // Nothing may follow an unfinished message: seal the queue, which closes the connection
+        // once what is queued has been written.
+        self.close_sent.store(true, Ordering::Release);
+        let _ = self.sender.send_last(b"");
     }
 }
 

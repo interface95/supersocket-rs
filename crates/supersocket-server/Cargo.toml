@@ -19,6 +19,8 @@ tls = ["dep:tokio-rustls"]
 config = ["dep:serde_json", "dep:toml"]
 ## `GzipLayer`, which compresses connections with gzip.
 gzip = ["supersocket-connection/gzip"]
+## `JsonCommand`, commands whose package body is JSON.
+json = ["dep:serde_json"]
 
 [dependencies]
 supersocket-connection.workspace = true

@@ -13,7 +13,7 @@ use std::{
 use common::{WAIT, start};
 use supersocket::{
     Server,
-    client::{EasyClient, HttpProxy, Socks4Proxy, Socks5Proxy},
+    client::{Connector, EasyClient, Endpoint, HttpProxy, Socks4Proxy, Socks5Proxy},
     prelude::*,
 };
 use tokio::{
@@ -306,4 +306,23 @@ async fn socks4_proxy_connects_by_address_and_by_host_name() {
         assert_greeting_and_echo(client).await;
     }
     server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks4_rejects_nul_fields_before_connecting_to_the_proxy() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    for (user, host) in [
+        ("alice\0different.example\0", "intended.example"),
+        ("alice\0extra", "127.0.0.1"),
+        ("alice", "intended.example\0extra"),
+    ] {
+        let error = Socks4Proxy::new(address.to_string())
+            .user_id(user)
+            .connect(&Endpoint::new(host, 80), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+    }
 }

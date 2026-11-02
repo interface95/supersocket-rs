@@ -5,6 +5,8 @@ mod common;
 use std::{
     io,
     net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -15,7 +17,12 @@ use supersocket::{
     client::{Connection, Connector, Endpoint, ReadError},
     prelude::*,
 };
-use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    net::TcpListener,
+    sync::mpsc,
+    time::timeout,
+};
 
 fn echo_lines() -> ServerBuilder<TextPackage> {
     Server::builder(LineFilter::default).on_package(async |session, package| {
@@ -81,6 +88,166 @@ async fn hands_packages_to_a_handler_and_closes_cleanly() {
     assert_eq!(next_reason(&mut reasons).await, CloseReason::RemoteClosed);
     timeout(WAIT, sender.closed()).await.unwrap();
     server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receiving_recovers_from_handler_construction_and_poll_panics() {
+    let (server, address) = start(echo_lines());
+    let (packages, mut received) = mpsc::unbounded_channel();
+    // Handlers need Send, but not Sync. Keep this contract while wrapping both panic sites.
+    let calls = std::cell::Cell::new(0);
+    let sender = connect(address)
+        .await
+        .start_receive(move |_sender, package: TextPackage| {
+            calls.set(calls.get() + 1);
+            assert_ne!(
+                package.text, "construction panic",
+                "before returning a future"
+            );
+            if package.text == "healthy" {
+                assert_eq!(calls.get(), 3);
+            }
+            let packages = packages.clone();
+            async move {
+                if package.text == "poll panic" {
+                    tokio::task::yield_now().await;
+                    panic!("while polling the future");
+                }
+                packages.send(package.text).unwrap();
+            }
+        });
+    sender
+        .send("construction panic\r\npoll panic\r\nhealthy\r\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        timeout(WAIT, received.recv()).await.unwrap().as_deref(),
+        Some("healthy")
+    );
+    sender.close().await;
+    server.shutdown().await;
+}
+
+struct HandlerLifetime(mpsc::UnboundedSender<()>);
+
+impl Drop for HandlerLifetime {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receiving_drops_a_pending_handler_when_the_client_closes() {
+    let (server, address) = start(echo_lines());
+    let (started, mut entered) = mpsc::unbounded_channel();
+    let (done, mut dropped) = mpsc::unbounded_channel();
+    let sender = connect(address)
+        .await
+        .start_receive(move |_sender, _package| {
+            let started = started.clone();
+            let done = done.clone();
+            async move {
+                let _lifetime = HandlerLifetime(done);
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }
+        });
+    sender.send("start\r\n").await.unwrap();
+    timeout(WAIT, entered.recv()).await.unwrap().unwrap();
+    timeout(WAIT, sender.close()).await.unwrap();
+    timeout(WAIT, dropped.recv())
+        .await
+        .expect("closing left the handler running")
+        .unwrap();
+    server.shutdown().await;
+}
+
+struct ReadPanic;
+
+impl AsyncRead for ReadPanic {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        panic!("custom stream read panicked");
+    }
+}
+
+impl Connector for ReadPanic {
+    async fn connect(&self, _: &Endpoint, _: Option<Connection>) -> io::Result<Connection> {
+        Ok(Connection::new(tokio::io::join(
+            ReadPanic,
+            tokio::io::sink(),
+        )))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receiving_closes_the_sender_when_the_receive_task_panics() {
+    let sender = EasyClient::builder(LineFilter::default)
+        .proxy(ReadPanic)
+        .connect("127.0.0.1:1")
+        .await
+        .unwrap()
+        .start_receive(|_, _| async {});
+    timeout(WAIT, sender.closed())
+        .await
+        .expect("a failed receive task left the sender open");
+    assert_eq!(
+        sender.send("late\r\n").await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+}
+
+struct WriteFailure;
+
+impl AsyncWrite for WriteFailure {
+    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Connector for WriteFailure {
+    async fn connect(&self, _: &Endpoint, _: Option<Connection>) -> io::Result<Connection> {
+        Ok(Connection::new(tokio::io::join(
+            &b"hello\r\n"[..],
+            WriteFailure,
+        )))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receiving_drops_a_pending_handler_when_the_writer_fails() {
+    let (started, mut entered) = mpsc::unbounded_channel();
+    let (done, mut dropped) = mpsc::unbounded_channel();
+    let sender = EasyClient::builder(LineFilter::default)
+        .proxy(WriteFailure)
+        .connect("127.0.0.1:1")
+        .await
+        .unwrap()
+        .start_receive(move |_sender, _package| {
+            let started = started.clone();
+            let done = done.clone();
+            async move {
+                let _lifetime = HandlerLifetime(done);
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }
+        });
+    timeout(WAIT, entered.recv()).await.unwrap().unwrap();
+    sender.send("fails\r\n").await.unwrap();
+    timeout(WAIT, sender.closed()).await.unwrap();
+    timeout(WAIT, dropped.recv())
+        .await
+        .expect("a write failure left the handler running")
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -360,4 +527,49 @@ async fn connecting_fails_for_closed_ports_and_bad_endpoints() {
         .await
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}
+
+/// Reads from one half of a pipe and never finishes a write, so that closing takes the whole
+/// close timeout.
+struct LateGoodbye(std::sync::Mutex<Option<tokio::io::ReadHalf<tokio::io::DuplexStream>>>);
+
+impl Connector for LateGoodbye {
+    async fn connect(&self, _: &Endpoint, _: Option<Connection>) -> io::Result<Connection> {
+        let reader = self.0.lock().unwrap().take().unwrap();
+        Ok(Connection::new(tokio::io::join(reader, common::Stall)))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn packages_arriving_while_closing_still_reach_the_handler() {
+    let (mut peer, client_side) = tokio::io::duplex(1024);
+    let (reader, _writer) = tokio::io::split(client_side);
+    let (lines, mut received) = mpsc::unbounded_channel();
+    let sender = EasyClient::builder(LineFilter::default)
+        .proxy(LateGoodbye(std::sync::Mutex::new(Some(reader))))
+        .configure(|options| options.close_timeout = Duration::from_millis(300))
+        .connect("127.0.0.1:1")
+        .await
+        .unwrap()
+        .start_receive(move |_sender, package: TextPackage| {
+            let lines = lines.clone();
+            async move {
+                let _ = lines.send(package.text);
+            }
+        });
+    // The writer never finishes this, so closing lasts the close timeout.
+    sender.send("QUIT\r\n").await.unwrap();
+    let closing = tokio::spawn({
+        let sender = sender.clone();
+        async move { sender.close().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The goodbye arrives while the connection is closing: it is still handled.
+    peer.write_all(b"BYE\r\n").await.unwrap();
+    assert_eq!(
+        timeout(WAIT, received.recv()).await.unwrap().as_deref(),
+        Some("BYE")
+    );
+    timeout(WAIT, closing).await.unwrap().unwrap();
+    assert!(sender.is_closed());
 }

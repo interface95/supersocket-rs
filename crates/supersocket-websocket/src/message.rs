@@ -2,6 +2,25 @@ use std::fmt;
 
 use bytes::Bytes;
 
+/// The kind of a message, for sending one in fragments; see
+/// [`WebSocketSession::send_fragmented`](crate::WebSocketSession::send_fragmented).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MessageKind {
+    /// A text message, whose fragments add up to UTF-8.
+    Text,
+    /// A binary message.
+    Binary,
+}
+
+impl MessageKind {
+    pub(crate) fn opcode(self) -> u8 {
+        match self {
+            Self::Text => crate::frame::OP_TEXT,
+            Self::Binary => crate::frame::OP_BINARY,
+        }
+    }
+}
+
 /// A WebSocket message. Control frames (ping, pong and close) are handled by the server and the
 /// client themselves.
 #[derive(Debug, Clone, PartialEq, Eq)]

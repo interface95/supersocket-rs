@@ -3,7 +3,6 @@ use std::{
     fmt,
     future::Future,
     io,
-    net::SocketAddr,
     pin::Pin,
     sync::{
         Arc, OnceLock,
@@ -14,9 +13,9 @@ use std::{
 
 use supersocket_proto::{CommandPackage, ProtocolError};
 use supersocket_server::{
-    CloseReason, ConnectionInfo, Error, ErrorAction, HandlerResult, KeyedPackage, ListenOptions,
-    Middleware, PackageError, PackageHandler, Server, ServerBuilder, ServerInfo, ServerOptions,
-    Session, SessionState, StreamLayer,
+    CloseReason, ConnectionInfo, Error, ErrorAction, HandlerResult, KeyedPackage, ListenAddr,
+    ListenOptions, Listener, Middleware, PackageError, PackageHandler, Server, ServerBuilder,
+    ServerInfo, ServerOptions, Session, SessionState, StreamLayer,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -49,6 +48,10 @@ pub struct WebSocketState<S = ()> {
     /// Whether a close frame has been sent; nothing but control frames may follow it.
     pub(crate) close_sent: AtomicBool,
     pub(crate) close_frame: OnceLock<CloseFrame>,
+    /// Taken for writing while a fragmented message is sent and for reading by every other
+    /// message send, so that a fragmented message is not interleaved with another while plain
+    /// sends do not wait for each other; control frames do not take it.
+    pub(crate) sending: tokio::sync::RwLock<()>,
     pub(crate) user: S,
 }
 
@@ -61,6 +64,7 @@ impl<S> WebSocketState<S> {
             compression: OnceLock::new(),
             close_sent: AtomicBool::new(false),
             close_frame: OnceLock::new(),
+            sending: tokio::sync::RwLock::new(()),
             user,
         }
     }
@@ -130,7 +134,7 @@ impl<S: Send + Sync + 'static> WebSocketServer<S> {
     }
 
     /// Binds all listeners and starts accepting connections; see [`Server::start`].
-    pub fn start(&self) -> Result<Vec<SocketAddr>, Error> {
+    pub fn start(&self) -> Result<Vec<ListenAddr>, Error> {
         let addresses = self.server.start()?;
         if let Some(keepalive) = self.keepalive {
             let task = tokio::spawn(run_keepalive(
@@ -484,6 +488,17 @@ impl<S: Send + Sync + 'static> WebSocketBuilder<S> {
         self
     }
 
+    /// Listens on the Unix domain socket at `path`, on Unix; see [`ListenOptions::unix`].
+    pub fn listen_unix(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.options.listeners.push(ListenOptions::unix(path));
+        self
+    }
+
+    /// Accepts connections from a listener of your own; see [`ServerBuilder::listener`].
+    pub fn listener(self, listener: impl Listener) -> Self {
+        self.defer(move |builder| builder.listener(listener))
+    }
+
     /// Changes the options in place.
     pub fn configure(mut self, configure: impl FnOnce(&mut ServerOptions)) -> Self {
         configure(&mut self.options);
@@ -621,7 +636,7 @@ where
                 }
                 session.close(CloseReason::ProtocolError);
             }
-            Package::Pong | Package::Handshake(_) => {}
+            Package::Fragment | Package::Pong | Package::Handshake(_) => {}
         }
         Ok(())
     }

@@ -32,10 +32,18 @@
 //! - `gzip`: gzip compression of connections, `GzipLayer` for the server and, with `client`,
 //!   `GzipConnector` for the client.
 //! - `codec`: `CodecFilter`, which runs a `tokio_util::codec::Decoder` as a pipeline filter.
+//! - `json`: commands whose package body is JSON: `JsonCommand`, and with `websocket`
+//!   `JsonWebSocketCommand`.
+//! - `udp`: the UDP listener in the `udp` module, which serves datagrams as sessions.
+//! - `http`: HTTP/1.1 in the `http` module: a request filter, responses, keep-alive and
+//!   Server-Sent Events.
 
 #[cfg(feature = "client")]
 pub use supersocket_client as client;
 pub use supersocket_connection as connection;
+pub use supersocket_connection::send_fmt;
+#[cfg(feature = "http")]
+pub use supersocket_http as http;
 pub use supersocket_proto as proto;
 #[cfg(feature = "codec")]
 pub use supersocket_proto::CodecFilter;
@@ -52,13 +60,18 @@ pub use supersocket_server::ConfigError;
 pub use supersocket_server::GzipLayer;
 pub use supersocket_server::{
     AsyncCommand, AsyncCommandExt, BoxError, BoxStream, CloseReason, CommandFilter, Commands,
-    ConnectionInfo, Error, ErrorAction, Extensions, Filtered, HandlerResult, KeyedPackage,
-    ListenOptions, Middleware, PackageError, PackageHandler, PackageHandling, ProxyCommand,
-    ProxyInfo, Server, ServerBuilder, ServerInfo, ServerOptions, Session, SessionContainer,
-    SessionState, Stream, StreamLayer, TlsOptions, shutdown_signal,
+    ConnectionInfo, Detached, Detaching, Error, ErrorAction, Extensions, Filtered, HandlerResult,
+    KeyedPackage, ListenAddr, ListenOptions, Listener, Middleware, PackageError, PackageHandler,
+    PackageHandling, ProxyCommand, ProxyInfo, Server, ServerBuilder, ServerInfo, ServerOptions,
+    ServerStatus, Session, SessionContainer, SessionState, SessionStatus, Stream, StreamLayer,
+    TlsOptions, shutdown_signal,
 };
+#[cfg(feature = "json")]
+pub use supersocket_server::{Json, JsonCommand};
 #[cfg(feature = "tls")]
 pub use supersocket_server::{TlsInfo, rustls};
+#[cfg(feature = "udp")]
+pub use supersocket_udp as udp;
 #[cfg(feature = "websocket")]
 pub use supersocket_websocket as websocket;
 

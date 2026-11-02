@@ -5,17 +5,22 @@ use std::{
     io,
     net::SocketAddr,
     ops::Deref,
+    pin::Pin,
     sync::{
-        Arc, OnceLock, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, Instant, SystemTime},
 };
 
 use bytes::BytesMut;
-use supersocket_connection::SendQueue;
+use supersocket_connection::{BoxStream, Rewind, SendQueue};
 use supersocket_proto::PackageEncoder;
-use tokio::io::AsyncWrite;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::oneshot,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{BoxError, extensions::Extensions, proxy_protocol::ProxyInfo, server::ServerInfo};
@@ -46,6 +51,8 @@ pub enum CloseReason {
     /// Application code panicked where the session cannot continue, such as in the pipeline
     /// filter.
     InternalError,
+    /// The application took the connection over with [`Session::detach`].
+    Detached,
 }
 
 impl fmt::Display for CloseReason {
@@ -61,6 +68,35 @@ impl fmt::Display for CloseReason {
             Self::ProtocolError => "protocol error",
             Self::Rejected => "rejected",
             Self::InternalError => "internal error",
+            Self::Detached => "detached",
+        })
+    }
+}
+
+/// Where a session is in its life, like SuperSocket's `SessionState`; see [`Session::status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SessionStatus {
+    /// The connection is being set up: middleware is registering the session, or it has not
+    /// completed its handshake yet. Only middleware and the package handler of a server that
+    /// requires a handshake see sessions in this state.
+    Connecting,
+    /// The session is in the session container and its packages are handled.
+    Connected,
+    /// The session is closing: data still queued is sent, and the closed handlers have not run
+    /// yet.
+    Closing,
+    /// The connection is gone and the closed handlers have run.
+    Closed,
+}
+
+impl fmt::Display for SessionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Closing => "closing",
+            Self::Closed => "closed",
         })
     }
 }
@@ -195,6 +231,10 @@ struct SessionInner<S> {
     started_at: Instant,
     last_active_ms: AtomicU64,
     handshake_complete: AtomicBool,
+    connected: AtomicBool,
+    closed: AtomicBool,
+    /// Set by [`Session::detach`]: where to hand the connection over once the session is done.
+    detaching: Mutex<Option<oneshot::Sender<Detached>>>,
     send_queue: SendQueue,
     close_token: CancellationToken,
     close_reason: OnceLock<CloseReason>,
@@ -257,6 +297,9 @@ impl<S: SessionState> Session<S> {
                 started_at: Instant::now(),
                 last_active_ms: AtomicU64::new(0),
                 handshake_complete: AtomicBool::new(handshake_complete),
+                connected: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
+                detaching: Mutex::new(None),
                 send_queue,
                 close_token,
                 close_reason: OnceLock::new(),
@@ -339,6 +382,29 @@ impl<S> Session<S> {
         self.inner.close_token.is_cancelled()
     }
 
+    /// Where the session is in its life.
+    pub fn status(&self) -> SessionStatus {
+        if self.inner.closed.load(Ordering::Acquire) {
+            SessionStatus::Closed
+        } else if self.inner.close_token.is_cancelled() {
+            SessionStatus::Closing
+        } else if self.inner.connected.load(Ordering::Acquire) {
+            SessionStatus::Connected
+        } else {
+            SessionStatus::Connecting
+        }
+    }
+
+    /// Records that the session joined the session container.
+    pub(crate) fn mark_connected(&self) {
+        self.inner.connected.store(true, Ordering::Release);
+    }
+
+    /// Records that the session is over: its connection is gone and its closed handlers ran.
+    pub(crate) fn mark_closed(&self) {
+        self.inner.closed.store(true, Ordering::Release);
+    }
+
     /// Queues `data` to be sent. Data from concurrent calls is never interleaved. When more than
     /// [`send_buffer_limit`](crate::ServerOptions::send_buffer_limit) bytes are already waiting,
     /// this waits until the writer has taken them. Fails once the session has stopped sending,
@@ -373,16 +439,83 @@ impl<S> Session<S> {
         self.inner.send_queue.send_last(data.as_ref())
     }
 
-    /// Encodes `package` with `encoder` and queues it like [`send`](Self::send).
+    /// Encodes `package` with `encoder` straight into the send buffer and queues it like
+    /// [`send`](Self::send).
     pub async fn send_package<T: ?Sized>(
         &self,
         encoder: &impl PackageEncoder<T>,
         package: &T,
     ) -> Result<(), BoxError> {
-        let mut buf = BytesMut::new();
-        encoder.encode(package, &mut buf)?;
-        self.send(&buf).await?;
-        Ok(())
+        self.send_with(|buf| encoder.encode(package, buf).map_err(BoxError::from))
+            .await
+    }
+
+    /// Queues what `write` appends to the send buffer, like [`send`](Self::send) without a buffer
+    /// in between, like SuperSocket's `SendAsync` with a `PipeWriter` action: for encoding a
+    /// package or formatting a reply straight into the queue. `write` runs while the send queue
+    /// is locked, so it must be quick and must not wait. Nothing is queued when it fails, and its
+    /// error is returned; the session's own errors are I/O errors.
+    ///
+    /// ```
+    /// use supersocket_server::Session;
+    ///
+    /// # async fn run(session: Session) -> std::io::Result<()> {
+    /// let items: Vec<u8> = vec![1, 2, 3];
+    /// session
+    ///     .send_with(|buf| {
+    ///         buf.extend_from_slice(&(items.len() as u16).to_be_bytes());
+    ///         buf.extend_from_slice(&items);
+    ///         Ok(())
+    ///     })
+    ///     .await
+    /// # }
+    /// ```
+    pub async fn send_with<E: From<io::Error>>(
+        &self,
+        write: impl FnOnce(&mut BytesMut) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.inner.send_queue.send_with(write).await
+    }
+
+    /// Formats `args` straight into the send buffer and queues it like [`send`](Self::send).
+    /// Only while the send buffer limit is reached is the text formatted into a `String` first,
+    /// to wait for room. Call it through the [`send_fmt!`](supersocket_connection::send_fmt)
+    /// macro, `send_fmt!(session, "OK {sum}\r\n").await?`: `format_args!` cannot be kept across
+    /// an `await` in a `Send` future, and the macro lets go of it in time.
+    pub fn send_fmt<'a>(
+        &'a self,
+        args: fmt::Arguments<'_>,
+    ) -> impl Future<Output = io::Result<()>> + Send + use<'a, S>
+    where
+        S: Send + Sync,
+    {
+        use std::fmt::Write as _;
+        // The arguments cannot be kept across an await, so they are used before the first one.
+        let queued = self.try_send_with(|buf| {
+            buf.write_fmt(args)
+                .map_err(|_| io::Error::other("formatting the data failed"))
+        });
+        let fallback = match queued {
+            Ok(()) => Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(Some(args.to_string())),
+            Err(error) => Err(error),
+        };
+        async move {
+            match fallback? {
+                Some(text) => self.send(text).await,
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// Like [`send_with`](Self::send_with) without waiting: fails with
+    /// [`ErrorKind::WouldBlock`](io::ErrorKind::WouldBlock) while the send buffer limit is
+    /// reached, in which case `write` is not called.
+    pub fn try_send_with<E: From<io::Error>>(
+        &self,
+        write: impl FnOnce(&mut BytesMut) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.inner.send_queue.try_send_with(write)
     }
 
     /// Completes once the session is closed or closing, for tasks that should stop with it.
@@ -410,6 +543,60 @@ impl<S> Session<S> {
         self.inner.close_token.cancel();
     }
 
+    /// Takes the connection away from the session, like SuperSocket's
+    /// `IConnection.DetachAsync`: to hand it to another server or protocol that the session
+    /// negotiated, such as [`Server::serve_connection`](crate::Server::serve_connection) of a
+    /// WebSocket server after an HTTP exchange. The session closes with
+    /// [`CloseReason::Detached`], without a goodbye from the package handler; what it had queued
+    /// is sent first, within the close timeout. The returned future completes with the
+    /// connection once the session's tasks have let go of it, or with `None` when the queued data
+    /// could not be sent in time.
+    ///
+    /// Call it from a package handler and return; await the future from another task. The
+    /// connection is handed over only once the handler has returned, so awaiting the future
+    /// inside the handler would wait forever. Fails when the session is already closing or
+    /// detaching.
+    ///
+    /// ```
+    /// use supersocket_server::{HandlerResult, Session};
+    /// use tokio::io::AsyncWriteExt;
+    ///
+    /// # async fn handle(session: Session) -> HandlerResult {
+    /// let detaching = session.detach()?;
+    /// tokio::spawn(async move {
+    ///     if let Some(connection) = detaching.await {
+    ///         let mut stream = connection.into_stream();
+    ///         let _ = stream.write_all(b"the raw connection is yours\r\n").await;
+    ///     }
+    /// });
+    /// Ok(())
+    /// # }
+    /// ```
+    pub fn detach(&self) -> io::Result<Detaching> {
+        let mut slot = self.inner.detaching.lock().unwrap();
+        if self.is_closed() || slot.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "the session is closing or already detaching",
+            ));
+        }
+        let (sender, receiver) = oneshot::channel();
+        *slot = Some(sender);
+        drop(slot);
+        self.close(CloseReason::Detached);
+        Ok(Detaching(receiver))
+    }
+
+    /// Hands the connection over to whoever called [`detach`](Self::detach), or tells them that
+    /// it is gone.
+    pub(crate) fn hand_over(&self, detached: Option<Detached>) {
+        if let Some(sender) = self.inner.detaching.lock().unwrap().take() {
+            if let Some(detached) = detached {
+                let _ = sender.send(detached);
+            }
+        }
+    }
+
     pub(crate) fn close_token(&self) -> &CancellationToken {
         &self.inner.close_token
     }
@@ -432,10 +619,25 @@ impl<S> Session<S> {
         self.inner.send_queue.close();
     }
 
-    /// The session's writer task. A failed or timed-out write closes the session.
-    pub(crate) async fn run_writer(self, writer: Box<dyn AsyncWrite + Send + Unpin>) {
+    /// Like [`close_send_queue`](Self::close_send_queue), but the writer leaves the connection
+    /// open for whoever takes it over.
+    pub(crate) fn detach_send_queue(&self) {
+        self.inner.send_queue.detach();
+    }
+
+    /// The session's writer task. A failed or timed-out write closes the session. Returns the
+    /// writer, for a connection that is taken over.
+    pub(crate) async fn run_writer(
+        self,
+        mut writer: Box<dyn AsyncWrite + Send + Unpin>,
+    ) -> Box<dyn AsyncWrite + Send + Unpin> {
         let send_timeout = self.inner.server.options().send_timeout;
-        if let Err(error) = self.inner.send_queue.run_writer(writer, send_timeout).await {
+        if let Err(error) = self
+            .inner
+            .send_queue
+            .run_writer(&mut writer, send_timeout)
+            .await
+        {
             let reason = if error.kind() == io::ErrorKind::TimedOut {
                 CloseReason::Timeout
             } else {
@@ -444,6 +646,54 @@ impl<S> Session<S> {
             tracing::debug!(session = self.id(), %error, "send failed");
             self.close(reason);
         }
+        writer
+    }
+}
+
+/// The connection of a session that the application took over with [`Session::detach`]: the
+/// two halves of the stream and the bytes read ahead of the last package.
+pub struct Detached {
+    /// The reading half of the connection, positioned after `buffered`.
+    pub reader: Box<dyn AsyncRead + Send + Unpin>,
+    /// The writing half of the connection; everything the session had queued has been written.
+    pub writer: Box<dyn AsyncWrite + Send + Unpin>,
+    /// Bytes that were received after the last package and not consumed by the pipeline filter.
+    pub buffered: BytesMut,
+}
+
+impl Detached {
+    /// Joins the halves into one stream, which first yields the buffered bytes.
+    pub fn into_stream(self) -> BoxStream {
+        Box::new(tokio::io::join(
+            Rewind::new(self.buffered.freeze(), self.reader),
+            self.writer,
+        ))
+    }
+}
+
+impl fmt::Debug for Detached {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Detached")
+            .field("buffered", &self.buffered.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The connection of a detaching session, once its tasks have let go of it; see
+/// [`Session::detach`]. `None` when the session could not hand it over.
+pub struct Detaching(oneshot::Receiver<Detached>);
+
+impl Future for Detaching {
+    type Output = Option<Detached>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx).map(Result::ok)
+    }
+}
+
+impl fmt::Debug for Detaching {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Detaching")
     }
 }
 

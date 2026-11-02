@@ -55,11 +55,17 @@ pub trait Middleware<S = ()>: Send + Sync + 'static {
 
     /// Called for every new session before it is registered. Returning `false` rejects the
     /// session: its connection is closed without the connected and closed events.
+    ///
+    /// The call is cancelled when the connection's handshake deadline passes or the session
+    /// closes, including server shutdown. It must be cancellation-safe: use guards to release
+    /// resources acquired across an await. Only middleware that returned `true` receive
+    /// [`unregister_session`](Self::unregister_session); a cancelled registration does not.
     fn register_session(&self, _session: &Session<S>) -> impl Future<Output = bool> + Send {
         async { true }
     }
 
-    /// Called when a registered session closes.
+    /// Called when a registered session closes, including rollback when a later middleware
+    /// rejects, panics, times out or is cancelled. The session is already closing at that point.
     fn unregister_session(&self, _session: &Session<S>) -> impl Future<Output = ()> + Send {
         async {}
     }

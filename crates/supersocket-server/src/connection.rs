@@ -20,7 +20,7 @@ use tracing::Instrument;
 use crate::{
     options::PackageHandling,
     proxy_protocol,
-    server::{ErrorAction, Listener, ServerInner},
+    server::{Endpoint, ErrorAction, ServerInner},
     session::{CloseReason, ConnectionInfo, Session, SessionState},
 };
 
@@ -28,7 +28,7 @@ use crate::{
 pub(crate) async fn serve<P: Send + 'static, S: SessionState>(
     server: Arc<ServerInner<P, S>>,
     stream: TcpStream,
-    listener: Arc<Listener>,
+    listener: Arc<Endpoint>,
     permit: Option<OwnedSemaphorePermit>,
 ) {
     let Some((id, span, connection, deadline)) = accept(&server, &stream, &listener) else {
@@ -74,7 +74,7 @@ pub(crate) async fn serve<P: Send + 'static, S: SessionState>(
 pub(crate) async fn serve_tls<P: Send + 'static, S: SessionState>(
     server: Arc<ServerInner<P, S>>,
     stream: TcpStream,
-    listener: Arc<Listener>,
+    listener: Arc<Endpoint>,
     permit: Option<OwnedSemaphorePermit>,
 ) {
     let Some((id, span, connection, deadline)) = accept(&server, &stream, &listener) else {
@@ -129,7 +129,7 @@ pub(crate) async fn serve_tls<P: Send + 'static, S: SessionState>(
 pub(crate) async fn serve_layered_tcp<P: Send + 'static, S: SessionState>(
     server: Arc<ServerInner<P, S>>,
     stream: TcpStream,
-    listener: Arc<Listener>,
+    listener: Arc<Endpoint>,
     permit: Option<OwnedSemaphorePermit>,
 ) {
     let Some((id, span, connection, deadline)) = accept(&server, &stream, &listener) else {
@@ -138,6 +138,49 @@ pub(crate) async fn serve_layered_tcp<P: Send + 'static, S: SessionState>(
     async move {
         let _permit = permit;
         let (mut stream, mut connection) = (stream, connection);
+        let Some(buffered) =
+            read_proxy_header(&listener, &mut stream, &mut connection, deadline).await
+        else {
+            return;
+        };
+        if !admit(&server, &connection) {
+            return;
+        }
+        let stream = Rewind::new(buffered.freeze(), stream);
+        #[cfg(feature = "tls")]
+        if let Some(tls) = &listener.tls {
+            let stream = match Box::pin(tls.accept(stream, deadline)).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::debug!(%error, "TLS handshake failed");
+                    return;
+                }
+            };
+            connection.secure = true;
+            connection.tls = Some(Box::new(crate::TlsInfo::new(stream.get_ref().1)));
+            return serve_layered(&server, id, Box::new(stream), connection, deadline).await;
+        }
+        serve_layered(&server, id, Box::new(stream), connection, deadline).await;
+    }
+    .instrument(span)
+    .await
+}
+
+/// Serves a connection accepted on a Unix socket listener: like a TCP connection with stream
+/// layers, without addresses or socket settings.
+#[cfg(unix)]
+pub(crate) async fn serve_unix<P: Send + 'static, S: SessionState>(
+    server: Arc<ServerInner<P, S>>,
+    stream: tokio::net::UnixStream,
+    listener: Arc<Endpoint>,
+    permit: Option<OwnedSemaphorePermit>,
+) {
+    let id = server.next_session_id.fetch_add(1, Ordering::Relaxed);
+    let span = tracing::debug_span!("session", id, remote = tracing::field::Empty);
+    let deadline = Instant::now() + server.info.options().handshake_timeout;
+    async move {
+        let _permit = permit;
+        let (mut stream, mut connection) = (stream, ConnectionInfo::default());
         let Some(buffered) =
             read_proxy_header(&listener, &mut stream, &mut connection, deadline).await
         else {
@@ -245,7 +288,7 @@ async fn serve_layered<P: Send + 'static, S: SessionState>(
 fn accept<P, S>(
     server: &ServerInner<P, S>,
     stream: &TcpStream,
-    listener: &Listener,
+    listener: &Endpoint,
 ) -> Option<(u64, tracing::Span, ConnectionInfo, Instant)> {
     let (Ok(remote_addr), Ok(local_addr)) = (stream.peer_addr(), stream.local_addr()) else {
         return None;
@@ -271,8 +314,8 @@ fn accept<P, S>(
 /// Reads the PROXY protocol header where the listener expects one, and records what it says.
 /// Returns the bytes read past it, or `None` when the connection must be dropped.
 async fn read_proxy_header(
-    listener: &Listener,
-    stream: &mut TcpStream,
+    listener: &Endpoint,
+    stream: &mut (impl AsyncRead + Unpin),
     connection: &mut ConnectionInfo,
     deadline: Instant,
 ) -> Option<BytesMut> {
@@ -312,7 +355,7 @@ fn start<P, S, R>(
 where
     P: Send + 'static,
     S: SessionState,
-    R: AsyncRead + Send + Unpin,
+    R: AsyncRead + Send + Unpin + 'static,
 {
     let filter = match catch_panic_sync(|| (server.filter_factory)()) {
         Ok(filter) => filter,
@@ -363,6 +406,7 @@ impl<S> Drop for Cleanup<S> {
         self.session.close(CloseReason::InternalError);
         self.session.close_send_queue();
         self.session.server().sessions().remove(self.session.id());
+        self.session.mark_closed();
     }
 }
 
@@ -375,16 +419,16 @@ async fn run_session<P, S, R>(
 ) where
     P: Send + 'static,
     S: SessionState,
-    R: AsyncRead + Send + Unpin,
+    R: AsyncRead + Send + Unpin + 'static,
 {
     let mut writer_task = server.tracker.spawn(session.clone().run_writer(writer));
     let _cleanup = Cleanup {
         session: session.clone(),
     };
 
-    if !register(&server, &session).await {
-        tracing::debug!("session rejected by middleware");
-        session.close(CloseReason::Rejected);
+    if let Err(reason) = register(&server, &session, deadline).await {
+        tracing::debug!(%reason, "session registration failed");
+        session.close(reason);
         session.close_send_queue();
         if tokio::time::timeout(server.info.options().close_timeout, &mut writer_task)
             .await
@@ -407,9 +451,11 @@ async fn run_session<P, S, R>(
     let reason = session.close_reason();
 
     // Let the protocol queue a goodbye, send what is still queued (unless the peer stops
-    // reading), and close the connection before the closed events run.
+    // reading), and close the connection before the closed events run. A connection that is
+    // taken over gets no goodbye and stays open.
     let deadline = Instant::now() + server.info.options().close_timeout;
-    if connected {
+    let detaching = reason == CloseReason::Detached;
+    if connected && !detaching {
         if let Some(closing) = server
             .package_handler
             .as_ref()
@@ -420,14 +466,30 @@ async fn run_session<P, S, R>(
             }
         }
     }
-    session.close_send_queue();
-    if tokio::time::timeout_at(deadline, &mut writer_task)
-        .await
-        .is_err()
-    {
-        writer_task.abort();
+    if detaching {
+        session.detach_send_queue();
+    } else {
+        session.close_send_queue();
     }
-    drop(packages);
+    let writer = match tokio::time::timeout_at(deadline, &mut writer_task).await {
+        Ok(Ok(writer)) => Some(writer),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            writer_task.abort();
+            None
+        }
+    };
+    if detaching {
+        let (reader, buffered) = packages.into_parts();
+        session.hand_over(writer.map(|writer| crate::Detached {
+            reader: Box::new(reader),
+            writer,
+            buffered,
+        }));
+    } else {
+        drop(packages);
+        session.hand_over(None);
+    }
     server.info.sessions().remove(session.id());
     for middleware in server.middlewares.iter().rev() {
         if let Err(panic) =
@@ -453,6 +515,7 @@ async fn run_session<P, S, R>(
 /// Adds the session to the session container and runs the connected handlers.
 async fn connect<P, S: SessionState>(server: &ServerInner<P, S>, session: &Session<S>) {
     server.info.sessions().add(session.clone());
+    session.mark_connected();
     tracing::debug!("session connected");
     if let Err(panic) = catch_panic(async { S::on_connected(session).await }).await {
         tracing::error!(%panic, "SessionState::on_connected panicked");
@@ -464,17 +527,31 @@ async fn connect<P, S: SessionState>(server: &ServerInner<P, S>, session: &Sessi
     }
 }
 
-/// Registers the session with every middleware. When one rejects it or panics, the session is
-/// unregistered from the ones that accepted it.
-async fn register<P, S: SessionState>(server: &ServerInner<P, S>, session: &Session<S>) -> bool {
+/// Registers within the connection's handshake deadline. Rejection, panic, timeout or closure
+/// rolls back only the middleware that already accepted the session, in reverse order.
+async fn register<P, S: SessionState>(
+    server: &ServerInner<P, S>,
+    session: &Session<S>,
+    deadline: Instant,
+) -> Result<(), CloseReason> {
     for (index, middleware) in server.middlewares.iter().enumerate() {
-        let accepted = catch_panic(async { middleware.register_session(session).await })
-            .await
-            .unwrap_or_else(|panic| {
-                tracing::error!(%panic, "Middleware::register_session panicked");
-                false
-            });
-        if !accepted {
+        let result = tokio::select! {
+            biased;
+            () = session.closed() => Err(cancelled_reason(server)),
+            () = tokio::time::sleep_until(deadline) => Err(CloseReason::Timeout),
+            accepted = catch_panic(async { middleware.register_session(session).await }) => {
+                match accepted {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(CloseReason::Rejected),
+                    Err(panic) => {
+                        tracing::error!(%panic, "Middleware::register_session panicked");
+                        Err(CloseReason::Rejected)
+                    }
+                }
+            }
+        };
+        if let Err(reason) = result {
+            session.close(reason);
             for registered in server.middlewares[..index].iter().rev() {
                 if let Err(panic) =
                     catch_panic(async { registered.unregister_session(session).await }).await
@@ -482,10 +559,10 @@ async fn register<P, S: SessionState>(server: &ServerInner<P, S>, session: &Sess
                     tracing::error!(%panic, "Middleware::unregister_session panicked");
                 }
             }
-            return false;
+            return Err(reason);
         }
     }
-    true
+    Ok(())
 }
 
 /// Reads packages and hands them to the package handler until the session ends. Returns why it
@@ -516,7 +593,7 @@ where
     let mut in_flight = JoinSet::new();
     let concurrent = matches!(options.package_handling, PackageHandling::Concurrent { .. });
 
-    let reason = loop {
+    let reason = 'reading: loop {
         // Reaping finished tasks takes a lock; only concurrent handling has any.
         if concurrent {
             while in_flight.try_join_next().is_some() {}
@@ -542,7 +619,14 @@ where
             PackageHandling::Serial => handle_package(server, session, package).await,
             PackageHandling::Concurrent { max_in_flight } => {
                 while in_flight.len() >= max_in_flight {
-                    in_flight.join_next().await;
+                    tokio::select! {
+                        biased;
+                        () = close_token.cancelled() => break 'reading cancelled_reason(server),
+                        _ = in_flight.join_next() => {}
+                    }
+                }
+                if close_token.is_cancelled() {
+                    break cancelled_reason(server);
                 }
                 let (server, session) = (server.clone(), session.clone());
                 in_flight.spawn(async move { handle_package(&server, &session, package).await });

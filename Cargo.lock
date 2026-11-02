@@ -783,11 +783,14 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "rcgen",
+ "serde",
  "socket2",
  "supersocket-client",
  "supersocket-connection",
+ "supersocket-http",
  "supersocket-proto",
  "supersocket-server",
+ "supersocket-udp",
  "supersocket-websocket",
  "tokio",
  "tokio-rustls",
@@ -828,6 +831,18 @@ dependencies = [
  "supersocket-proto",
  "thiserror",
  "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "supersocket-http"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "memchr",
+ "supersocket-proto",
+ "supersocket-server",
+ "tokio",
 ]
 
 [[package]]
@@ -835,6 +850,7 @@ name = "supersocket-proto"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "memchr",
  "thiserror",
  "tokio-util",
 ]
@@ -859,11 +875,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "supersocket-udp"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "supersocket-connection",
+ "supersocket-proto",
+ "supersocket-server",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "supersocket-websocket"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "flate2",
+ "memchr",
+ "serde",
  "supersocket-client",
  "supersocket-connection",
  "supersocket-proto",

@@ -30,6 +30,8 @@ pub(crate) enum Package {
     /// The HTTP head that opens the connection: the client's request or the server's response,
     /// with what was negotiated from it.
     Handshake(Result<Handshake, HeadError>),
+    /// A complete non-final data frame, so the reader can reset its per-frame byte budget.
+    Fragment,
     Message(Message),
     Ping(Bytes),
     Pong,
@@ -297,33 +299,30 @@ impl PipelineFilter for FrameFilter {
     type Package = WebSocketPackage;
 
     fn filter(&mut self, buf: &mut BytesMut) -> Result<Option<WebSocketPackage>, ProtocolError> {
-        // Fragments that do not complete a message produce nothing, so keep going until a frame
-        // does or more data is needed.
-        while !self.done {
-            let Some(header) = Header::parse(buf) else {
-                return Ok(None);
-            };
-            if let Err(violation) = self.check(&header) {
-                return Ok(Some(self.fail(violation)));
-            }
-            // `check` bounded the length by the maximum size.
-            let length = header.length as usize;
-            if buf.len() < header.size + length {
-                return Ok(None);
-            }
-            buf.advance(header.size);
-            let mut payload = buf.split_to(length);
-            if let Some(mask) = header.mask {
-                apply_mask(&mut payload, mask);
-            }
-            match self.frame(header.fin, header.opcode, payload, header.rsv == RSV1) {
-                Ok(Some(package)) => return Ok(Some(WebSocketPackage(package))),
-                Ok(None) => {}
-                Err(violation) => return Ok(Some(self.fail(violation))),
-            }
+        if self.done {
+            buf.clear();
+            return Ok(None);
         }
-        buf.clear();
-        Ok(None)
+        let Some(header) = Header::parse(buf) else {
+            return Ok(None);
+        };
+        if let Err(violation) = self.check(&header) {
+            return Ok(Some(self.fail(violation)));
+        }
+        // `check` bounded the length by the maximum size.
+        let length = header.length as usize;
+        if buf.len() < header.size + length {
+            return Ok(None);
+        }
+        buf.advance(header.size);
+        let mut payload = buf.split_to(length);
+        if let Some(mask) = header.mask {
+            apply_mask(&mut payload, mask);
+        }
+        match self.frame(header.fin, header.opcode, payload, header.rsv == RSV1) {
+            Ok(package) => Ok(Some(WebSocketPackage(package.unwrap_or(Package::Fragment)))),
+            Err(violation) => Ok(Some(self.fail(violation))),
+        }
     }
 }
 
@@ -453,7 +452,7 @@ mod tests {
         frame
     }
 
-    /// Runs `frames` through a server's frame filter and returns the packages it produced.
+    /// Runs frames through the server filter and returns its message and control packages.
     fn read(frames: &[Vec<u8>], max_size: usize) -> Vec<Package> {
         let mut filter = FrameFilter::new(Role::Server, max_size, None);
         let mut buf = BytesMut::new();
@@ -461,7 +460,9 @@ mod tests {
         for frame in frames {
             buf.extend_from_slice(frame);
             while let Some(package) = filter.filter(&mut buf).unwrap() {
-                packages.push(package.0);
+                if !matches!(package.0, Package::Fragment) {
+                    packages.push(package.0);
+                }
             }
         }
         packages
@@ -478,6 +479,47 @@ mod tests {
         match package {
             Package::Message(Message::Text(text)) => text,
             _ => panic!("not a text message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_message_budget_excludes_previous_frame_headers() {
+        use supersocket_connection::{PackageReader, ReadOptions};
+
+        for role in [Role::Server, Role::Client] {
+            let mut wire = Vec::new();
+            for index in 0..8 {
+                let first = match index {
+                    0 => OP_BINARY,
+                    7 => FIN | OP_CONTINUATION,
+                    _ => OP_CONTINUATION,
+                };
+                let mut frame = client_frame(first, b"abcd");
+                if role == Role::Client {
+                    frame = vec![first, 4, b'a', b'b', b'c', b'd'];
+                }
+                wire.extend(frame);
+            }
+            let mut reader = PackageReader::new(
+                wire.as_slice(),
+                Box::new(FrameFilter::new(role, 32, None)),
+                ReadOptions {
+                    max_package_length: 32,
+                    receive_buffer_size: 1,
+                },
+            );
+            let mut messages = Vec::new();
+            let mut fragments = 0;
+            while let Some(package) = reader.next().await.unwrap() {
+                match package.0 {
+                    Package::Message(message) => messages.push(message),
+                    Package::Fragment => fragments += 1,
+                    _ => panic!("unexpected control package"),
+                }
+            }
+            assert_eq!(fragments, 7);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].as_bytes(), b"abcdabcdabcdabcdabcdabcdabcdabcd");
         }
     }
 
@@ -773,7 +815,9 @@ mod tests {
             for frame in frames {
                 buf.extend_from_slice(frame);
                 while let Some(package) = filter.filter(&mut buf).unwrap() {
-                    packages.push(package.0);
+                    if !matches!(package.0, Package::Fragment) {
+                        packages.push(package.0);
+                    }
                 }
             }
             packages

@@ -13,7 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use supersocket::{
     CloseReason, CommandPackage, HandlerResult,
     websocket::{
-        Accept, CloseCode, CloseFrame, Rejection, WebSocketBuilder, WebSocketCommand,
+        Accept, CloseCode, CloseFrame, MessageKind, Rejection, WebSocketBuilder, WebSocketCommand,
         WebSocketServer, WebSocketSession,
     },
 };
@@ -38,7 +38,7 @@ fn start<S: Send + Sync + 'static>(
     builder: WebSocketBuilder<S>,
 ) -> (WebSocketServer<S>, SocketAddr) {
     let server = builder.listen("127.0.0.1:0").build().unwrap();
-    let address = server.start().unwrap()[0];
+    let address = server.start().unwrap()[0].tcp().unwrap();
     (server, address)
 }
 
@@ -794,6 +794,30 @@ mod compression {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn truncated_nonfinal_deflate_messages_close_without_delivery() {
+        for reset in [true, false] {
+            let (server, address) = start(compressing(CompressionOptions {
+                server_no_context_takeover: reset,
+                client_no_context_takeover: reset,
+                ..CompressionOptions::default()
+            }));
+            for payload in [
+                &b""[..],
+                &b"\x00\x05\x00\xfa\xffw"[..],
+                &b"\x00\x0a\x00\xf5\xffw"[..],
+                &b"\x00\x01\x00\xfe\xffw"[..],
+            ] {
+                let (mut client, _) = RawClient::connect_with(address, OFFER).await;
+                client.send(0xC1, &HELLO, true).await;
+                assert_eq!(client.receive().await, (0x81, b"Hello".to_vec()));
+                client.send(0xC2, payload, true).await;
+                client.expect_close(CloseCode::INVALID_PAYLOAD).await;
+            }
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn messages_that_decompress_beyond_the_limit_are_refused() {
         let (server, address) = start(
             compressing(CompressionOptions::default())
@@ -826,4 +850,48 @@ mod compression {
         assert!(payload.len() < 100, "{} bytes", payload.len());
         server.shutdown().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn messages_can_be_sent_in_fragments() {
+    let (server, address) = start(WebSocketServer::builder().on_message(
+        async |session, message| {
+            match message.as_text() {
+                Some("stream") => {
+                    let mut writer = session.send_fragmented(MessageKind::Text).await?;
+                    // A message sent meanwhile waits until the fragmented one is finished.
+                    let other = session.clone();
+                    let waiting = tokio::spawn(async move { other.send_text("after").await });
+                    writer.write(b"part1").await?;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    // A broadcast does not wait: it is skipped.
+                    assert_eq!(
+                        session.try_send(&"skipped".into()).unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                    writer.write(b"part2").await?;
+                    writer.finish(b"part3").await?;
+                    waiting.await.unwrap()?;
+                }
+                Some("abandon") => {
+                    let mut writer = session.send_fragmented(MessageKind::Binary).await?;
+                    writer.write(b"half").await?;
+                    drop(writer);
+                    session.send_text("still usable").await?;
+                }
+                _ => session.send(&message).await?,
+            }
+            Ok(())
+        },
+    ));
+    let mut ws = connect(address).await;
+    ws.send(tungstenite::Message::text("stream")).await.unwrap();
+    assert_eq!(next(&mut ws).await.to_text().unwrap(), "part1part2part3");
+    assert_eq!(next(&mut ws).await.to_text().unwrap(), "after");
+    ws.send(tungstenite::Message::text("abandon"))
+        .await
+        .unwrap();
+    assert_eq!(&next(&mut ws).await.into_data()[..], b"half");
+    assert_eq!(next(&mut ws).await.to_text().unwrap(), "still usable");
+    server.shutdown().await;
 }
