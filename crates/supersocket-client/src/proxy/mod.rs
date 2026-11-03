@@ -1,79 +1,176 @@
-//! Proxy connectors. Like SuperSocket's, they parse the proxy's replies with the pipeline
-//! filters from `supersocket-proto`.
+//! Proxy connectors, laid out like SuperSocket's `SuperSocket.Client.Proxy`.
+//!
+//! [`ProxyConnector`] plays the part of `ProxyConnectorBase`: it opens the connection to the
+//! proxy, then leaves the proxy's handshake to [`connect_proxy`](ProxyConnector::connect_proxy).
+//! A handshake runs on a [`ProxyConnection`], which sends requests and cuts the replies into
+//! packages with the pipeline filters from `supersocket-proto`, the way SuperSocket's connectors
+//! read a package stream, and finally detaches the connection to hand it on. [`HttpConnector`],
+//! [`Socks4Connector`] and [`Socks5Connector`] are built this way, and so can be connectors for
+//! other proxies.
 
 mod http;
 mod socks4;
 mod socks5;
 
-use std::{fmt, io};
+use std::{any, fmt, future::Future, io, net::SocketAddr};
 
-use bytes::BytesMut;
 use supersocket_connection::{PackageReader, ReadOptions, Rewind};
-use supersocket_proto::BoxFilter;
-use tokio::net::TcpStream;
+use supersocket_proto::PipelineFilter;
+use tokio::io::AsyncWriteExt;
 
-pub use http::HttpProxy;
-pub use socks4::Socks4Proxy;
-pub use socks5::Socks5Proxy;
+pub use http::HttpConnector;
+pub use socks4::Socks4Connector;
+pub use socks5::Socks5Connector;
 
-use crate::{BoxStream, Connection, Endpoint, TcpConnector};
+use crate::{BoxStream, Connection, Connector, Endpoint, TcpConnector, connector::must_be_first};
 
+/// The base of the proxy connectors, like SuperSocket's `ProxyConnectorBase`.
+///
+/// Every `ProxyConnector` is a [`Connector`]: connecting opens a connection to
+/// [`proxy_endpoint`](Self::proxy_endpoint) with the connector from
+/// [`create_default_connector`](Self::create_default_connector), then calls
+/// [`connect_proxy`](Self::connect_proxy) to ask the proxy for the target. Like the other
+/// connectors that open the connection, it goes first in a chain, through
+/// [`ClientBuilder::proxy`](crate::ClientBuilder::proxy).
+///
+/// A connector for a proxy that answers `CONNECT host:port` with a line `OK`:
+///
+/// ```
+/// use std::io;
+///
+/// use supersocket_client::{Connection, Endpoint, ProxyConnection, ProxyConnector};
+/// use supersocket_proto::LineFilter;
+///
+/// struct LineProxy {
+///     proxy: Endpoint,
+/// }
+///
+/// impl ProxyConnector for LineProxy {
+///     fn proxy_endpoint(&self) -> &Endpoint {
+///         &self.proxy
+///     }
+///
+///     async fn connect_proxy(
+///         &self,
+///         target: &Endpoint,
+///         connection: Connection,
+///     ) -> io::Result<Connection> {
+///         let mut connection = ProxyConnection::new(connection, LineFilter::default());
+///         connection.send(format!("CONNECT {target}\r\n").as_bytes()).await?;
+///         match connection.receive().await?.text.as_str() {
+///             "OK" => Ok(connection.detach()),
+///             reply => Err(io::Error::new(io::ErrorKind::ConnectionRefused, reply.to_owned())),
+///         }
+///     }
+/// }
+/// ```
+pub trait ProxyConnector: Send + Sync + 'static {
+    /// Where the proxy listens.
+    fn proxy_endpoint(&self) -> &Endpoint;
+
+    /// The connector that opens the connection to the proxy, like `CreateDefaultConnector`.
+    /// Default: a [`TcpConnector`].
+    fn create_default_connector(&self) -> impl Connector {
+        TcpConnector::new()
+    }
+
+    /// Asks the proxy, over the open `connection` to it, to connect to `target`, and returns the
+    /// connection through the proxy; like `ConnectProxyAsync`. [`ProxyConnection`] reads the
+    /// replies.
+    fn connect_proxy(
+        &self,
+        target: &Endpoint,
+        connection: Connection,
+    ) -> impl Future<Output = io::Result<Connection>> + Send;
+}
+
+impl<T: ProxyConnector> Connector for T {
+    async fn connect(
+        &self,
+        target: &Endpoint,
+        previous: Option<Connection>,
+    ) -> io::Result<Connection> {
+        must_be_first(any::type_name::<T>(), &previous)?;
+        let connection = self
+            .create_default_connector()
+            .connect(self.proxy_endpoint(), None)
+            .await?;
+        self.connect_proxy(target, connection).await
+    }
+}
+
+/// Limits for reading a proxy's replies, which are small.
 const HANDSHAKE_LIMITS: ReadOptions = ReadOptions {
     max_package_length: 64 * 1024,
     receive_buffer_size: 1024,
 };
 
-async fn connect_to_proxy(proxy: &str) -> io::Result<TcpStream> {
-    let proxy: Endpoint = proxy.parse()?;
-    TcpConnector::new().open(&proxy).await
+/// The connection to a proxy during its handshake, like the connection and package stream that
+/// SuperSocket's proxy connectors create from their `ConnectState`.
+///
+/// [`send`](Self::send) writes requests, [`receive`](Self::receive) returns the replies cut by a
+/// pipeline filter, which may switch to the filter of the next step through
+/// [`next_filter`](PipelineFilter::next_filter), and [`detach`](Self::detach) hands the
+/// connection on once the proxy has connected. Dropping it instead closes the connection.
+pub struct ProxyConnection<P> {
+    reader: PackageReader<BoxStream, P>,
+    local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
 }
 
-/// Reads one reply from the proxy and returns it with whatever the proxy sent after it.
-async fn read_reply<P: Send + 'static>(
-    stream: &mut TcpStream,
-    filter: BoxFilter<P>,
-) -> io::Result<(P, BytesMut)> {
-    let mut reader = PackageReader::new(&mut *stream, filter, HANDSHAKE_LIMITS);
-    let reply = reader.next().await?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "the proxy closed the connection",
-        )
-    })?;
-    let (_, rest) = reader.into_parts();
-    Ok((reply, rest))
-}
-
-/// Reads one reply in the middle of a handshake, where the proxy must not send anything more.
-async fn read_step<P: Send + 'static>(
-    stream: &mut TcpStream,
-    filter: BoxFilter<P>,
-) -> io::Result<P> {
-    let (reply, rest) = read_reply(stream, filter).await?;
-    if !rest.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "the proxy sent unexpected data during the handshake",
-        ));
+impl<P: Send + 'static> ProxyConnection<P> {
+    /// Starts a handshake on `connection`, cutting what the proxy sends with `filter`.
+    pub fn new(connection: Connection, filter: impl PipelineFilter<Package = P>) -> Self {
+        let (stream, local_addr, peer_addr) = connection.into_parts();
+        Self {
+            reader: PackageReader::new(stream, Box::new(filter), HANDSHAKE_LIMITS),
+            local_addr,
+            peer_addr,
+        }
     }
-    Ok(reply)
+
+    /// Sends `data` to the proxy.
+    pub async fn send(&mut self, data: &[u8]) -> io::Result<()> {
+        let stream = self.reader.get_mut();
+        stream.write_all(data).await?;
+        stream.flush().await
+    }
+
+    /// Receives the proxy's next reply. The proxy closing the connection first is an error.
+    pub async fn receive(&mut self) -> io::Result<P> {
+        self.reader.next().await?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the proxy closed the connection",
+            )
+        })
+    }
+
+    /// Ends the handshake and returns the connection, like `DetachAsync`. Whatever the proxy sent
+    /// after its last reply, such as the first bytes from the target, is read again first.
+    pub fn detach(self) -> Connection {
+        let (stream, rest) = self.reader.into_parts();
+        let stream: BoxStream = if rest.is_empty() {
+            stream
+        } else {
+            Box::new(Rewind::new(rest.freeze(), stream))
+        };
+        Connection::from_parts(stream, self.local_addr, self.peer_addr)
+    }
+}
+
+impl<P> fmt::Debug for ProxyConnection<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyConnection")
+            .field("local_addr", &self.local_addr)
+            .field("peer_addr", &self.peer_addr)
+            .field("reader", &self.reader)
+            .finish()
+    }
 }
 
 fn refused(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionRefused, message)
-}
-
-/// Turns the stream connected through the proxy into a connection, putting back any data the
-/// proxy already sent past its reply.
-fn finish(stream: TcpStream, rest: BytesMut) -> Connection {
-    let local_addr = stream.local_addr().ok();
-    let peer_addr = stream.peer_addr().ok();
-    let stream: BoxStream = if rest.is_empty() {
-        Box::new(stream)
-    } else {
-        Box::new(Rewind::new(rest.freeze(), stream))
-    };
-    Connection::from_parts(stream, local_addr, peer_addr)
 }
 
 /// A username and password. `Debug` output leaves out the password.
@@ -120,6 +217,15 @@ fn base64(input: &[u8]) -> String {
     output
 }
 
+/// A connection to nowhere for unit tests: what the connector writes ends up in the returned
+/// stream, and the connector reads `replies`.
+#[cfg(test)]
+async fn in_memory(replies: &[u8]) -> (Connection, tokio::io::DuplexStream) {
+    let (ours, mut theirs) = tokio::io::duplex(4096);
+    theirs.write_all(replies).await.unwrap();
+    (Connection::new(ours), theirs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,15 +242,45 @@ mod tests {
     fn debug_output_leaves_out_passwords() {
         let http = format!(
             "{:?}",
-            HttpProxy::new("proxy:8080").credentials("user", "hunter2")
+            HttpConnector::new("proxy:8080")
+                .unwrap()
+                .credentials("user", "hunter2")
         );
         let socks5 = format!(
             "{:?}",
-            Socks5Proxy::new("proxy:1080").credentials("user", "hunter2")
+            Socks5Connector::new("proxy:1080")
+                .unwrap()
+                .credentials("user", "hunter2")
         );
         for output in [http, socks5] {
             assert!(output.contains("\"user\""), "{output}");
             assert!(!output.contains("hunter2"), "{output}");
         }
+    }
+
+    #[tokio::test]
+    async fn detaching_keeps_what_follows_the_last_reply() {
+        use supersocket_proto::LineFilter;
+        use tokio::io::AsyncReadExt;
+
+        let (connection, _proxy) = in_memory(b"OK\r\nfirst bytes").await;
+        let mut connection = ProxyConnection::new(connection, LineFilter::default());
+        assert_eq!(connection.receive().await.unwrap().text, "OK");
+        let (mut stream, _, _) = connection.detach().into_parts();
+        let mut rest = [0; 11];
+        stream.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"first bytes");
+    }
+
+    #[tokio::test]
+    async fn a_proxy_connector_goes_first() {
+        let (previous, _proxy) = in_memory(b"").await;
+        let error = Socks5Connector::new("127.0.0.1:1")
+            .unwrap()
+            .connect(&Endpoint::new("example.com", 80), Some(previous))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("Socks5Connector"), "{error}");
     }
 }

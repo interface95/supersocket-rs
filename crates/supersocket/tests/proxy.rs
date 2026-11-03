@@ -13,7 +13,10 @@ use std::{
 use common::{WAIT, start};
 use supersocket::{
     Server,
-    client::{Connector, EasyClient, Endpoint, HttpProxy, Socks4Proxy, Socks5Proxy},
+    client::{
+        Connection, EasyClient, Endpoint, HttpConnector, ProxyConnection, ProxyConnector,
+        Socks4Connector, Socks5Connector,
+    },
     prelude::*,
 };
 use tokio::{
@@ -212,7 +215,11 @@ async fn http_proxy_connects_and_keeps_data_sent_with_its_reply() {
     let proxy = spawn_proxy(|client| http_proxy(client, Some("dXNlcjpwYXNz"), "\r\n")).await;
 
     let client = EasyClient::builder(LineFilter::default)
-        .proxy(HttpProxy::new(proxy.to_string()).credentials("user", "pass"))
+        .proxy(
+            HttpConnector::new(proxy)
+                .unwrap()
+                .credentials("user", "pass"),
+        )
         .connect(("localhost", address.port()))
         .await
         .unwrap();
@@ -227,7 +234,11 @@ async fn http_proxy_rejection_is_an_error() {
     let proxy = spawn_proxy(|client| http_proxy(client, Some("dXNlcjpwYXNz"), "\r\n")).await;
 
     let error = EasyClient::builder(LineFilter::default)
-        .proxy(HttpProxy::new(proxy.to_string()).credentials("user", "wrong"))
+        .proxy(
+            HttpConnector::new(proxy)
+                .unwrap()
+                .credentials("user", "wrong"),
+        )
         .connect(address)
         .await
         .unwrap_err();
@@ -242,7 +253,7 @@ async fn http_proxy_replies_may_end_lines_with_a_bare_newline() {
     let proxy = spawn_proxy(|client| http_proxy(client, None, "\n")).await;
 
     let client = EasyClient::builder(LineFilter::default)
-        .proxy(HttpProxy::new(proxy.to_string()))
+        .proxy(HttpConnector::new(proxy).unwrap())
         .connect(address)
         .await
         .unwrap();
@@ -256,7 +267,7 @@ async fn socks5_proxy_resolves_host_names() {
     let proxy = spawn_proxy(|client| socks5_proxy(client, None)).await;
 
     let client = EasyClient::builder(LineFilter::default)
-        .proxy(Socks5Proxy::new(proxy.to_string()))
+        .proxy(Socks5Connector::new(proxy).unwrap())
         .connect(("localhost", address.port()))
         .await
         .unwrap();
@@ -270,21 +281,29 @@ async fn socks5_proxy_authenticates() {
     let proxy = spawn_proxy(|client| socks5_proxy(client, Some(("user", "secret")))).await;
 
     let client = EasyClient::builder(LineFilter::default)
-        .proxy(Socks5Proxy::new(proxy.to_string()).credentials("user", "secret"))
+        .proxy(
+            Socks5Connector::new(proxy)
+                .unwrap()
+                .credentials("user", "secret"),
+        )
         .connect(address)
         .await
         .unwrap();
     assert_greeting_and_echo(client).await;
 
     let error = EasyClient::builder(LineFilter::default)
-        .proxy(Socks5Proxy::new(proxy.to_string()).credentials("user", "wrong"))
+        .proxy(
+            Socks5Connector::new(proxy)
+                .unwrap()
+                .credentials("user", "wrong"),
+        )
         .connect(address)
         .await
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
 
     let error = EasyClient::builder(LineFilter::default)
-        .proxy(Socks5Proxy::new(proxy.to_string()))
+        .proxy(Socks5Connector::new(proxy).unwrap())
         .connect(address)
         .await
         .unwrap_err();
@@ -299,7 +318,7 @@ async fn socks4_proxy_connects_by_address_and_by_host_name() {
 
     for target in [address.to_string(), format!("localhost:{}", address.port())] {
         let client = EasyClient::builder(LineFilter::default)
-            .proxy(Socks4Proxy::new(proxy.to_string()).user_id("tester"))
+            .proxy(Socks4Connector::new(proxy).unwrap().user_id("tester"))
             .connect(target)
             .await
             .unwrap();
@@ -309,20 +328,96 @@ async fn socks4_proxy_connects_by_address_and_by_host_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn socks4_rejects_nul_fields_before_connecting_to_the_proxy() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
+async fn socks4_rejects_nul_fields_without_sending_anything() {
     for (user, host) in [
         ("alice\0different.example\0", "intended.example"),
         ("alice\0extra", "127.0.0.1"),
         ("alice", "intended.example\0extra"),
     ] {
-        let error = Socks4Proxy::new(address.to_string())
+        let (ours, mut proxy) = tokio::io::duplex(1024);
+        let error = Socks4Connector::new("127.0.0.1:1080")
+            .unwrap()
             .user_id(user)
-            .connect(&Endpoint::new(host, 80), None)
+            .connect_proxy(&Endpoint::new(host, 80), Connection::new(ours))
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert_eq!(proxy.read(&mut [0; 64]).await.unwrap(), 0);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks5_proxy_may_skip_the_offered_authentication() {
+    let (server, address) = start_greeting_echo();
+    let proxy = spawn_proxy(|client| socks5_proxy(client, None)).await;
+
+    let client = EasyClient::builder(LineFilter::default)
+        .proxy(
+            Socks5Connector::new(proxy)
+                .unwrap()
+                .credentials("user", "secret"),
+        )
+        .connect(address)
+        .await
+        .unwrap();
+    assert_greeting_and_echo(client).await;
+    server.shutdown().await;
+}
+
+/// A proxy that answers `CONNECT host:port` with a line `OK`, written like the built-in ones.
+struct LineProxy {
+    proxy: Endpoint,
+}
+
+impl ProxyConnector for LineProxy {
+    fn proxy_endpoint(&self) -> &Endpoint {
+        &self.proxy
+    }
+
+    async fn connect_proxy(
+        &self,
+        target: &Endpoint,
+        connection: Connection,
+    ) -> io::Result<Connection> {
+        let mut connection = ProxyConnection::new(connection, LineFilter::default());
+        connection
+            .send(format!("CONNECT {target}\r\n").as_bytes())
+            .await?;
+        match connection.receive().await?.text.as_str() {
+            "OK" => Ok(connection.detach()),
+            reply => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                reply.to_owned(),
+            )),
+        }
+    }
+}
+
+async fn line_proxy(mut client: TcpStream) -> io::Result<()> {
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n") {
+        request.push(client.read_u8().await?);
+    }
+    let request = String::from_utf8(request).unwrap();
+    let target = request.trim_end().strip_prefix("CONNECT ").unwrap();
+    let upstream = TcpStream::connect(target).await?;
+    client.write_all(b"OK\r\n").await?;
+    relay(client, upstream).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_connectors_of_your_own_plug_in_like_the_built_in_ones() {
+    let (server, address) = start_greeting_echo();
+    let proxy = spawn_proxy(line_proxy).await;
+
+    let client = EasyClient::builder(LineFilter::default)
+        .proxy(LineProxy {
+            proxy: proxy.into(),
+        })
+        .connect(address)
+        .await
+        .unwrap();
+    assert_eq!(client.peer_addr(), Some(proxy));
+    assert_greeting_and_echo(client).await;
+    server.shutdown().await;
 }

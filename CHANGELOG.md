@@ -63,6 +63,12 @@ The first release.
 
 - `EasyClient` with reusable builders and connector chains: TCP, TLS, HTTP CONNECT, SOCKS4 and
   SOCKS5 proxies (feature `proxy`), and gzip; receiving by pulling or through a handler.
+- Proxy connectors laid out like SuperSocket's: `HttpConnector`, `Socks4Connector` and
+  `Socks5Connector` implement `ProxyConnector` (SuperSocket's `ProxyConnectorBase`), which opens
+  the connection to the proxy and leaves the handshake to `connect_proxy`; handshakes run on a
+  `ProxyConnection` that cuts replies with pipeline filters and detaches the connection at the
+  end. SOCKS5 follows the method the proxy chose, also when it skips the offered authentication.
+  `PackageReader::get_mut` writes to the stream between packages.
 - `ClientSender::send_with`, `try_send_with` and `send_fmt`.
 
 ### WebSocket (`supersocket-websocket`)

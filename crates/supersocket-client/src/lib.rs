@@ -34,7 +34,7 @@ pub use connector::GzipConnector;
 pub use connector::{Connection, Connector, TcpConnector};
 pub use endpoint::{Endpoint, ToEndpoint};
 #[cfg(feature = "proxy")]
-pub use proxy::{HttpProxy, Socks4Proxy, Socks5Proxy};
+pub use proxy::{HttpConnector, ProxyConnection, ProxyConnector, Socks4Connector, Socks5Connector};
 pub use supersocket_connection::ReadError;
 pub use supersocket_connection::{BoxStream, Stream};
 #[cfg(feature = "tls")]

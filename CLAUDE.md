@@ -133,10 +133,11 @@ new callbacks.
 
 Public extension traits use `impl Future` return types (async-fn-in-trait style):
 `PackageHandler`, `Middleware`, `StreamLayer`, `Listener`, `AsyncCommand`, `CommandFilter`,
-`SessionState`, `Connector`, `WebSocketCommand`, `JsonCommand`. Each one that is stored as a
-trait object has a `pub(crate) Dyn*` twin returning `BoxFuture` with a blanket impl
+`SessionState`, `Connector`, `ProxyConnector`, `WebSocketCommand`, `JsonCommand`. Each one that is
+stored as a trait object has a `pub(crate) Dyn*` twin returning `BoxFuture` with a blanket impl
 (`DynMiddleware`, `DynStreamLayer`, `DynListener`, `DynPackageHandler`, `DynConnector`). Adding a
-method to the public trait means adding it to the twin too.
+method to the public trait means adding it to the twin too. `ProxyConnector` has no twin: a blanket
+impl makes every `ProxyConnector` a `Connector`.
 
 ### Protocol switching
 
@@ -163,9 +164,12 @@ sends do not wait for each other; control frames bypass it.
 
 `ClientBuilder` holds a filter factory and a `Connector` chain: the first connector
 (`TcpConnector` or a proxy) opens the stream, later ones (`TlsConnector`, `GzipConnector`,
-custom) wrap it. Proxy connectors parse replies with proto filters through `PackageReader` and
-push leftover bytes back with `Rewind`. The client reuses `PackageReader` and `SendQueue`, so
-package limits, batching and back-pressure behave like a server session.
+custom) wrap it. Proxy connectors mirror SuperSocket's `SuperSocket.Client.Proxy`: each implements
+`ProxyConnector` (`ProxyConnectorBase`), whose blanket `Connector` impl opens the connection to the
+proxy and calls `connect_proxy`; the handshake runs on a `ProxyConnection` (one `PackageReader`
+whose filter switches per step via `next_filter`), and `detach` pushes leftover bytes back with
+`Rewind`. The client reuses `PackageReader` and `SendQueue`, so package limits, batching and
+back-pressure behave like a server session.
 
 ### Configuration
 

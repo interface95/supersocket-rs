@@ -200,6 +200,12 @@ where
         Ok(None)
     }
 
+    /// The underlying reader, for writing to a stream between packages, as a handshake does.
+    /// Reading from it directly skips the bytes buffered here.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
     /// Returns the underlying reader and the bytes received but not consumed yet.
     pub fn into_parts(self) -> (R, BytesMut) {
         (self.reader, self.buf)

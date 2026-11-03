@@ -2,26 +2,26 @@ use std::{io, net::IpAddr};
 
 use bytes::Bytes;
 use supersocket_proto::FixedSizeFilter;
-use tokio::io::AsyncWriteExt;
 
-use super::{connect_to_proxy, finish, read_reply, refused};
-use crate::{Connection, Connector, Endpoint, connector::must_be_first};
+use super::{ProxyConnection, ProxyConnector, refused};
+use crate::{Connection, Endpoint, ToEndpoint};
 
-/// Connects through a SOCKS4 proxy, like SuperSocket's `Socks4Connector`. Host names are sent
-/// to the proxy with SOCKS4a; IPv6 targets are not supported by the protocol.
+/// Connects through a SOCKS4 proxy. Host names are sent to the proxy with SOCKS4a; IPv6 targets
+/// are not supported by the protocol. SuperSocket declares a `Socks4Connector` but leaves it
+/// unimplemented; this one follows its other proxy connectors.
 #[derive(Debug, Clone)]
-pub struct Socks4Proxy {
-    proxy: String,
+pub struct Socks4Connector {
+    proxy: Endpoint,
     user_id: String,
 }
 
-impl Socks4Proxy {
-    /// A connector for the proxy at `proxy`, written as `host:port`.
-    pub fn new(proxy: impl Into<String>) -> Self {
-        Self {
-            proxy: proxy.into(),
+impl Socks4Connector {
+    /// A connector for the proxy at `proxy`, such as `"proxy.example:1080"`.
+    pub fn new(proxy: impl ToEndpoint) -> io::Result<Self> {
+        Ok(Self {
+            proxy: proxy.to_endpoint()?,
             user_id: String::new(),
-        }
+        })
     }
 
     /// The user id sent to the proxy. Default: empty. Connecting rejects embedded NUL bytes.
@@ -29,15 +29,9 @@ impl Socks4Proxy {
         self.user_id = user_id.into();
         self
     }
-}
 
-impl Connector for Socks4Proxy {
-    async fn connect(
-        &self,
-        target: &Endpoint,
-        previous: Option<Connection>,
-    ) -> io::Result<Connection> {
-        must_be_first("Socks4Proxy", &previous)?;
+    /// The connect request for `target`.
+    fn request(&self, target: &Endpoint) -> io::Result<Vec<u8>> {
         if self.user_id.contains('\0') || target.host().contains('\0') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -67,20 +61,40 @@ impl Connector for Socks4Proxy {
                 request.push(0);
             }
         }
+        Ok(request)
+    }
+}
 
-        let mut stream = connect_to_proxy(&self.proxy).await?;
-        stream.write_all(&request).await?;
-        let reply_filter = FixedSizeFilter::new(8, |reply: Bytes| Ok(reply));
-        let (reply, rest) = read_reply(&mut stream, Box::new(reply_filter)).await?;
-        match reply[1] {
-            0x5a => Ok(finish(stream, rest)),
-            0x5b => Err(refused("the SOCKS4 proxy rejected the request".into())),
-            0x5c | 0x5d => Err(refused(
-                "the SOCKS4 proxy could not verify the user id".into(),
-            )),
-            code => Err(refused(format!(
-                "the SOCKS4 proxy replied with unknown code {code:#04x}"
-            ))),
-        }
+impl ProxyConnector for Socks4Connector {
+    fn proxy_endpoint(&self) -> &Endpoint {
+        &self.proxy
+    }
+
+    async fn connect_proxy(
+        &self,
+        target: &Endpoint,
+        connection: Connection,
+    ) -> io::Result<Connection> {
+        let request = self.request(target)?;
+        // The reply is 8 bytes: version, status, then a port and an address to ignore.
+        let reply_filter = FixedSizeFilter::new(8, |reply: Bytes| Ok(reply[1]));
+        let mut connection = ProxyConnection::new(connection, reply_filter);
+        connection.send(&request).await?;
+        handle_response(connection.receive().await?)?;
+        Ok(connection.detach())
+    }
+}
+
+/// Checks the status of the reply.
+fn handle_response(status: u8) -> io::Result<()> {
+    match status {
+        0x5a => Ok(()),
+        0x5b => Err(refused("the SOCKS4 proxy rejected the request".into())),
+        0x5c | 0x5d => Err(refused(
+            "the SOCKS4 proxy could not verify the user id".into(),
+        )),
+        code => Err(refused(format!(
+            "the SOCKS4 proxy replied with unknown code {code:#04x}"
+        ))),
     }
 }

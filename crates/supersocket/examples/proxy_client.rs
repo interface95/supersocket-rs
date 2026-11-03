@@ -4,7 +4,7 @@
 //! cargo run --example proxy_client --features proxy -- 127.0.0.1:1080 example.com:80
 //! ```
 
-use supersocket::{client::Socks5Proxy, prelude::*};
+use supersocket::{client::Socks5Connector, prelude::*};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -14,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     };
     let mut client = EasyClient::builder(LineFilter::default)
-        .proxy(Socks5Proxy::new(proxy.as_str()))
+        .proxy(Socks5Connector::new(proxy.as_str())?)
         .connect(target.as_str())
         .await?;
     let host = target

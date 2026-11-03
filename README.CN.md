@@ -301,14 +301,20 @@ sender.close().await; // 先把队列里的数据发完，最多等 close_timeou
 
 ```rust
 EasyClient::builder(LineFilter::default)
-    .proxy(Socks5Proxy::new("127.0.0.1:1080").credentials("user", "secret")) // 需要 "proxy" feature
+    .proxy(Socks5Connector::new("127.0.0.1:1080")?.credentials("user", "secret")) // 需要 "proxy" feature
     .tls(TlsConnector::new()) // 需要 "tls" feature，默认用 Mozilla 根证书校验
     .connect("example.com:443")
     .await?;
 ```
 
-`HttpProxy`（CONNECT 方法）和 `Socks4Proxy`（主机名用 SOCKS4a）用法一样；任何实现了 `Connector` 的类型都可以通过
+`HttpConnector`（CONNECT 方法）和 `Socks4Connector`（主机名用 SOCKS4a）用法一样；任何实现了 `Connector` 的类型都可以通过
 `.connector(...)` 加进来。
+
+代理连接器的结构和 SuperSocket 的 `SuperSocket.Client.Proxy` 一致。`ProxyConnector` 相当于
+`ProxyConnectorBase`：先连上代理（`create_default_connector`，默认是 `TcpConnector`），握手交给
+`connect_proxy`。握手在 `ProxyConnection` 上进行：发送请求，用 pipeline filter 切分代理的回复（SOCKS5
+每一步通过 `next_filter` 切换过滤器），最后 detach 交出连接，代理在回复之后已经发来的数据也会保留。
+其他类型的代理照同样的方式实现 `ProxyConnector` 即可。
 
 `ClientBuilder` 可以留着、也可以克隆，用来重连或者做连接池；协议过滤器每次连接单独创建。
 

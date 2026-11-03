@@ -332,14 +332,22 @@ one opens it, later ones wrap it.
 
 ```rust
 EasyClient::builder(LineFilter::default)
-    .proxy(Socks5Proxy::new("127.0.0.1:1080").credentials("user", "secret")) // feature "proxy"
+    .proxy(Socks5Connector::new("127.0.0.1:1080")?.credentials("user", "secret")) // feature "proxy"
     .tls(TlsConnector::new()) // feature "tls"; Mozilla roots by default
     .connect("example.com:443")
     .await?;
 ```
 
-`HttpProxy` (CONNECT) and `Socks4Proxy` (with SOCKS4a for host names) work the same way, and
-anything implementing `Connector` can be added with `.connector(...)`.
+`HttpConnector` (CONNECT) and `Socks4Connector` (with SOCKS4a for host names) work the same way,
+and anything implementing `Connector` can be added with `.connector(...)`.
+
+The proxy connectors are laid out like SuperSocket's `SuperSocket.Client.Proxy`.
+`ProxyConnector` plays the part of `ProxyConnectorBase`: it opens the connection to the proxy
+(`create_default_connector`, a `TcpConnector` by default) and leaves the handshake to
+`connect_proxy`. The handshake runs on a `ProxyConnection`, which sends requests, cuts the replies
+with a pipeline filter (SOCKS5 switches filters from step to step with `next_filter`) and finally
+detaches the connection, keeping whatever the proxy already sent past its reply. A connector for
+another kind of proxy implements `ProxyConnector` the same way.
 
 A `ClientBuilder` can be kept and cloned to connect again, for reconnecting or a pool; the
 pipeline filter is created for each connection.
