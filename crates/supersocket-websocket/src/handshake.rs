@@ -66,22 +66,7 @@ impl fmt::Display for HeadError {
     }
 }
 
-/// Finds the empty line that ends an HTTP head at the start of `buf` and returns the length of
-/// the head including it. Lines may end with `\r\n` or `\n`. The first `searched` bytes were
-/// already searched.
-pub(crate) fn head_length(buf: &[u8], searched: usize) -> Option<usize> {
-    // The end may have begun in the last two bytes searched.
-    let mut start = searched.saturating_sub(2);
-    while let Some(offset) = memchr::memchr(b'\n', &buf[start..]) {
-        let after = start + offset + 1;
-        match &buf[after..] {
-            [b'\n', ..] => return Some(after + 1),
-            [b'\r', b'\n', ..] => return Some(after + 2),
-            _ => start = after,
-        }
-    }
-    None
-}
+pub(crate) use supersocket_proto::head_length;
 
 /// Parses an HTTP head found by [`head_length`].
 pub(crate) fn parse_head(head: &[u8]) -> Result<Head, HeadError> {

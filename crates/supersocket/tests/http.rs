@@ -146,10 +146,19 @@ async fn the_request_decides_about_keep_alive_too() {
     client
         .send(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET / HTTP/1.0\r\n\r\n")
         .await;
-    let (_, _, body) = read_response(&mut client).await;
+    // An HTTP/1.0 client is told that the connection stays open.
+    let (_, headers, body) = read_response(&mut client).await;
     assert_eq!(body, "home");
-    let (_, _, body) = read_response(&mut client).await;
+    assert!(
+        headers.contains(&"Connection: keep-alive".to_owned()),
+        "{headers:?}"
+    );
+    let (_, headers, body) = read_response(&mut client).await;
     assert_eq!(body, "home");
+    assert!(
+        headers.contains(&"Connection: close".to_owned()),
+        "{headers:?}"
+    );
     client.expect_closed().await;
     server.shutdown().await;
 }

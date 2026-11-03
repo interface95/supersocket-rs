@@ -31,9 +31,9 @@
 //! waits for the whole request, body included, before the handler sees it, so pipelined
 //! requests are handled in order. A request or response that says `Connection: close` ends the
 //! connection once the response is sent. The [idle session
-//! timeout](supersocket_server::ServerOptions::idle_session_timeout) is the keep-alive timeout,
-//! and [`max_package_length`](supersocket_server::ServerOptions::max_package_length) limits a
-//! request with its body.
+//! timeout](supersocket_server::ServerOptions::idle_session_timeout) is the keep-alive timeout;
+//! a Server-Sent Events stream counts as active while it sends. [`max_package_length`](
+//! supersocket_server::ServerOptions::max_package_length) limits a request with its body.
 
 mod filter;
 mod request;

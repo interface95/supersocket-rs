@@ -1,5 +1,5 @@
 use bytes::{Buf, BytesMut};
-use supersocket_proto::{PipelineFilter, ProtocolError};
+use supersocket_proto::{PipelineFilter, ProtocolError, head_length};
 
 use crate::{HttpRequest, HttpVersion};
 
@@ -22,7 +22,9 @@ impl Default for HttpOptions {
 /// Cuts a connection into [`HttpRequest`]s: the head, then a body of `Content-Length` bytes or
 /// in chunks (`Transfer-Encoding: chunked`). A request without either has no body. Bodies count
 /// against the server's maximum package length. A malformed request is a protocol error, which
-/// closes the connection.
+/// closes the connection, and so is a request whose body framing is ambiguous, as RFC 9112
+/// requires: `Transfer-Encoding` together with `Content-Length`, a transfer coding that does not
+/// end with `chunked`, or `Content-Length` values that disagree.
 ///
 /// `Expect: 100-continue` is not answered; clients that use it send the body after a short wait.
 #[derive(Debug, Default)]
@@ -80,28 +82,22 @@ impl HttpFilter {
             return Err(ProtocolError::new("the request head is too large"));
         }
         let head = buf.split_to(length);
-        let mut request = parse_head(&head)?;
-        if request.has_token("Transfer-Encoding", "chunked") {
-            self.state = State::Chunked {
-                request,
-                body: BytesMut::new(),
-                phase: Chunk::Size,
-            };
-            return Ok(None);
+        let request = parse_head(&head)?;
+        match body_framing(&request)? {
+            Framing::Chunked => {
+                self.state = State::Chunked {
+                    request,
+                    body: BytesMut::new(),
+                    phase: Chunk::Size,
+                };
+                Ok(None)
+            }
+            Framing::Length(0) => Ok(Some(request)),
+            Framing::Length(length) => {
+                self.state = State::Body { request, length };
+                Ok(None)
+            }
         }
-        let length = match request.header("Content-Length") {
-            Some(value) => value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| ProtocolError::new("invalid Content-Length"))?,
-            None => 0,
-        };
-        if length == 0 {
-            request.body = bytes::Bytes::new();
-            return Ok(Some(request));
-        }
-        self.state = State::Body { request, length };
-        Ok(None)
     }
 
     fn body(
@@ -214,20 +210,54 @@ impl PipelineFilter for HttpFilter {
     }
 }
 
-/// Finds the empty line that ends a request head at the start of `buf` and returns the length of
-/// the head including it. Lines may end with `\r\n` or `\n`. The first `searched` bytes were
-/// already searched.
-fn head_length(buf: &[u8], searched: usize) -> Option<usize> {
-    let mut start = searched.saturating_sub(2);
-    while let Some(offset) = memchr::memchr(b'\n', &buf[start..]) {
-        let after = start + offset + 1;
-        match &buf[after..] {
-            [b'\n', ..] => return Some(after + 1),
-            [b'\r', b'\n', ..] => return Some(after + 2),
-            _ => start = after,
+/// How the body of a request is delimited.
+enum Framing {
+    Chunked,
+    Length(usize),
+}
+
+/// Decides how the body is framed, as RFC 9112 section 6 says: `Transfer-Encoding` must end
+/// with `chunked` and must not come with `Content-Length`, since a disagreement between the two
+/// is what request smuggling exploits, and every `Content-Length` value must be the same.
+fn body_framing(request: &HttpRequest) -> Result<Framing, ProtocolError> {
+    let mut encodings = header_values(request, "Transfer-Encoding").peekable();
+    if encodings.peek().is_some() {
+        if request.header("Content-Length").is_some() {
+            return Err(ProtocolError::new(
+                "a request may not have both Transfer-Encoding and Content-Length",
+            ));
         }
+        if !encodings
+            .last()
+            .is_some_and(|encoding| encoding.eq_ignore_ascii_case("chunked"))
+        {
+            return Err(ProtocolError::new(
+                "unsupported Transfer-Encoding: only chunked is understood",
+            ));
+        }
+        return Ok(Framing::Chunked);
     }
-    None
+    let mut length = None;
+    for value in header_values(request, "Content-Length") {
+        let parsed = value
+            .parse::<usize>()
+            .map_err(|_| ProtocolError::new("invalid Content-Length"))?;
+        if length.is_some_and(|length| length != parsed) {
+            return Err(ProtocolError::new("conflicting Content-Length values"));
+        }
+        length = Some(parsed);
+    }
+    Ok(Framing::Length(length.unwrap_or(0)))
+}
+
+/// The comma-separated values of every header field called `name`.
+fn header_values<'a>(request: &'a HttpRequest, name: &'a str) -> impl Iterator<Item = &'a str> {
+    request
+        .headers()
+        .filter(move |(field, _)| field.eq_ignore_ascii_case(name))
+        .flat_map(|(_, value)| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// Takes one line off the front of `buf`, without its line break; `None` when it is incomplete.
@@ -386,6 +416,36 @@ mod tests {
         let mut filter = HttpFilter::new(HttpOptions { max_head_size: 16 });
         let mut buf = BytesMut::from(&b"GET /a/very/long/path HTTP/1.1\r\n"[..]);
         assert!(filter.filter(&mut buf).is_err());
+    }
+
+    #[test]
+    fn ambiguous_body_framing_is_rejected() {
+        for head in [
+            // Both ways of framing the body: what request smuggling relies on.
+            &b"POST / HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+                [..],
+            // A transfer encoding that does not end with chunked leaves the length unknown.
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\nxxxx",
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n",
+            // Lengths that disagree.
+            b"POST / HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\nxxxxx",
+            b"POST / HTTP/1.1\r\nContent-Length: 4, 5\r\n\r\nxxxxx",
+        ] {
+            let mut filter = HttpFilter::default();
+            let mut buf = BytesMut::from(head);
+            assert!(filter.filter(&mut buf).is_err(), "{head:?}");
+        }
+        // Repeated identical lengths are fine, as is gzip followed by chunked.
+        let requests = feed(&[
+            b"POST / HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok",
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+        ]);
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.body_text() == Some("ok"))
+        );
     }
 
     #[test]

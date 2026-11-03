@@ -3,7 +3,7 @@ use std::{fmt, future::Future, io, time::Duration};
 use bytes::BytesMut;
 use supersocket_server::{CloseReason, Session, SessionState};
 
-use crate::{HttpRequest, HttpResponse};
+use crate::{HttpRequest, HttpResponse, HttpVersion};
 
 /// Sending HTTP responses on a [`Session`].
 pub trait HttpSessionExt {
@@ -68,7 +68,12 @@ impl<S: SessionState> HttpSessionExt for Session<S> {
 
     async fn respond(&self, request: &HttpRequest, response: HttpResponse) -> io::Result<()> {
         let keep_alive = request.keep_alive() && response.is_keep_alive();
-        self.send_response(response.keep_alive(keep_alive)).await
+        let mut response = response.keep_alive(keep_alive);
+        // An HTTP/1.0 client only reuses the connection when told so.
+        if keep_alive && request.version() == HttpVersion::Http10 {
+            response = response.header("Connection", "keep-alive");
+        }
+        self.send_response(response).await
     }
 
     async fn start_sse(&self, options: SseOptions) -> io::Result<SseWriter<S>> {
@@ -94,9 +99,14 @@ impl<S: SessionState> HttpSessionExt for Session<S> {
             let writer = writer.clone();
             tokio::spawn(async move {
                 loop {
+                    // A comment is due once nothing was sent for a whole interval.
+                    let due = writer.session.last_sent_time() + interval;
                     tokio::select! {
                         () = writer.session.closed() => return,
-                        () = tokio::time::sleep(interval) => {}
+                        () = tokio::time::sleep_until(due.into()) => {}
+                    }
+                    if writer.session.last_sent_time() + interval > std::time::Instant::now() {
+                        continue;
                     }
                     if writer.comment("keep-alive").await.is_err() {
                         return;

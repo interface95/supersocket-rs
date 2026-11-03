@@ -21,6 +21,7 @@
 mod error;
 mod filter;
 mod filters;
+mod head;
 mod package;
 
 pub use bytes;
@@ -34,4 +35,5 @@ pub use filters::{
     BeginEndMarkFilter, CommandLineFilter, Decoder, FixedHeaderFilter, FixedHeaderProtocol,
     FixedSizeFilter, LineFilter, TerminatorFilter, TransparentFilter,
 };
+pub use head::head_length;
 pub use package::{CommandPackage, TextPackage};
