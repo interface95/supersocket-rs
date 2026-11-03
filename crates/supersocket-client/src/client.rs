@@ -17,8 +17,8 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    BoxStream, Connection, Connector, ConnectorChain, TcpConnector, ToEndpoint,
-    connector::DynConnector,
+    BoxStream, Connection, Connector, TcpConnector, ToEndpoint,
+    connector::{DynConnector, connect_through},
 };
 
 /// Options of an [`EasyClient`].
@@ -121,25 +121,17 @@ impl<P: Send + 'static> ClientBuilder<P> {
         self
     }
 
-    /// The chain the client connects through: the proxy or the TCP connector, then the layers,
-    /// like `EasyClient.GetConnector`.
-    fn connector_chain(&self) -> ConnectorChain {
-        let first: Arc<dyn DynConnector> = match &self.proxy {
-            Some(proxy) => proxy.clone(),
-            None => Arc::new(self.tcp.clone()),
-        };
-        let mut connectors = Vec::with_capacity(1 + self.layers.len());
-        connectors.push(first);
-        connectors.extend(self.layers.iter().cloned());
-        ConnectorChain { connectors }
-    }
-
     /// Connects to `target`, which is a `"host:port"` string, a socket address or an
     /// [`Endpoint`](crate::Endpoint).
     pub async fn connect(&self, target: impl ToEndpoint) -> io::Result<EasyClient<P>> {
         let target = target.to_endpoint()?;
-        let chain = self.connector_chain();
-        let connecting = Connector::connect(&chain, &target, None);
+        // The proxy or the TCP connector, then the layers, like `EasyClient.GetConnector`.
+        let first: &dyn DynConnector = match &self.proxy {
+            Some(proxy) => &**proxy,
+            None => &self.tcp,
+        };
+        let layers = self.layers.iter().map(|layer| &**layer);
+        let connecting = connect_through(std::iter::once(first).chain(layers), &target, None);
         let connection = tokio::time::timeout(self.options.connect_timeout, connecting)
             .await
             .map_err(|_| {

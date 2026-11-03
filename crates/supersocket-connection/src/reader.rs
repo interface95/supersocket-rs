@@ -206,6 +206,12 @@ where
         &mut self.reader
     }
 
+    /// The bytes received but not consumed yet. Empty right after a package means the peer
+    /// sent nothing past it, which a handshake may require.
+    pub fn buffered(&self) -> &[u8] {
+        &self.buf
+    }
+
     /// Returns the underlying reader and the bytes received but not consumed yet.
     pub fn into_parts(self) -> (R, BytesMut) {
         (self.reader, self.buf)

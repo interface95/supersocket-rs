@@ -138,8 +138,9 @@ stored as a trait object has a `pub(crate) Dyn*` twin returning `BoxFuture` with
 (`DynMiddleware`, `DynStreamLayer`, `DynListener`, `DynPackageHandler`, `DynConnector`). Adding a
 method to the public trait means adding it to the twin too. `ProxyConnector` has no twin: a blanket
 impl makes every `ProxyConnector` a `Connector`. `ConnectorChain` and `ClientBuilder` store
-connectors as `Arc<dyn DynConnector>`; inside the crate, call `Connector::connect(&x, ..)` in full,
-since both traits name the method `connect`.
+connectors as `Arc<dyn DynConnector>` and both walk them with `connector::connect_through`; inside
+the crate, call `Connector::connect(&x, ..)` / `DynConnector::connect(x, ..)` in full, since both
+traits name the method `connect`.
 
 ### Protocol switching
 
@@ -166,13 +167,14 @@ sends do not wait for each other; control frames bypass it.
 
 `ClientBuilder` holds a filter factory and a `Connector` chain: the first connector
 (`TcpConnector` or a proxy) opens the stream, later ones (`TlsConnector`, `GzipConnector`,
-custom) wrap it. `connect` builds a `ConnectorChain` from them (SuperSocket's `ConnectorBase` +
-`BuildConnectors`): the chain is itself a `Connector`, so `ProxyConnector::create_default_connector`
-can return one. Proxy connectors mirror SuperSocket's `SuperSocket.Client.Proxy`: each implements
-`ProxyConnector` (`ProxyConnectorBase`), whose blanket `Connector` impl opens the connection to the
-proxy and calls `connect_proxy`; the handshake runs on a `ProxyConnection` (one `PackageReader`
-whose filter switches per step via `next_filter`), and `detach` pushes leftover bytes back with
-`Rewind`. The client reuses `PackageReader` and `SendQueue`, so package limits, batching and
+custom) wrap it. `connect` walks them with the same `connect_through` that `ConnectorChain` uses
+(SuperSocket's `ConnectorBase` + `BuildConnectors`); the chain is itself a `Connector`, so
+`ProxyConnector::create_default_connector` can return one. Proxy connectors mirror SuperSocket's
+`SuperSocket.Client.Proxy`: each implements `ProxyConnector` (`ProxyConnectorBase`), whose blanket
+`Connector` impl runs `validate_target` (no dial for a target the protocol cannot carry), opens
+the connection to the proxy and calls `connect_proxy`; the handshake runs on a `ProxyConnection`
+(one `PackageReader` whose filter switches per step via `next_filter`), and `detach` pushes
+leftover bytes back with `Rewind`. The client reuses `PackageReader` and `SendQueue`, so package limits, batching and
 back-pressure behave like a server session.
 
 ### Configuration

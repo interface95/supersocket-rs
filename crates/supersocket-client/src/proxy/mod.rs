@@ -26,7 +26,8 @@ use crate::{BoxStream, Connection, Connector, Endpoint, TcpConnector, connector:
 
 /// The base of the proxy connectors, like SuperSocket's `ProxyConnectorBase`.
 ///
-/// Every `ProxyConnector` is a [`Connector`]: connecting opens a connection to
+/// Every `ProxyConnector` is a [`Connector`]: connecting checks the target with
+/// [`validate_target`](Self::validate_target), opens a connection to
 /// [`proxy_endpoint`](Self::proxy_endpoint) with the connector from
 /// [`create_default_connector`](Self::create_default_connector), then calls
 /// [`connect_proxy`](Self::connect_proxy) to ask the proxy for the target. Like the other
@@ -68,8 +69,16 @@ pub trait ProxyConnector: Send + Sync + 'static {
     /// Where the proxy listens.
     fn proxy_endpoint(&self) -> &Endpoint;
 
+    /// Checks `target` before the proxy is dialed, so a target the proxy protocol cannot carry
+    /// is refused without opening a connection. Default: accepts every target.
+    fn validate_target(&self, target: &Endpoint) -> io::Result<()> {
+        let _ = target;
+        Ok(())
+    }
+
     /// The connector that opens the connection to the proxy, like `CreateDefaultConnector`.
-    /// Default: a [`TcpConnector`].
+    /// Default: a [`TcpConnector`]; a [`ConnectorChain`](crate::ConnectorChain) of TCP and TLS
+    /// reaches an HTTPS proxy.
     fn create_default_connector(&self) -> impl Connector {
         TcpConnector::new()
     }
@@ -90,13 +99,20 @@ impl<T: ProxyConnector> Connector for T {
         target: &Endpoint,
         previous: Option<Connection>,
     ) -> io::Result<Connection> {
-        must_be_first(any::type_name::<T>(), &previous)?;
-        let connection = self
-            .create_default_connector()
-            .connect(self.proxy_endpoint(), None)
-            .await?;
+        must_be_first(short_type_name::<T>(), &previous)?;
+        self.validate_target(target)?;
+        let connector = self.create_default_connector();
+        let connection = Connector::connect(&connector, self.proxy_endpoint(), None).await?;
         self.connect_proxy(target, connection).await
     }
+}
+
+/// The name of `T` without its module path, for messages; `type_name` is for diagnostics only,
+/// so nothing depends on the exact text.
+fn short_type_name<T>() -> &'static str {
+    let name = any::type_name::<T>();
+    let base = name.split('<').next().unwrap_or(name);
+    base.rsplit("::").next().unwrap_or(base)
 }
 
 /// Limits for reading a proxy's replies, which are small.
@@ -144,6 +160,20 @@ impl<P: Send + 'static> ProxyConnection<P> {
                 "the proxy closed the connection",
             )
         })
+    }
+
+    /// Receives a reply in the middle of the handshake, where the proxy must wait for the next
+    /// request: anything it sent past the reply is an error. Use [`receive`](Self::receive) for
+    /// the last reply, which data from the target may follow.
+    pub async fn receive_step(&mut self) -> io::Result<P> {
+        let reply = self.receive().await?;
+        if !self.reader.buffered().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the proxy sent unexpected data during the handshake",
+            ));
+        }
+        Ok(reply)
     }
 
     /// Ends the handshake and returns the connection, like `DetachAsync`. Whatever the proxy sent
@@ -281,6 +311,32 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("Socks5Connector"), "{error}");
+    }
+
+    #[test]
+    fn short_type_names_leave_out_the_path() {
+        assert_eq!(short_type_name::<Socks5Connector>(), "Socks5Connector");
+        assert_eq!(short_type_name::<Vec<HttpConnector>>(), "Vec");
+    }
+
+    #[tokio::test]
+    async fn invalid_targets_are_refused_before_the_proxy_is_dialed() {
+        // Nothing listens on port 1, so dialing would fail with a different error.
+        let target = Endpoint::new("example.com:443 HTTP/1.1\r\nX-Injected: 1\r\nX", 80);
+        let connector = HttpConnector::new("127.0.0.1:1").unwrap();
+        let error = Connector::connect(&connector, &target, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+    }
+
+    #[tokio::test]
+    async fn data_past_a_handshake_reply_is_an_error() {
+        use supersocket_proto::LineFilter;
+
+        let (connection, _proxy) = in_memory(b"OK\r\nextra").await;
+        let mut connection = ProxyConnection::new(connection, LineFilter::default());
+        let error = connection.receive_step().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

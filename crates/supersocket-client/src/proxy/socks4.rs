@@ -70,6 +70,10 @@ impl ProxyConnector for Socks4Connector {
         &self.proxy
     }
 
+    fn validate_target(&self, target: &Endpoint) -> io::Result<()> {
+        self.request(target).map(drop)
+    }
+
     async fn connect_proxy(
         &self,
         target: &Endpoint,

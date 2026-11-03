@@ -52,14 +52,9 @@ impl Socks5Connector {
         }
     }
 
-    /// Checks a reply of the handshake.
-    fn handle_response(
-        &self,
-        response: &Socks5Pack,
-        step: Step,
-        target: &Endpoint,
-    ) -> io::Result<()> {
-        match step {
+    /// Checks a reply of the handshake, according to the step that produced it.
+    fn handle_response(&self, response: &Socks5Pack, target: &Endpoint) -> io::Result<()> {
+        match response.step {
             Step::Handshake => {
                 if response.version != VERSION {
                     return Err(io::Error::new(
@@ -114,6 +109,10 @@ impl ProxyConnector for Socks5Connector {
         &self.proxy
     }
 
+    fn validate_target(&self, target: &Endpoint) -> io::Result<()> {
+        endpoint_request(target).map(drop)
+    }
+
     async fn connect_proxy(
         &self,
         target: &Endpoint,
@@ -123,19 +122,21 @@ impl ProxyConnector for Socks5Connector {
         let mut connection =
             ProxyConnection::new(connection, Socks5AuthFilter::new(Step::Handshake));
 
+        // The proxy must wait for the next request after the greeting and the authentication
+        // replies, so anything it sends past them is a violation.
         connection.send(self.handshake_request()).await?;
-        let response = connection.receive().await?;
-        self.handle_response(&response, Step::Handshake, target)?;
+        let response = connection.receive_step().await?;
+        self.handle_response(&response, target)?;
 
         if let (USERNAME_PASSWORD, Some(credentials)) = (response.status, &self.credentials) {
             connection.send(&password_request(credentials)?).await?;
-            let response = connection.receive().await?;
-            self.handle_response(&response, Step::Authentication, target)?;
+            let response = connection.receive_step().await?;
+            self.handle_response(&response, target)?;
         }
 
         connection.send(&endpoint_request).await?;
         let response = connection.receive().await?;
-        self.handle_response(&response, Step::Connect, target)?;
+        self.handle_response(&response, target)?;
         if let Some((address, port)) = &response.bound {
             tracing::debug!(
                 proxy = %self.proxy,
@@ -202,9 +203,11 @@ fn too_long(what: &str) -> io::Error {
     )
 }
 
-/// A reply from the proxy, like SuperSocket's `Socks5Pack`.
+/// A reply from the proxy, like SuperSocket's `Socks5Pack`, stamped by the filter with the step
+/// it belongs to, so the connector cannot read it as the reply to another step.
 #[derive(Debug)]
 struct Socks5Pack {
+    step: Step,
     version: u8,
     status: u8,
     /// The address and port the proxy connected from; only in the reply to the connect request.
@@ -251,6 +254,7 @@ impl PipelineFilter for Socks5AuthFilter {
         }
         let reply = buf.split_to(2);
         let pack = Socks5Pack {
+            step: self.step,
             version: reply[0],
             status: reply[1],
             bound: None,
@@ -303,6 +307,7 @@ impl FixedHeaderProtocol for ConnectReply {
             _ => Socks5Address::Domain(String::from_utf8_lossy(&address[1..]).into_owned()),
         };
         Ok(Socks5Pack {
+            step: Step::Connect,
             version: reply[0],
             status: reply[1],
             bound: Some((address, u16::from_be_bytes([port[0], port[1]]))),
@@ -336,6 +341,11 @@ mod tests {
         .await;
         let statuses: Vec<_> = replies.iter().map(|reply| reply.status).collect();
         assert_eq!(statuses, [2, 0, 0]);
+        let steps: Vec<_> = replies.iter().map(|reply| reply.step).collect();
+        assert_eq!(
+            steps,
+            [Step::Handshake, Step::Authentication, Step::Connect]
+        );
         let ip = Socks5Address::Ip(Ipv4Addr::new(10, 0, 0, 1).into());
         assert_eq!(replies[2].bound, Some((ip, 8080)));
 
@@ -348,6 +358,18 @@ mod tests {
         assert_eq!(replies.len(), 2);
         let domain = Socks5Address::Domain("localhost".into());
         assert_eq!(replies[1].bound, Some((domain, 80)));
+    }
+
+    #[tokio::test]
+    async fn data_past_the_greeting_reply_is_a_violation() {
+        // A well-formed connect reply sent before the request must not count as success.
+        let (connection, _proxy) = in_memory(&[5, 0, 5, 0, 0, 1, 127, 0, 0, 1, 0, 80]).await;
+        let error = Socks5Connector::new("127.0.0.1:1")
+            .unwrap()
+            .connect_proxy(&Endpoint::new("example.com", 80), connection)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     }
 
     #[tokio::test]

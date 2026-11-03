@@ -331,6 +331,40 @@ async fn socks4_proxy_connects_by_address_and_by_host_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_targets_are_refused_before_the_proxy_is_dialed() {
+    // Nothing listens here any more, so dialing the proxy would fail differently.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = listener.local_addr().unwrap();
+    drop(listener);
+    let builder = EasyClient::builder(LineFilter::default);
+    let http = builder
+        .clone()
+        .proxy(HttpConnector::new(proxy).unwrap())
+        .connect(Endpoint::new("example.com:443 HTTP/1.1\r\nX", 80))
+        .await;
+    let socks4_nul = builder
+        .clone()
+        .proxy(Socks4Connector::new(proxy).unwrap().user_id("alice\0bob"))
+        .connect(Endpoint::new("example.com", 80))
+        .await;
+    let socks4_ipv6 = builder
+        .clone()
+        .proxy(Socks4Connector::new(proxy).unwrap())
+        .connect(Endpoint::new("::1", 80))
+        .await;
+    let socks5_long = builder
+        .proxy(Socks5Connector::new(proxy).unwrap())
+        .connect(Endpoint::new("a".repeat(256), 80))
+        .await;
+    for result in [http, socks4_nul, socks4_ipv6, socks5_long] {
+        let Err(error) = result else {
+            panic!("the target is invalid")
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn socks4_rejects_nul_fields_without_sending_anything() {
     for (user, host) in [
         ("alice\0different.example\0", "intended.example"),

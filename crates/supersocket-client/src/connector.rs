@@ -111,10 +111,30 @@ impl<C: Connector> DynConnector for C {
 /// chain; a [`ProxyConnector`](crate::ProxyConnector) can return one from
 /// `create_default_connector` to reach the proxy through TLS.
 ///
-/// ```no_run
-/// use supersocket_client::{ConnectorChain, TcpConnector, TlsConnector};
+/// With the `tls` feature, `ConnectorChain::new(TcpConnector::new()).then(TlsConnector::new())`
+/// is the chain to an HTTPS proxy. Any wrapping connector works the same way:
 ///
-/// let chain = ConnectorChain::new(TcpConnector::new()).then(TlsConnector::new());
+/// ```
+/// use std::io;
+///
+/// use supersocket_client::{Connection, Connector, ConnectorChain, Endpoint, TcpConnector};
+///
+/// /// Logs every connection that the chain so far has made.
+/// struct Logged;
+///
+/// impl Connector for Logged {
+///     async fn connect(
+///         &self,
+///         target: &Endpoint,
+///         previous: Option<Connection>,
+///     ) -> io::Result<Connection> {
+///         let connection = previous.expect("Logged wraps a connection");
+///         println!("connected to {target} via {:?}", connection.peer_addr());
+///         Ok(connection)
+///     }
+/// }
+///
+/// let chain = ConnectorChain::new(TcpConnector::new()).then(Logged);
 /// ```
 #[derive(Clone)]
 pub struct ConnectorChain {
@@ -142,16 +162,29 @@ impl Connector for ConnectorChain {
         target: &Endpoint,
         previous: Option<Connection>,
     ) -> io::Result<Connection> {
-        let (first, rest) = self
-            .connectors
-            .split_first()
-            .expect("a chain always has a first connector");
-        let mut connection = first.connect(target, previous).await?;
-        for connector in rest {
-            connection = connector.connect(target, Some(connection)).await?;
-        }
-        Ok(connection)
+        let connectors = self.connectors.iter().map(|connector| &**connector);
+        connect_through(connectors, target, previous).await
     }
+}
+
+/// Runs `connectors` one after another: the first receives `previous`, each later one the
+/// connection made so far, and the first error ends the chain. Shared by [`ConnectorChain`] and
+/// [`ClientBuilder`](crate::ClientBuilder), which walks its connectors without building a chain.
+pub(crate) async fn connect_through<'a>(
+    connectors: impl Iterator<Item = &'a dyn DynConnector> + Send,
+    target: &Endpoint,
+    previous: Option<Connection>,
+) -> io::Result<Connection> {
+    let mut connection = previous;
+    for connector in connectors {
+        connection = Some(DynConnector::connect(connector, target, connection).await?);
+    }
+    connection.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no connector opened the connection",
+        )
+    })
 }
 
 impl fmt::Debug for ConnectorChain {

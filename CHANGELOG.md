@@ -68,9 +68,12 @@ The first release.
   the connection to the proxy and leaves the handshake to `connect_proxy`; handshakes run on a
   `ProxyConnection` that cuts replies with pipeline filters and detaches the connection at the
   end. SOCKS5 follows the method the proxy chose, also when it skips the offered authentication.
-  `PackageReader::get_mut` writes to the stream between packages.
+  `validate_target` refuses a target the protocol cannot carry before the proxy is dialed, and
+  `ProxyConnection::receive_step` rejects data a proxy sends ahead of the next request.
+  `PackageReader::get_mut` writes to the stream between packages, `buffered` shows what is read
+  ahead.
 - `ConnectorChain` runs connectors one after another as one `Connector`, like SuperSocket's
-  `ConnectorBase` and `BuildConnectors`; `ClientBuilder` connects through one, and a
+  `ConnectorBase` and `BuildConnectors`; `ClientBuilder` connects the same way, and a
   `ProxyConnector` can return one from `create_default_connector` to reach a proxy through TLS.
 - `ClientSender::send_with`, `try_send_with` and `send_fmt`.
 
