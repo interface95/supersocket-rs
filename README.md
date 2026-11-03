@@ -92,6 +92,8 @@ cargo run --example websocket_chat --features websocket
 cargo run --example websocket_client --features websocket,client   # with websocket_echo_server running
 cargo run --example udp_echo_server --features udp     # nc -u 127.0.0.1 4040
 cargo run --example http_server --features http        # curl -N http://127.0.0.1:8080/events
+cargo run --example switch_protocol    # the first line chooses TEXT or BINARY
+cargo run --example stdio_server       # commands on standard input and output
 ```
 
 ## Guide
@@ -131,7 +133,9 @@ Server::builder(FixedHeaderFilter::<MessageProtocol>::default)
 ```
 
 Anything else implements `PipelineFilter` directly. Returning a filter from `next_filter`
-switches the connection to it, which is how a protocol upgrade works.
+switches the connection to it, which is how a protocol upgrade works. In the
+[`switch_protocol`](crates/supersocket/examples/switch_protocol.rs) example, the first line of a
+connection chooses between a text and a binary protocol for the rest of it.
 
 The decoders of the built-in filters may be closures with state, such as a text encoding. With
 the `codec` feature, `CodecFilter` runs any `tokio_util::codec::Decoder`, such as
@@ -273,6 +277,10 @@ Server::builder(LineFilter::default)
 
 By default the packages of a session are handled one at a time, in order. In concurrent mode up
 to `max_in_flight` packages of a session run at the same time on the runtime's worker threads.
+
+`idle_session_timeout` closes sessions that neither received nor sent anything for that long, so
+a session that only pushes data, such as a Server-Sent Events stream, stays open.
+`session.last_received_time()` and `last_sent_time()` tell the two apart.
 
 ### Accepting connections, limits and shutdown
 
@@ -554,7 +562,9 @@ Listeners are not only TCP. A listener may be a Unix domain socket, from the bui
 config file, and any transport can be a listener of its own by implementing `Listener`, like
 SuperSocket's `IConnectionListener`: its connections are served like the others, within the
 connection limit and the handshake timeout, and `stop_accepting()` stops it. `start()` reports
-where every listener listens as a `ListenAddr`.
+where every listener listens as a `ListenAddr`. A Unix socket file that an earlier run left
+behind is replaced; one that another process still serves is not, and `start()` fails with
+`AddrInUse`. The file is removed again when the listener closes.
 
 ```rust
 Server::builder(LineFilter::default)
@@ -564,9 +574,10 @@ Server::builder(LineFilter::default)
 ```
 
 Connections can also be handed to a running server one by one, such as stdin and stdout joined
-with `tokio::io::join` or a connection an HTTP server upgraded. It becomes a session like the
-others: middleware sees it, it joins the session container and shutting down closes it. A server
-may have no listeners at all.
+with `tokio::io::join`, as in the [`stdio_server`](crates/supersocket/examples/stdio_server.rs)
+example, or a connection an HTTP server upgraded. It becomes a session like the others:
+middleware sees it, it joins the session container and shutting down closes it. A server may
+have no listeners at all.
 
 ```rust
 server.serve_connection(stream, ConnectionInfo::default())?; // no IP addresses on a pipe
@@ -575,8 +586,8 @@ server.serve_connection(stream, ConnectionInfo::default())?; // no IP addresses 
 The other way round, a session can hand its connection back, like SuperSocket's `DetachAsync`:
 `session.detach()` closes the session with `CloseReason::Detached` once what it queued is sent,
 and the returned future yields the raw connection with the bytes read ahead, for another
-protocol or server to take over. Await it from another task: the hand-over happens once the
-handler has returned.
+protocol or server to take over, or `None` when the queued data could not be written. Await it
+from another task: the hand-over happens once the handler has returned.
 
 ```rust
 let detaching = session.detach()?;
@@ -607,6 +618,11 @@ belong together is decided by a `SessionKey`, by default the peer's address, lik
 `IUdpSessionIdentifierProvider`. Peers never say goodbye on UDP, so set `idle_session_timeout`
 to close sessions that went silent.
 
+A task of its own receives the datagrams, so the sessions go on while the server waits for a
+connection slot for a new peer; that peer's first datagram is lost then, as a network would lose
+it. Empty datagrams are ignored, and a reply larger than `max_send_size` (8 KiB by default) goes
+out as several datagrams.
+
 ```rust
 Server::builder(LineFilter::default)
     .on_package(echo)
@@ -619,8 +635,10 @@ Server::builder(LineFilter::default)
 With the `http` feature, `HttpFilter` cuts a connection into `HttpRequest`s, body included,
 with keep-alive and chunked bodies, like SuperSocket's `SuperSocket.Http`. `respond` answers
 with an `HttpResponse` and keeps the connection alive when both sides allow it, and `start_sse`
-opens a Server-Sent Events stream with an optional heartbeat. This is a small HTTP for services
-that speak it next to their own protocol, such as a health endpoint or a push stream, not a web
+opens a Server-Sent Events stream with an optional heartbeat, sent only while nothing else is.
+Requests whose body framing is ambiguous, such as `Transfer-Encoding` together with
+`Content-Length`, are rejected, as RFC 9112 requires. This is a small HTTP for services that
+speak it next to their own protocol, such as a health endpoint or a push stream, not a web
 framework.
 
 ```rust

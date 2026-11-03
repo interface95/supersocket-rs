@@ -32,24 +32,32 @@ The first release.
 - Unix domain socket listeners with `ListenOptions::unix` and `listen_unix`, also from config
   files, and the `Listener` trait with `ServerBuilder::listener` for transports of your own,
   served within the connection limit and stopped by `stop_accepting`. `Server::start` reports
-  where every listener listens as a `ListenAddr`.
+  where every listener listens as a `ListenAddr`. A Unix socket file that another process still
+  serves is not taken over.
 - `Session::detach` hands a connection over to another protocol or server, closing the session
   with `CloseReason::Detached`.
 - `Session::send_with`, `try_send_with` and the `send_fmt!` macro encode straight into the send
   buffer; `send_package` uses it.
 - `ServerStatus` and `SessionStatus`, through `Server::status` and `Session::status`.
+- The idle session timeout counts sends as activity too, so a session that only pushes data,
+  such as a Server-Sent Events stream, is not idle; `Session::last_received_time` and
+  `last_sent_time` tell the two apart.
 - `ServerBuilder::commands_with` dispatches packages of any type to commands through a mapper,
   and with feature `json`, `JsonCommand` wrapped in `Json` runs commands whose body is JSON.
 
 ### UDP (`supersocket-udp`, feature `udp`)
 
 - `UdpListener` serves datagrams as sessions, keyed by a `SessionKey`, by default the peer's
-  address; one socket, a virtual connection per session.
+  address; one socket, a virtual connection per session. A receive task of its own keeps the
+  sessions going while the server waits for a connection slot, replies follow a peer that moved,
+  and replies larger than `max_send_size` go out as several datagrams.
 
 ### HTTP (`supersocket-http`, feature `http`)
 
-- `HttpFilter` cuts connections into `HttpRequest`s with keep-alive and chunked bodies,
-  `HttpResponse` with `HttpSessionExt::respond`, and Server-Sent Events through `SseWriter`.
+- `HttpFilter` cuts connections into `HttpRequest`s with keep-alive and chunked bodies, and
+  rejects requests with ambiguous body framing (RFC 9112); `HttpResponse` with
+  `HttpSessionExt::respond`, which also tells HTTP/1.0 clients when a connection is kept; and
+  Server-Sent Events through `SseWriter`, with a heartbeat while nothing else is sent.
 
 ### Client (`supersocket-client`)
 

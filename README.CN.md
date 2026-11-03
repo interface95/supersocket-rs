@@ -78,6 +78,8 @@ cargo run --example websocket_chat --features websocket
 cargo run --example websocket_client --features websocket,client   # 先运行 websocket_echo_server
 cargo run --example udp_echo_server --features udp     # nc -u 127.0.0.1 4040
 cargo run --example http_server --features http        # curl -N http://127.0.0.1:8080/events
+cargo run --example switch_protocol    # 第一行选择 TEXT 或 BINARY
+cargo run --example stdio_server       # 在标准输入输出上跑命令
 ```
 
 ## 使用说明
@@ -117,6 +119,7 @@ Server::builder(FixedHeaderFilter::<MessageProtocol>::default)
 ```
 
 其他协议直接实现 `PipelineFilter`。在 `next_filter` 里返回另一个过滤器，连接就会切换过去，协议升级就是这么做的。
+[`switch_protocol`](crates/supersocket/examples/switch_protocol.rs) 示例里，连接的第一行决定后面用文本协议还是二进制协议。
 
 内置过滤器的解码函数可以是带状态的闭包，比如带一个文本编码。启用 `codec` feature 后，`CodecFilter` 能把任何
 `tokio_util::codec::Decoder`（比如 `LengthDelimitedCodec`）当协议过滤器用。
@@ -250,6 +253,9 @@ Server::builder(LineFilter::default)
 ```
 
 默认每个会话的包按顺序一个一个处理。并发模式下，一个会话最多同时有 `max_in_flight` 个包在运行时的工作线程上处理。
+
+`idle_session_timeout` 关掉在这段时间里既没收到也没发出任何数据的会话，所以只往外推数据的会话（比如 Server-Sent Events 流）
+不会被当成空闲。`session.last_received_time()` 和 `last_sent_time()` 分别给出两者的时间。
 
 ### 接受连接、上限和关闭
 
@@ -500,7 +506,8 @@ ListenOptions {
 
 监听器不止 TCP。监听器可以是 Unix 域套接字，在 builder 或配置文件里都能配；任何传输层实现 `Listener` 就能成为监听器，
 对应 SuperSocket 的 `IConnectionListener`：它接入的连接和其他连接一样受连接上限和握手超时约束，`stop_accepting()`
-也会停掉它。`start()` 以 `ListenAddr` 的形式报告每个监听器的位置。
+也会停掉它。`start()` 以 `ListenAddr` 的形式报告每个监听器的位置。之前运行留下的 Unix socket 文件会被替换；
+还有别的进程在服务的则不会，`start()` 以 `AddrInUse` 失败。监听器关闭时文件会被删掉。
 
 ```rust
 Server::builder(LineFilter::default)
@@ -509,7 +516,8 @@ Server::builder(LineFilter::default)
     .listener(my_listener)        // 任何实现了 `Listener` 的类型
 ```
 
-连接也可以一个一个交给运行中的服务端，比如用 `tokio::io::join` 拼起来的 stdin/stdout，或者 HTTP 服务端升级后的连接。
+连接也可以一个一个交给运行中的服务端，比如用 `tokio::io::join` 拼起来的 stdin/stdout（见
+[`stdio_server`](crates/supersocket/examples/stdio_server.rs) 示例），或者 HTTP 服务端升级后的连接。
 它会和其他会话一样：经过中间件、进入会话容器、随服务端关闭而关闭。服务端也可以完全不配置监听地址。
 
 ```rust
@@ -517,8 +525,8 @@ server.serve_connection(stream, ConnectionInfo::default())?; // 管道没有 IP 
 ```
 
 反过来，会话也可以把连接交还出来，对应 SuperSocket 的 `DetachAsync`：`session.detach()` 在排队数据发完后以
-`CloseReason::Detached` 关闭会话，返回的 future 给出原始连接和提前读到的字节，交给另一个协议或服务端接管。
-要在别的任务里 await 它：交接发生在处理函数返回之后。
+`CloseReason::Detached` 关闭会话，返回的 future 给出原始连接和提前读到的字节，交给另一个协议或服务端接管；
+排队数据没能写出去时给出 `None`。要在别的任务里 await 它：交接发生在处理函数返回之后。
 
 ```rust
 let detaching = session.detach()?;
@@ -545,6 +553,9 @@ EasyClient::builder(LineFilter::default).connector(GzipConnector)
 之后同一对端的数据报都交给它，会话发出的数据以数据报形式回到对端。哪些数据报属于同一个会话由 `SessionKey` 决定，默认按对端地址，
 对应 SuperSocket 的 `IUdpSessionIdentifierProvider`。UDP 上对端不会说再见，所以要设置 `idle_session_timeout` 关掉沉默的会话。
 
+数据报由一个单独的任务接收，所以服务端为新对端等待连接名额时，已有会话照常收发；那个新对端的第一个数据报这时会丢掉，
+就像网络丢包一样。空数据报会被忽略，超过 `max_send_size`（默认 8 KiB）的回复会拆成多个数据报发出。
+
 ```rust
 Server::builder(LineFilter::default)
     .on_package(echo)
@@ -556,7 +567,8 @@ Server::builder(LineFilter::default)
 
 开启 `http` feature 后，`HttpFilter` 把连接切成一个个 `HttpRequest`（含正文），支持 keep-alive 和分块正文，对应 SuperSocket 的
 `SuperSocket.Http`。`respond` 用 `HttpResponse` 应答，双方都允许时保持连接；`start_sse` 打开一条 Server-Sent Events 流，
-可以带心跳。这是给在自己协议之外还要提供健康检查、推送流之类接口的服务用的小型 HTTP，不是 Web 框架。
+可以带心跳，心跳只在没有其他数据发出时才发。正文定界有歧义的请求（比如同时带 `Transfer-Encoding` 和 `Content-Length`）
+按 RFC 9112 的要求拒绝。这是给在自己协议之外还要提供健康检查、推送流之类接口的服务用的小型 HTTP，不是 Web 框架。
 
 ```rust
 use supersocket::http::{HttpFilter, HttpResponse, HttpSessionExt, SseEvent, SseOptions};

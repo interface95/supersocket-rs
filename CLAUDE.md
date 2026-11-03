@@ -72,12 +72,12 @@ Bottom-up dependency order. Each crate's `lib.rs` doc comment is the best short 
 
 | Crate | Role |
 |---|---|
-| `supersocket-proto` | `PipelineFilter` trait, built-in filters, `TextPackage`/`CommandPackage`, `ProtocolError`. No tokio dependency. |
+| `supersocket-proto` | `PipelineFilter` trait, built-in filters, `TextPackage`/`CommandPackage`, `ProtocolError`, `head_length` (shared by the WebSocket handshake and HTTP). No tokio dependency. |
 | `supersocket-connection` | Shared by server and client: `PackageReader` (reads and cuts packages, holds no buffer while idle), `SendQueue` (batched writes, back-pressure, `try_send`), `catch_panic`, `Rewind`, gzip. |
 | `supersocket-server` | `Server`/`ServerBuilder`, `Session`, commands, middleware, `StreamLayer`, options and config loading, PROXY protocol, TLS. |
 | `supersocket-client` | `EasyClient` with a `Connector` chain (TCP or proxy first, then TLS, gzip, custom). |
 | `supersocket-websocket` | RFC 6455 server on `supersocket-server`, client on `supersocket-client`, permessage-deflate, fragmented sending. |
-| `supersocket-udp` | `UdpListener`: a `Listener` that serves datagrams as sessions keyed by a `SessionKey`. |
+| `supersocket-udp` | `UdpListener`: a `Listener` that serves datagrams as sessions keyed by a `SessionKey`. A receive task of its own demultiplexes datagrams, so live sessions never depend on the server accepting. |
 | `supersocket-http` | HTTP/1.1: `HttpFilter`, `HttpResponse`, keep-alive, Server-Sent Events. |
 | `supersocket` | Facade: re-exports, `prelude`, feature forwarding. **All examples and integration tests live here.** |
 | `tools/bench` | Load generator, `publish = false`. |
@@ -94,8 +94,9 @@ feature needs an entry there and in the feature list in `crates/supersocket/src/
 TLS, with stream layers, Unix socket, `Server::serve_connection`, custom `Listener`) has its own
 `serve_*` entry so a task carries only the state it needs; all funnel into `start` →
 `run_session`. Listeners from the options are `Endpoint`s (TCP or Unix) bound in `Server::start`
-and driven by `accept_loop`; custom `Listener`s run in `custom_accept_loop` and feed
-`serve_stream`:
+and driven by `accept_loop`; TCP with stream layers and Unix sockets share `serve_endpoint` for
+the PROXY header, the accept hook and TLS. Custom `Listener`s run in `custom_accept_loop` and
+feed `serve_stream`:
 
 1. `accept`: the `on_accept` hook (before TLS, for cheap rejection), session id, tracing span,
    and the `handshake_timeout` deadline starts.
@@ -118,6 +119,10 @@ and driven by `accept_loop`; custom `Listener`s run in `custom_accept_loop` and 
    unwinds. A session closed with `CloseReason::Detached` (`Session::detach`) skips the goodbye,
    keeps the transport open and hands reader, writer and read-ahead bytes to the `Detaching`
    future instead.
+
+Activity: received data (`Session::touch` in the read loop) and every successful send update
+`last_received_time` / `last_sent_time`. The idle session timeout uses the later of the two; the
+WebSocket pong timeout uses only the received one.
 
 Every application callback (handlers, commands, command filters, middleware, state hooks,
 filter and state construction) runs under `catch_panic` / `catch_panic_sync`: a panic becomes
