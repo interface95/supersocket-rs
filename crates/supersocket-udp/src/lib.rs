@@ -95,18 +95,27 @@ const QUEUE_CAPACITY: usize = 64;
 
 /// A UDP socket that serves datagrams as sessions; see the [crate] documentation. Add it
 /// to a server with [`ServerBuilder::listener`](supersocket_server::ServerBuilder::listener).
+///
+/// Once the server accepts from it, a task of its own receives the datagrams and delivers them
+/// to their sessions, so that the sessions go on while the server waits for a connection slot
+/// for a new one. A new session that finds the server busy loses its first datagram, as a
+/// network would lose it.
 pub struct UdpListener<K: SessionKey = ByAddress> {
     socket: Arc<UdpSocket>,
     local_addr: SocketAddr,
-    keying: K,
+    /// Taken by the receive task when it starts.
+    keying: Option<K>,
     sessions: Arc<Sessions<K::Key>>,
-    buf: Vec<u8>,
+    max_datagram_size: usize,
     queue_capacity: usize,
     send_size: usize,
-    /// Tells sessions with the same key apart, so that a session that ends removes only its own
-    /// entry.
-    next_generation: u64,
+    /// The sessions the receive task opened, once it runs.
+    opened: Option<mpsc::Receiver<(BoxStream, ConnectionInfo)>>,
+    receiving: Option<tokio::task::AbortHandle>,
 }
+
+/// How many new sessions may wait for the server to accept them.
+const OPENED_CAPACITY: usize = 64;
 
 /// The sessions by key, shared with their streams so that a stream can remove its own session.
 struct Sessions<K> {
@@ -134,39 +143,41 @@ impl UdpListener {
         Ok(Self {
             socket: Arc::new(socket),
             local_addr,
-            keying: ByAddress,
+            keying: Some(ByAddress),
             sessions: Arc::new(Sessions {
                 map: Mutex::new(HashMap::new()),
             }),
-            buf: vec![0; MAX_DATAGRAM_SIZE],
+            max_datagram_size: MAX_DATAGRAM_SIZE,
             queue_capacity: QUEUE_CAPACITY,
             send_size: DEFAULT_SEND_SIZE,
-            next_generation: 0,
+            opened: None,
+            receiving: None,
         })
     }
 }
 
 impl<K: SessionKey> UdpListener<K> {
     /// Decides which session a datagram belongs to with `keying` instead of the peer's address.
-    pub fn keyed_by<N: SessionKey>(self, keying: N) -> UdpListener<N> {
+    pub fn keyed_by<N: SessionKey>(mut self, keying: N) -> UdpListener<N> {
         UdpListener {
-            socket: self.socket,
+            socket: self.socket.clone(),
             local_addr: self.local_addr,
-            keying,
+            keying: Some(keying),
             sessions: Arc::new(Sessions {
                 map: Mutex::new(HashMap::new()),
             }),
-            buf: self.buf,
+            max_datagram_size: self.max_datagram_size,
             queue_capacity: self.queue_capacity,
             send_size: self.send_size,
-            next_generation: 0,
+            opened: None,
+            receiving: self.receiving.take(),
         }
     }
 
     /// The largest datagram to receive; longer ones are cut off. Default: 64 KiB, the most UDP
     /// carries.
     pub fn max_datagram_size(mut self, size: usize) -> Self {
-        self.buf = vec![0; size.max(1)];
+        self.max_datagram_size = size.max(1);
         self
     }
 
@@ -194,6 +205,27 @@ impl<K: SessionKey> UdpListener<K> {
     pub fn session_count(&self) -> usize {
         self.sessions.map.lock().unwrap().len()
     }
+
+    /// Starts the task that receives the datagrams, the first time the server accepts.
+    fn start_receiving(&mut self) -> &mut mpsc::Receiver<(BoxStream, ConnectionInfo)> {
+        if self.opened.is_none() {
+            let (opened, receiver) = mpsc::channel(OPENED_CAPACITY);
+            let receiving = Receiving {
+                socket: self.socket.clone(),
+                local_addr: self.local_addr,
+                keying: self.keying.take().expect("the receive task starts once"),
+                sessions: self.sessions.clone(),
+                buf: vec![0; self.max_datagram_size],
+                queue_capacity: self.queue_capacity,
+                send_size: self.send_size,
+                next_generation: 0,
+                opened,
+            };
+            self.receiving = Some(tokio::spawn(receiving.run()).abort_handle());
+            self.opened = Some(receiver);
+        }
+        self.opened.as_mut().expect("just started")
+    }
 }
 
 impl<K: SessionKey> Listener for UdpListener<K> {
@@ -202,9 +234,58 @@ impl<K: SessionKey> Listener for UdpListener<K> {
     }
 
     async fn accept(&mut self) -> io::Result<Option<(BoxStream, ConnectionInfo)>> {
+        // Receiving from a channel is cancel safe; `None` means the receive task ended.
+        Ok(self.start_receiving().recv().await)
+    }
+}
+
+impl<K: SessionKey> Drop for UdpListener<K> {
+    fn drop(&mut self) {
+        if let Some(receiving) = &self.receiving {
+            receiving.abort();
+        }
+    }
+}
+
+impl<K: SessionKey> fmt::Debug for UdpListener<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UdpListener")
+            .field("local_addr", &self.local_addr)
+            .field("sessions", &self.session_count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The task that receives every datagram: it delivers them to their sessions and opens sessions
+/// for new peers.
+struct Receiving<K: SessionKey> {
+    socket: Arc<UdpSocket>,
+    local_addr: SocketAddr,
+    keying: K,
+    sessions: Arc<Sessions<K::Key>>,
+    buf: Vec<u8>,
+    queue_capacity: usize,
+    send_size: usize,
+    /// Tells sessions with the same key apart, so that a session that ends removes only its own
+    /// entry.
+    next_generation: u64,
+    opened: mpsc::Sender<(BoxStream, ConnectionInfo)>,
+}
+
+impl<K: SessionKey> Receiving<K> {
+    async fn run(mut self) {
         loop {
-            // Nothing is awaited after a datagram arrived, so dropping this future loses none.
-            let (length, remote) = self.socket.recv_from(&mut self.buf).await?;
+            let (length, remote) = match self.socket.recv_from(&mut self.buf).await {
+                Ok(received) => received,
+                Err(error) => {
+                    tracing::error!(local = %self.local_addr, %error, "receiving datagrams failed");
+                    return;
+                }
+            };
+            // An empty datagram carries nothing and opens nothing.
+            if length == 0 {
+                continue;
+            }
             let datagram = Bytes::copy_from_slice(&self.buf[..length]);
             let key = self.keying.key(remote, &datagram);
             let mut sessions = self.sessions.map.lock().unwrap();
@@ -253,20 +334,17 @@ impl<K: SessionKey> Listener for UdpListener<K> {
                 key,
                 generation,
             };
-            return Ok(Some((
-                Box::new(stream),
-                ConnectionInfo::new(remote, self.local_addr),
-            )));
+            let connection = ConnectionInfo::new(remote, self.local_addr);
+            match self.opened.try_send((Box::new(stream), connection)) {
+                Ok(()) => {}
+                // The server is not accepting: the session is dropped, which removes it again.
+                Err(TrySendError::Full(_)) => {
+                    tracing::debug!(%remote, "dropping a datagram, the server is not accepting");
+                }
+                // The listener is gone.
+                Err(TrySendError::Closed(_)) => return,
+            }
         }
-    }
-}
-
-impl<K: SessionKey> fmt::Debug for UdpListener<K> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UdpListener")
-            .field("local_addr", &self.local_addr)
-            .field("sessions", &self.session_count())
-            .finish_non_exhaustive()
     }
 }
 

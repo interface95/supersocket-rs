@@ -167,8 +167,12 @@ async fn empty_datagrams_are_ignored_and_big_batches_are_split() {
     server.start().unwrap();
 
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // An empty datagram from an unknown peer opens nothing.
+    client.send_to(b"", address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(server.info().session_count(), 0);
     assert_eq!(exchange(&client, address, "one\r\n").await, "one");
-    // An empty datagram is not the end of the stream.
+    // An empty datagram is not the end of the stream either.
     client.send_to(b"", address).await.unwrap();
     assert_eq!(exchange(&client, address, "two\r\n").await, "two");
     assert!(reasons.try_recv().is_err(), "the session was closed");
@@ -185,6 +189,35 @@ async fn empty_datagrams_are_ignored_and_big_batches_are_split() {
     }
     assert_eq!(received.len(), 70_002);
     assert!(received[..70_000].iter().all(|&byte| byte == b'x'));
+    assert_eq!(server.info().session_count(), 1);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_go_on_while_the_server_waits_for_a_connection_slot() {
+    let listener = UdpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = listener.local_addr();
+    let server = echo()
+        .configure(|options| options.max_connections = Some(1))
+        .listener(listener)
+        .build()
+        .unwrap();
+    server.start().unwrap();
+
+    let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let first_addr = first.local_addr().unwrap();
+    assert_eq!(
+        exchange(&first, address, "one\r\n").await,
+        format!("one from {first_addr}")
+    );
+    // The second peer has to wait for a slot; the first one is still served meanwhile.
+    second.send_to(b"waiting\r\n", address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        exchange(&first, address, "two\r\n").await,
+        format!("two from {first_addr}")
+    );
     assert_eq!(server.info().session_count(), 1);
     server.shutdown().await;
 }

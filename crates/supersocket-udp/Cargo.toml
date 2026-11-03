@@ -16,7 +16,7 @@ all-features = true
 supersocket-connection.workspace = true
 supersocket-server.workspace = true
 bytes.workspace = true
-tokio = { workspace = true, features = ["net", "sync"] }
+tokio = { workspace = true, features = ["net", "rt", "sync"] }
 tracing.workspace = true
 
 [dev-dependencies]
