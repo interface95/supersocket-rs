@@ -51,7 +51,7 @@ futures-util.workspace = true
 rcgen.workspace = true
 serde.workspace = true
 socket2 = { workspace = true, features = ["all"] }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
