@@ -734,7 +734,7 @@ async fn run_keepalive<S: Send + Sync + 'static>(
             if session.close_sent.load(Ordering::Acquire) {
                 return;
             }
-            let silent = now.saturating_duration_since(session.last_active_time());
+            let silent = now.saturating_duration_since(session.last_received_time());
             if keepalive
                 .pong_timeout
                 .is_some_and(|timeout| silent > timeout)

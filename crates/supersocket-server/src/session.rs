@@ -229,7 +229,9 @@ struct SessionInner<S> {
     connection: ConnectionInfo,
     start_time: SystemTime,
     started_at: Instant,
-    last_active_ms: AtomicU64,
+    /// Milliseconds after `started_at` when data was last received and last sent.
+    last_received_ms: AtomicU64,
+    last_sent_ms: AtomicU64,
     handshake_complete: AtomicBool,
     connected: AtomicBool,
     closed: AtomicBool,
@@ -295,7 +297,8 @@ impl<S: SessionState> Session<S> {
                 connection,
                 start_time: SystemTime::now(),
                 started_at: Instant::now(),
-                last_active_ms: AtomicU64::new(0),
+                last_received_ms: AtomicU64::new(0),
+                last_sent_ms: AtomicU64::new(0),
                 handshake_complete: AtomicBool::new(handshake_complete),
                 connected: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
@@ -361,10 +364,22 @@ impl<S> Session<S> {
         self.inner.start_time
     }
 
-    /// When data was last received.
+    /// When data was last received from or sent to the peer, whichever is later. The idle
+    /// session timeout counts from here, so a session that only pushes data is not idle.
     pub fn last_active_time(&self) -> Instant {
+        self.last_received_time().max(self.last_sent_time())
+    }
+
+    /// When data was last received from the peer.
+    pub fn last_received_time(&self) -> Instant {
         self.inner.started_at
-            + Duration::from_millis(self.inner.last_active_ms.load(Ordering::Relaxed))
+            + Duration::from_millis(self.inner.last_received_ms.load(Ordering::Relaxed))
+    }
+
+    /// When data was last queued to be sent to the peer.
+    pub fn last_sent_time(&self) -> Instant {
+        self.inner.started_at
+            + Duration::from_millis(self.inner.last_sent_ms.load(Ordering::Relaxed))
     }
 
     /// The server this session belongs to.
@@ -410,33 +425,43 @@ impl<S> Session<S> {
     /// this waits until the writer has taken them. Fails once the session has stopped sending,
     /// which happens after it closed and its last data was queued.
     pub async fn send(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
-        self.inner.send_queue.send(data.as_ref()).await
+        self.inner.send_queue.send(data.as_ref()).await?;
+        self.touch_sent();
+        Ok(())
     }
 
     /// Queues `data` without waiting: fails with [`ErrorKind::WouldBlock`](io::ErrorKind::WouldBlock)
     /// while the send buffer limit is reached. For broadcasts, where a session that reads slowly
     /// should be skipped rather than hold up the others.
     pub fn try_send(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
-        self.inner.send_queue.try_send(data.as_ref())
+        self.inner.send_queue.try_send(data.as_ref())?;
+        self.touch_sent();
+        Ok(())
     }
 
     /// Queues `parts` back to back as one piece without waiting, like [`try_send`](Self::try_send).
     pub fn try_send_vectored(&self, parts: &[&[u8]]) -> io::Result<()> {
-        self.inner.send_queue.try_send_vectored(parts)
+        self.inner.send_queue.try_send_vectored(parts)?;
+        self.touch_sent();
+        Ok(())
     }
 
     /// Queues `parts` back to back as one piece, like [`send`](Self::send) with the parts joined,
     /// but without copying them together first. Protocol layers use it to send a header and a
     /// payload.
     pub async fn send_vectored(&self, parts: &[&[u8]]) -> io::Result<()> {
-        self.inner.send_queue.send_vectored(parts).await
+        self.inner.send_queue.send_vectored(parts).await?;
+        self.touch_sent();
+        Ok(())
     }
 
     /// Queues `data` as the last data of the session, without waiting for room: later sends
     /// fail, while what is queued is still sent and the session keeps reading. For a goodbye
     /// message that nothing may follow, such as a WebSocket close frame.
     pub fn send_last(&self, data: impl AsRef<[u8]>) -> io::Result<()> {
-        self.inner.send_queue.send_last(data.as_ref())
+        self.inner.send_queue.send_last(data.as_ref())?;
+        self.touch_sent();
+        Ok(())
     }
 
     /// Encodes `package` with `encoder` straight into the send buffer and queues it like
@@ -474,7 +499,9 @@ impl<S> Session<S> {
         &self,
         write: impl FnOnce(&mut BytesMut) -> Result<(), E>,
     ) -> Result<(), E> {
-        self.inner.send_queue.send_with(write).await
+        self.inner.send_queue.send_with(write).await?;
+        self.touch_sent();
+        Ok(())
     }
 
     /// Formats `args` straight into the send buffer and queues it like [`send`](Self::send).
@@ -515,7 +542,9 @@ impl<S> Session<S> {
         &self,
         write: impl FnOnce(&mut BytesMut) -> Result<(), E>,
     ) -> Result<(), E> {
-        self.inner.send_queue.try_send_with(write)
+        self.inner.send_queue.try_send_with(write)?;
+        self.touch_sent();
+        Ok(())
     }
 
     /// Completes once the session is closed or closing, for tasks that should stop with it.
@@ -550,7 +579,7 @@ impl<S> Session<S> {
     /// [`CloseReason::Detached`], without a goodbye from the package handler; what it had queued
     /// is sent first, within the close timeout. The returned future completes with the
     /// connection once the session's tasks have let go of it, or with `None` when the queued data
-    /// could not be sent in time.
+    /// could not be sent: writing failed, or took longer than the close timeout.
     ///
     /// Call it from a package handler and return; await the future from another task. The
     /// connection is handed over only once the handler has returned, so awaiting the future
@@ -609,9 +638,18 @@ impl<S> Session<S> {
             .unwrap_or(CloseReason::Unknown)
     }
 
+    /// Records that data was received.
     pub(crate) fn touch(&self) {
         let elapsed = self.inner.started_at.elapsed().as_millis() as u64;
-        self.inner.last_active_ms.store(elapsed, Ordering::Relaxed);
+        self.inner
+            .last_received_ms
+            .store(elapsed, Ordering::Relaxed);
+    }
+
+    /// Records that data was queued to be sent.
+    fn touch_sent(&self) {
+        let elapsed = self.inner.started_at.elapsed().as_millis() as u64;
+        self.inner.last_sent_ms.store(elapsed, Ordering::Relaxed);
     }
 
     /// Stops accepting data to send; the writer task sends what is queued and shuts down.
@@ -626,11 +664,12 @@ impl<S> Session<S> {
     }
 
     /// The session's writer task. A failed or timed-out write closes the session. Returns the
-    /// writer, for a connection that is taken over.
+    /// writer for a connection that is taken over, or `None` when writing failed: the connection
+    /// is not worth handing over then.
     pub(crate) async fn run_writer(
         self,
         mut writer: Box<dyn AsyncWrite + Send + Unpin>,
-    ) -> Box<dyn AsyncWrite + Send + Unpin> {
+    ) -> Option<Box<dyn AsyncWrite + Send + Unpin>> {
         let send_timeout = self.inner.server.options().send_timeout;
         if let Err(error) = self
             .inner
@@ -645,8 +684,9 @@ impl<S> Session<S> {
             };
             tracing::debug!(session = self.id(), %error, "send failed");
             self.close(reason);
+            return None;
         }
-        writer
+        Some(writer)
     }
 }
 

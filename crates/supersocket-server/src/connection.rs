@@ -137,30 +137,7 @@ pub(crate) async fn serve_layered_tcp<P: Send + 'static, S: SessionState>(
     };
     async move {
         let _permit = permit;
-        let (mut stream, mut connection) = (stream, connection);
-        let Some(buffered) =
-            read_proxy_header(&listener, &mut stream, &mut connection, deadline).await
-        else {
-            return;
-        };
-        if !admit(&server, &connection) {
-            return;
-        }
-        let stream = Rewind::new(buffered.freeze(), stream);
-        #[cfg(feature = "tls")]
-        if let Some(tls) = &listener.tls {
-            let stream = match Box::pin(tls.accept(stream, deadline)).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::debug!(%error, "TLS handshake failed");
-                    return;
-                }
-            };
-            connection.secure = true;
-            connection.tls = Some(Box::new(crate::TlsInfo::new(stream.get_ref().1)));
-            return serve_layered(&server, id, Box::new(stream), connection, deadline).await;
-        }
-        serve_layered(&server, id, Box::new(stream), connection, deadline).await;
+        serve_endpoint(&server, id, stream, connection, &listener, deadline).await;
     }
     .instrument(span)
     .await
@@ -180,33 +157,56 @@ pub(crate) async fn serve_unix<P: Send + 'static, S: SessionState>(
     let deadline = Instant::now() + server.info.options().handshake_timeout;
     async move {
         let _permit = permit;
-        let (mut stream, mut connection) = (stream, ConnectionInfo::default());
-        let Some(buffered) =
-            read_proxy_header(&listener, &mut stream, &mut connection, deadline).await
-        else {
-            return;
-        };
-        if !admit(&server, &connection) {
-            return;
-        }
-        let stream = Rewind::new(buffered.freeze(), stream);
-        #[cfg(feature = "tls")]
-        if let Some(tls) = &listener.tls {
-            let stream = match Box::pin(tls.accept(stream, deadline)).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::debug!(%error, "TLS handshake failed");
-                    return;
-                }
-            };
-            connection.secure = true;
-            connection.tls = Some(Box::new(crate::TlsInfo::new(stream.get_ref().1)));
-            return serve_layered(&server, id, Box::new(stream), connection, deadline).await;
-        }
-        serve_layered(&server, id, Box::new(stream), connection, deadline).await;
+        serve_endpoint(
+            &server,
+            id,
+            stream,
+            ConnectionInfo::default(),
+            &listener,
+            deadline,
+        )
+        .await;
     }
     .instrument(span)
     .await
+}
+
+/// Sets up a connection accepted on a listener of the options, where the stream is not a plain
+/// TCP one: the PROXY protocol header and the TLS handshake where the listener asks for them,
+/// then the stream layers and the session.
+async fn serve_endpoint<P: Send + 'static, S: SessionState, IO>(
+    server: &Arc<ServerInner<P, S>>,
+    id: u64,
+    stream: IO,
+    connection: ConnectionInfo,
+    listener: &Endpoint,
+    deadline: Instant,
+) where
+    IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (mut stream, mut connection) = (stream, connection);
+    let Some(buffered) = read_proxy_header(listener, &mut stream, &mut connection, deadline).await
+    else {
+        return;
+    };
+    if !admit(server, &connection) {
+        return;
+    }
+    let stream = Rewind::new(buffered.freeze(), stream);
+    #[cfg(feature = "tls")]
+    if let Some(tls) = &listener.tls {
+        let stream = match Box::pin(tls.accept(stream, deadline)).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::debug!(%error, "TLS handshake failed");
+                return;
+            }
+        };
+        connection.secure = true;
+        connection.tls = Some(Box::new(crate::TlsInfo::new(stream.get_ref().1)));
+        return serve_layered(server, id, Box::new(stream), connection, deadline).await;
+    }
+    serve_layered(server, id, Box::new(stream), connection, deadline).await;
 }
 
 /// Serves a connection handed over with [`Server::serve_connection`](crate::Server::serve_connection).
@@ -472,7 +472,7 @@ async fn run_session<P, S, R>(
         session.close_send_queue();
     }
     let writer = match tokio::time::timeout_at(deadline, &mut writer_task).await {
-        Ok(Ok(writer)) => Some(writer),
+        Ok(Ok(writer)) => writer,
         Ok(Err(_)) => None,
         Err(_) => {
             writer_task.abort();

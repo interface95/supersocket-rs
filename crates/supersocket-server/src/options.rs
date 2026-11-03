@@ -33,7 +33,7 @@ pub struct ServerOptions {
     /// Whether the packages of a session are handled one at a time or concurrently.
     pub package_handling: PackageHandling,
 
-    /// Close sessions that received nothing for this long. Default: never.
+    /// Close sessions that neither received nor sent anything for this long. Default: never.
     #[serde(with = "lenient::option_duration")]
     pub idle_session_timeout: Option<Duration>,
 
@@ -216,7 +216,8 @@ pub struct ListenOptions {
 
     /// Path of a Unix domain socket to listen on instead of a TCP address, like SuperSocket's
     /// `ListenOptions.Path`; Unix only. A socket file left behind by an earlier run is removed
-    /// before binding, and the file is removed again when the listener closes. The TCP settings
+    /// before binding; one that another process still serves is not, and binding fails with
+    /// `AddrInUse`. The file is removed again when the listener closes. The TCP settings
     /// (`no_delay`, `keepalive` and the socket buffer sizes) do not apply; TLS and the PROXY
     /// protocol do. Default: none.
     #[serde(default, deserialize_with = "lenient::option_path")]

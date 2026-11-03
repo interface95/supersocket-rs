@@ -1568,3 +1568,96 @@ async fn sessions_can_hand_their_connection_over() {
     client.expect_closed().await;
     server.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_that_keep_sending_are_not_idle() {
+    let (builder, mut reasons) = track_close_reasons(
+        Server::builder(LineFilter::default)
+            .on_connected(async |session| {
+                // A push stream: the client never sends anything after connecting.
+                tokio::spawn(async move {
+                    for _ in 0..20 {
+                        if session.send("tick\r\n").await.is_err() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                });
+            })
+            .configure(|options| {
+                options.idle_session_timeout = Some(Duration::from_millis(100));
+                options.clear_idle_session_interval = Duration::from_millis(20);
+            }),
+    );
+    let (server, address) = start(builder);
+    let mut client = Client::connect(address).await;
+    for _ in 0..10 {
+        assert_eq!(client.line().await, "tick");
+    }
+    assert!(
+        reasons.try_recv().is_err(),
+        "a session that sends is not idle"
+    );
+    // Once the pushing stops, the session is idle and closed.
+    assert_eq!(next_reason(&mut reasons).await, CloseReason::Timeout);
+    server.shutdown().await;
+}
+
+/// Writes fail, reads never deliver anything but what the test put there.
+struct BrokenWriter;
+
+impl tokio::io::AsyncWrite for BrokenWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_whose_goodbye_fails_is_not_handed_over() {
+    let (outcome, mut outcomes) = tokio::sync::mpsc::unbounded_channel();
+    let server = Server::builder(LineFilter::default)
+        .on_package(move |session, _package| {
+            let outcome = outcome.clone();
+            async move {
+                session.send("goodbye\r\n").await?;
+                let detaching = session.detach()?;
+                tokio::spawn(async move {
+                    let _ = outcome.send(detaching.await.is_some());
+                });
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    server.start().unwrap();
+    let (mut peer, side) = tokio::io::duplex(64);
+    let (reader, _writer) = tokio::io::split(side);
+    server
+        .serve_connection(
+            tokio::io::join(reader, BrokenWriter),
+            ConnectionInfo::default(),
+        )
+        .unwrap();
+    peer.write_all(b"RAW\r\n").await.unwrap();
+    let handed_over = timeout(WAIT, outcomes.recv()).await.unwrap().unwrap();
+    assert!(!handed_over, "a dead connection must not be handed over");
+    server.shutdown().await;
+}

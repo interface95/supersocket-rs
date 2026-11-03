@@ -590,3 +590,29 @@ async fn a_failed_start_leaves_no_unix_socket_file_behind() {
     assert!(!path.exists(), "the socket file was left behind");
     assert_eq!(server.status(), ServerStatus::Idle);
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_unix_socket_in_use_is_not_taken_over() {
+    let path = std::env::temp_dir().join(format!("supersocket-in-use-{}.sock", std::process::id()));
+    let first = echo_with_address().listen_unix(&path).build().unwrap();
+    first.start().unwrap();
+
+    let second = echo_with_address().listen_unix(&path).build().unwrap();
+    match second.start() {
+        Err(supersocket::Error::Bind { source, .. }) => {
+            assert_eq!(source.kind(), io::ErrorKind::AddrInUse, "{source}");
+        }
+        other => panic!("expected a bind error, got {other:?}"),
+    }
+
+    // The first server still serves, and still owns the socket file.
+    let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let (reader, writer) = stream.into_split();
+    let mut client = Client::new(reader, writer);
+    client.send(b"hello\r\n").await;
+    assert_eq!(client.line().await, "hello 0.0.0.0:0");
+    assert!(path.exists());
+    first.shutdown().await;
+    assert!(!path.exists());
+}

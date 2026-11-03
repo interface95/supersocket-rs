@@ -747,10 +747,23 @@ impl Endpoint {
     fn bind_unix(&self, path: &std::path::Path) -> io::Result<tokio::net::UnixListener> {
         use std::os::unix::fs::FileTypeExt;
 
-        // A socket file left behind by an earlier run would make binding fail; anything else at
-        // the path is not ours to remove.
+        // A socket file left behind by an earlier run would make binding fail; one that a
+        // process still serves, or anything else at the path, is not ours to remove.
         match std::fs::metadata(path) {
-            Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path)?,
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                match std::os::unix::net::UnixStream::connect(path) {
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AddrInUse,
+                            "another process is listening on the socket",
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                        std::fs::remove_file(path)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             Ok(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
