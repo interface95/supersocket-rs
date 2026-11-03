@@ -69,6 +69,9 @@ The first release.
   `ProxyConnection` that cuts replies with pipeline filters and detaches the connection at the
   end. SOCKS5 follows the method the proxy chose, also when it skips the offered authentication.
   `PackageReader::get_mut` writes to the stream between packages.
+- `ConnectorChain` runs connectors one after another as one `Connector`, like SuperSocket's
+  `ConnectorBase` and `BuildConnectors`; `ClientBuilder` connects through one, and a
+  `ProxyConnector` can return one from `create_default_connector` to reach a proxy through TLS.
 - `ClientSender::send_with`, `try_send_with` and `send_fmt`.
 
 ### WebSocket (`supersocket-websocket`)

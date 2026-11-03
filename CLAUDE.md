@@ -137,7 +137,9 @@ Public extension traits use `impl Future` return types (async-fn-in-trait style)
 stored as a trait object has a `pub(crate) Dyn*` twin returning `BoxFuture` with a blanket impl
 (`DynMiddleware`, `DynStreamLayer`, `DynListener`, `DynPackageHandler`, `DynConnector`). Adding a
 method to the public trait means adding it to the twin too. `ProxyConnector` has no twin: a blanket
-impl makes every `ProxyConnector` a `Connector`.
+impl makes every `ProxyConnector` a `Connector`. `ConnectorChain` and `ClientBuilder` store
+connectors as `Arc<dyn DynConnector>`; inside the crate, call `Connector::connect(&x, ..)` in full,
+since both traits name the method `connect`.
 
 ### Protocol switching
 
@@ -164,7 +166,9 @@ sends do not wait for each other; control frames bypass it.
 
 `ClientBuilder` holds a filter factory and a `Connector` chain: the first connector
 (`TcpConnector` or a proxy) opens the stream, later ones (`TlsConnector`, `GzipConnector`,
-custom) wrap it. Proxy connectors mirror SuperSocket's `SuperSocket.Client.Proxy`: each implements
+custom) wrap it. `connect` builds a `ConnectorChain` from them (SuperSocket's `ConnectorBase` +
+`BuildConnectors`): the chain is itself a `Connector`, so `ProxyConnector::create_default_connector`
+can return one. Proxy connectors mirror SuperSocket's `SuperSocket.Client.Proxy`: each implements
 `ProxyConnector` (`ProxyConnectorBase`), whose blanket `Connector` impl opens the connection to the
 proxy and calls `connect_proxy`; the handshake runs on a `ProxyConnection` (one `PackageReader`
 whose filter switches per step via `next_filter`), and `detach` pushes leftover bytes back with

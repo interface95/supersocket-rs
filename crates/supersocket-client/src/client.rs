@@ -16,7 +16,10 @@ use supersocket_proto::{BoxFilter, PackageEncoder, PipelineFilter};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio_util::sync::CancellationToken;
 
-use crate::{BoxStream, Connection, Connector, TcpConnector, ToEndpoint, connector::DynConnector};
+use crate::{
+    BoxStream, Connection, Connector, ConnectorChain, TcpConnector, ToEndpoint,
+    connector::DynConnector,
+};
 
 /// Options of an [`EasyClient`].
 #[derive(Debug, Clone, PartialEq)]
@@ -118,20 +121,25 @@ impl<P: Send + 'static> ClientBuilder<P> {
         self
     }
 
+    /// The chain the client connects through: the proxy or the TCP connector, then the layers,
+    /// like `EasyClient.GetConnector`.
+    fn connector_chain(&self) -> ConnectorChain {
+        let first: Arc<dyn DynConnector> = match &self.proxy {
+            Some(proxy) => proxy.clone(),
+            None => Arc::new(self.tcp.clone()),
+        };
+        let mut connectors = Vec::with_capacity(1 + self.layers.len());
+        connectors.push(first);
+        connectors.extend(self.layers.iter().cloned());
+        ConnectorChain { connectors }
+    }
+
     /// Connects to `target`, which is a `"host:port"` string, a socket address or an
     /// [`Endpoint`](crate::Endpoint).
     pub async fn connect(&self, target: impl ToEndpoint) -> io::Result<EasyClient<P>> {
         let target = target.to_endpoint()?;
-        let connecting = async {
-            let mut connection = match &self.proxy {
-                Some(proxy) => proxy.connect(&target, None).await?,
-                None => Connector::connect(&self.tcp, &target, None).await?,
-            };
-            for layer in &self.layers {
-                connection = layer.connect(&target, Some(connection)).await?;
-            }
-            Ok::<_, io::Error>(connection)
-        };
+        let chain = self.connector_chain();
+        let connecting = Connector::connect(&chain, &target, None);
         let connection = tokio::time::timeout(self.options.connect_timeout, connecting)
             .await
             .map_err(|_| {

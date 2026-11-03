@@ -6,7 +6,10 @@ use std::{
     future::Future,
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -14,8 +17,8 @@ use common::{WAIT, start};
 use supersocket::{
     Server,
     client::{
-        Connection, EasyClient, Endpoint, HttpConnector, ProxyConnection, ProxyConnector,
-        Socks4Connector, Socks5Connector,
+        Connection, Connector, ConnectorChain, EasyClient, Endpoint, HttpConnector,
+        ProxyConnection, ProxyConnector, Socks4Connector, Socks5Connector, TcpConnector,
     },
     prelude::*,
 };
@@ -369,6 +372,21 @@ struct LineProxy {
     proxy: Endpoint,
 }
 
+/// The handshake of a `LineProxy`.
+async fn line_handshake(target: &Endpoint, connection: Connection) -> io::Result<Connection> {
+    let mut connection = ProxyConnection::new(connection, LineFilter::default());
+    connection
+        .send(format!("CONNECT {target}\r\n").as_bytes())
+        .await?;
+    match connection.receive().await?.text.as_str() {
+        "OK" => Ok(connection.detach()),
+        reply => Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            reply.to_owned(),
+        )),
+    }
+}
+
 impl ProxyConnector for LineProxy {
     fn proxy_endpoint(&self) -> &Endpoint {
         &self.proxy
@@ -379,17 +397,7 @@ impl ProxyConnector for LineProxy {
         target: &Endpoint,
         connection: Connection,
     ) -> io::Result<Connection> {
-        let mut connection = ProxyConnection::new(connection, LineFilter::default());
-        connection
-            .send(format!("CONNECT {target}\r\n").as_bytes())
-            .await?;
-        match connection.receive().await?.text.as_str() {
-            "OK" => Ok(connection.detach()),
-            reply => Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                reply.to_owned(),
-            )),
-        }
+        line_handshake(target, connection).await
     }
 }
 
@@ -417,6 +425,71 @@ async fn proxy_connectors_of_your_own_plug_in_like_the_built_in_ones() {
         .connect(address)
         .await
         .unwrap();
+    assert_eq!(client.peer_addr(), Some(proxy));
+    assert_greeting_and_echo(client).await;
+    server.shutdown().await;
+}
+
+/// Stands in for TLS towards the proxy: a wrapping connector that records that it ran.
+struct Wrapped {
+    ran: Arc<AtomicBool>,
+}
+
+impl Connector for Wrapped {
+    async fn connect(
+        &self,
+        _target: &Endpoint,
+        previous: Option<Connection>,
+    ) -> io::Result<Connection> {
+        self.ran.store(true, Ordering::SeqCst);
+        Ok(previous
+            .expect("Wrapped wraps a connection")
+            .map_stream(|stream| stream))
+    }
+}
+
+/// A `LineProxy` reached through a chain of connectors, as an HTTPS proxy would be reached
+/// through TCP and TLS.
+struct LineProxyBehindWrapper {
+    proxy: Endpoint,
+    wrapped: Arc<AtomicBool>,
+}
+
+impl ProxyConnector for LineProxyBehindWrapper {
+    fn proxy_endpoint(&self) -> &Endpoint {
+        &self.proxy
+    }
+
+    fn create_default_connector(&self) -> impl Connector {
+        ConnectorChain::new(TcpConnector::new()).then(Wrapped {
+            ran: self.wrapped.clone(),
+        })
+    }
+
+    async fn connect_proxy(
+        &self,
+        target: &Endpoint,
+        connection: Connection,
+    ) -> io::Result<Connection> {
+        line_handshake(target, connection).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proxy_can_be_reached_through_a_connector_chain() {
+    let (server, address) = start_greeting_echo();
+    let proxy = spawn_proxy(line_proxy).await;
+    let wrapped = Arc::new(AtomicBool::new(false));
+
+    let client = EasyClient::builder(LineFilter::default)
+        .proxy(LineProxyBehindWrapper {
+            proxy: proxy.into(),
+            wrapped: wrapped.clone(),
+        })
+        .connect(address)
+        .await
+        .unwrap();
+    assert!(wrapped.load(Ordering::SeqCst), "the chain's wrapper ran");
     assert_eq!(client.peer_addr(), Some(proxy));
     assert_greeting_and_echo(client).await;
     server.shutdown().await;

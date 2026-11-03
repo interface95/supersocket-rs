@@ -31,7 +31,7 @@ mod tls;
 pub use client::{ClientBuilder, ClientOptions, ClientSender, EasyClient};
 #[cfg(feature = "gzip")]
 pub use connector::GzipConnector;
-pub use connector::{Connection, Connector, TcpConnector};
+pub use connector::{Connection, Connector, ConnectorChain, TcpConnector};
 pub use endpoint::{Endpoint, ToEndpoint};
 #[cfg(feature = "proxy")]
 pub use proxy::{HttpConnector, ProxyConnection, ProxyConnector, Socks4Connector, Socks5Connector};

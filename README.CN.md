@@ -308,7 +308,10 @@ EasyClient::builder(LineFilter::default)
 ```
 
 `HttpConnector`（CONNECT 方法）和 `Socks4Connector`（主机名用 SOCKS4a）用法一样；任何实现了 `Connector` 的类型都可以通过
-`.connector(...)` 加进来。
+`.connector(...)` 加进来。`ConnectorChain` 把一串连接器变成一个 `Connector`，对应 SuperSocket 里
+`ConnectorBase` 通过 `NextConnector` 串起来、由 `BuildConnectors` 组装的链：
+`ConnectorChain::new(TcpConnector::new()).then(TlsConnector::new())` 就是 `ProxyConnector` 的
+`create_default_connector` 为了连上 HTTPS 代理要返回的东西。
 
 代理连接器的结构和 SuperSocket 的 `SuperSocket.Client.Proxy` 一致。`ProxyConnector` 相当于
 `ProxyConnectorBase`：先连上代理（`create_default_connector`，默认是 `TcpConnector`），握手交给

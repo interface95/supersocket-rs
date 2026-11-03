@@ -1,4 +1,4 @@
-use std::{fmt, future::Future, io, net::SocketAddr};
+use std::{fmt, future::Future, io, net::SocketAddr, sync::Arc};
 
 use supersocket_connection::{BoxStream, Stream};
 use tokio::net::{TcpSocket, TcpStream};
@@ -98,6 +98,67 @@ impl<C: Connector> DynConnector for C {
         previous: Option<Connection>,
     ) -> BoxFuture<'a, io::Result<Connection>> {
         Box::pin(Connector::connect(self, target, previous))
+    }
+}
+
+/// Connectors run one after another, as one [`Connector`]: what SuperSocket's `ConnectorBase`
+/// does by linking connectors through `NextConnector`, and `EasyClient.BuildConnectors` builds.
+///
+/// The first connector receives what the chain itself receives, so a chain that starts with a
+/// [`TcpConnector`] or a proxy opens the connection, and a chain of wrapping connectors can be
+/// added to another chain. Each later connector receives the connection made so far, and the
+/// first error ends the chain. [`ClientBuilder`](crate::ClientBuilder) connects through such a
+/// chain; a [`ProxyConnector`](crate::ProxyConnector) can return one from
+/// `create_default_connector` to reach the proxy through TLS.
+///
+/// ```no_run
+/// use supersocket_client::{ConnectorChain, TcpConnector, TlsConnector};
+///
+/// let chain = ConnectorChain::new(TcpConnector::new()).then(TlsConnector::new());
+/// ```
+#[derive(Clone)]
+pub struct ConnectorChain {
+    pub(crate) connectors: Vec<Arc<dyn DynConnector>>,
+}
+
+impl ConnectorChain {
+    /// A chain that starts with `first`.
+    pub fn new(first: impl Connector) -> Self {
+        Self {
+            connectors: vec![Arc::new(first)],
+        }
+    }
+
+    /// Adds `next` to the end of the chain.
+    pub fn then(mut self, next: impl Connector) -> Self {
+        self.connectors.push(Arc::new(next));
+        self
+    }
+}
+
+impl Connector for ConnectorChain {
+    async fn connect(
+        &self,
+        target: &Endpoint,
+        previous: Option<Connection>,
+    ) -> io::Result<Connection> {
+        let (first, rest) = self
+            .connectors
+            .split_first()
+            .expect("a chain always has a first connector");
+        let mut connection = first.connect(target, previous).await?;
+        for connector in rest {
+            connection = connector.connect(target, Some(connection)).await?;
+        }
+        Ok(connection)
+    }
+}
+
+impl fmt::Debug for ConnectorChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectorChain")
+            .field("connectors", &self.connectors.len())
+            .finish()
     }
 }
 
@@ -223,5 +284,93 @@ impl Connector for TcpConnector {
             local_addr,
             peer_addr,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// Records when it ran; opens an in-memory connection when first, otherwise passes the
+    /// connection on.
+    struct Step {
+        name: &'static str,
+        log: Arc<Mutex<Vec<&'static str>>>,
+        fails: bool,
+    }
+
+    impl Connector for Step {
+        async fn connect(
+            &self,
+            _target: &Endpoint,
+            previous: Option<Connection>,
+        ) -> io::Result<Connection> {
+            self.log.lock().unwrap().push(self.name);
+            if self.fails {
+                return Err(io::Error::other(self.name));
+            }
+            Ok(previous.unwrap_or_else(|| {
+                let (ours, _theirs) = tokio::io::duplex(16);
+                Connection::new(ours)
+            }))
+        }
+    }
+
+    fn chain(log: &Arc<Mutex<Vec<&'static str>>>, failing: Option<&'static str>) -> ConnectorChain {
+        let step = |name| Step {
+            name,
+            log: log.clone(),
+            fails: failing == Some(name),
+        };
+        ConnectorChain::new(step("open"))
+            .then(step("tls"))
+            .then(step("gzip"))
+    }
+
+    #[tokio::test]
+    async fn connectors_run_in_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let target = Endpoint::new("example.com", 80);
+        Connector::connect(&chain(&log, None), &target, None)
+            .await
+            .unwrap();
+        assert_eq!(*log.lock().unwrap(), ["open", "tls", "gzip"]);
+    }
+
+    #[tokio::test]
+    async fn the_first_error_ends_the_chain() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let target = Endpoint::new("example.com", 80);
+        let error = Connector::connect(&chain(&log, Some("tls")), &target, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "tls");
+        assert_eq!(*log.lock().unwrap(), ["open", "tls"]);
+    }
+
+    #[tokio::test]
+    async fn a_chain_passes_on_what_it_receives() {
+        // A chain of wrapping connectors can follow a connector that opened the connection.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let target = Endpoint::new("example.com", 80);
+        let (ours, _theirs) = tokio::io::duplex(16);
+        let connection = Connection::from_parts(
+            Box::new(ours),
+            None,
+            Some("127.0.0.1:1080".parse().unwrap()),
+        );
+        let connection = Connector::connect(&chain(&log, None), &target, Some(connection))
+            .await
+            .unwrap();
+        assert_eq!(
+            connection.peer_addr(),
+            Some("127.0.0.1:1080".parse().unwrap())
+        );
+        assert_eq!(
+            format!("{:?}", chain(&log, None)),
+            "ConnectorChain { connectors: 3 }"
+        );
     }
 }

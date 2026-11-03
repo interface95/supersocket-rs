@@ -339,7 +339,11 @@ EasyClient::builder(LineFilter::default)
 ```
 
 `HttpConnector` (CONNECT) and `Socks4Connector` (with SOCKS4a for host names) work the same way,
-and anything implementing `Connector` can be added with `.connector(...)`.
+and anything implementing `Connector` can be added with `.connector(...)`. A `ConnectorChain` is
+the chain itself as one `Connector`, like SuperSocket's `ConnectorBase` linked through
+`NextConnector` and built by `BuildConnectors`: `ConnectorChain::new(TcpConnector::new())
+.then(TlsConnector::new())` is what a `ProxyConnector`'s `create_default_connector` returns to
+reach an HTTPS proxy.
 
 The proxy connectors are laid out like SuperSocket's `SuperSocket.Client.Proxy`.
 `ProxyConnector` plays the part of `ProxyConnectorBase`: it opens the connection to the proxy
